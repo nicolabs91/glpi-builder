@@ -2,7 +2,8 @@
 
 Deze versie beheert interne GLPI Docker-projecten op een Synology RS822RP+.
 De bewezen v7-opbouw van de gegenereerde `docker-compose.yml` is bewust
-ongewijzigd en wordt door `tests/test_yaml_contract.py` bewaakt.
+ongewijzigd. Broncode, uiteindelijke project-YAML en de compose van de Builder
+worden afzonderlijk vergrendeld.
 
 ## Belangrijk beveiligingsmodel
 
@@ -53,11 +54,13 @@ sudo docker stop glpi-project-builder-full-restore
 ## Tests
 
 ```sh
-python3 -m py_compile app.py
-python3 tests/test_yaml_contract.py
-python3 tests/test_static_security.py
-python3 tests/test_preview_flow.py
+sh scripts/dev_loop.sh
 ```
+
+Dit is de vaste kwaliteitslus: syntaxcontrole, exacte YAML-regressie,
+composevalidatie, schone Docker-build, functionele tests en een echte
+container-healthcheck. Zie `DEVELOPMENT_LOOP.md` voor de ontwikkel- en
+releaseafspraken.
 
 ## Operationele aandachtspunten
 
