@@ -9,19 +9,24 @@ import zipfile
 import tarfile
 import stat
 import hmac
+import threading
 from datetime import datetime
 from html import escape as html_escape
 from pathlib import Path
 
 import docker
 from docker.errors import NotFound, ContainerError
-from flask import Flask, request, redirect, url_for, render_template_string, flash, session
+from flask import Flask, request, redirect, url_for, render_template_string, flash, session, g, jsonify
 
-APP_VERSION = "v10.4 - SSO cookie explicit, YAML locked + runtime check"
+APP_VERSION = "v11.0 - Synology production workflow, YAML locked"
 APP_PORT = int(os.environ.get("APP_PORT", "8080"))
 BASE_PATH = Path(os.environ.get("BASE_PATH", "/volume1/docker"))
-BACKUP_ROOT = os.environ.get("BACKUP_ROOT", "/volume1/docker/_BACKUPS")
-TZ_DEFAULT = os.environ.get("TZ", "Europe/Amsterdam")
+BACKUP_ROOT = Path(os.environ.get("BACKUP_ROOT", "/volume1/docker/_BACKUPS"))
+TZ_DEFAULT = os.environ.get("TZ", "Europe/Brussels")
+MAX_SCAN_ENTRIES = int(os.environ.get("MAX_SCAN_ENTRIES", "500"))
+ALLOWED_GLPI_IMAGES = tuple(filter(None, os.environ.get("ALLOWED_GLPI_IMAGES", "glpi/glpi:,diouxx/glpi:").split(",")))
+ALLOWED_DB_IMAGES = tuple(filter(None, os.environ.get("ALLOWED_DB_IMAGES", "mariadb:,mysql:").split(",")))
+MUTATION_LOCK = threading.Lock()
 DEFAULT_SESSION_COOKIE_SAMESITE = os.environ.get("DEFAULT_GLPI_SESSION_COOKIE_SAMESITE", "Lax")
 DEFAULT_SESSION_COOKIE_SECURE = os.environ.get("DEFAULT_GLPI_SESSION_COOKIE_SECURE", "Off")
 COOKIE_SAMESITE_CHOICES = ("Lax", "Strict", "None")
@@ -260,6 +265,35 @@ def path_under_base(path):
         return True
     except Exception:
         return False
+
+
+def path_under_backup_root(path):
+    """Only expose backup files below the configured backup root."""
+    try:
+        Path(path).resolve().relative_to(BACKUP_ROOT.resolve())
+        return True
+    except Exception:
+        return False
+
+
+def validate_local_image(image, kind):
+    image = str(image or "").strip()
+    prefixes = ALLOWED_GLPI_IMAGES if kind == "glpi" else ALLOWED_DB_IMAGES
+    if not image or not any(image.startswith(prefix) for prefix in prefixes):
+        raise ValueError(f"Niet-toegestane {kind}-image: {image or 'leeg'}.")
+    tags = {tag for item in docker_client().images.list() for tag in (item.tags or [])}
+    if image not in tags:
+        raise ValueError(f"Docker-image is niet lokaal beschikbaar: {image}")
+    return image
+
+
+def local_image_tags(kind):
+    prefixes = ALLOWED_GLPI_IMAGES if kind == "glpi" else ALLOWED_DB_IMAGES
+    try:
+        tags = {tag for item in docker_client().images.list() for tag in (item.tags or [])}
+    except Exception:
+        return []
+    return sorted(tag for tag in tags if any(tag.startswith(prefix) for prefix in prefixes))
 
 
 def read_env(project):
@@ -592,12 +626,14 @@ def require_csrf():
         raise ValueError("Beveiligingstoken ontbreekt of is verlopen. Herlaad de pagina en probeer opnieuw.")
 
 
-def scan_files(root, extensions):
-    root = Path(root or BACKUP_ROOT)
-    if not root.exists() or not root.is_dir() or not path_under_base(root):
+def scan_files(root, extensions, include_dirs=False):
+    root = Path(root or BACKUP_ROOT).resolve()
+    if not root.exists() or not root.is_dir() or not path_under_backup_root(root):
         return []
     files = []
-    for item in root.rglob("*"):
+    for index, item in enumerate(root.rglob("*")):
+        if index >= MAX_SCAN_ENTRIES * 20:
+            break
         if item.is_symlink():
             continue
         if item.is_file() and item.name.lower().endswith(extensions):
@@ -605,8 +641,13 @@ def scan_files(root, extensions):
                 files.append((item.stat().st_mtime, item))
             except OSError:
                 pass
+        elif include_dirs and item.parent == root and item.is_dir():
+            try:
+                files.append((item.stat().st_mtime, item))
+            except OSError:
+                pass
     files.sort(key=lambda x: x[0], reverse=True)
-    return [(str(path), f"{path} ({time.strftime('%Y-%m-%d %H:%M', time.localtime(mtime))})") for mtime, path in files[:300]]
+    return [(str(path), f"{path} ({time.strftime('%Y-%m-%d %H:%M', time.localtime(mtime))})") for mtime, path in files[:MAX_SCAN_ENTRIES]]
 
 
 def write_action_log(project, action, messages):
@@ -707,8 +748,8 @@ def restore_database(project, backup_file):
 
     if not backup_path.exists() or not backup_path.is_file():
         return False, f"Databasebackup bestaat niet: {backup_path}"
-    if not path_under_base(backup_path):
-        return False, f"Databasebackup moet onder {BASE_PATH} staan."
+    if not path_under_backup_root(backup_path):
+        return False, f"Databasebackup moet onder {BACKUP_ROOT} staan."
     if backup_path.is_symlink():
         return False, "Databasebackup mag geen symlink zijn."
     if not backup_path.name.lower().endswith(DB_EXTENSIONS):
@@ -882,8 +923,8 @@ def extract_source(source):
 
     if not source.exists():
         raise ValueError(f"GLPI bestandenbackup bestaat niet: {source}")
-    if not path_under_base(source):
-        raise ValueError(f"GLPI bestandenbackup moet onder {BASE_PATH} staan.")
+    if not path_under_backup_root(source):
+        raise ValueError(f"GLPI bestandenbackup moet onder {BACKUP_ROOT} staan.")
     if source.is_symlink():
         raise ValueError("GLPI bestandenbackup mag geen symlink zijn.")
 
@@ -1794,12 +1835,8 @@ def create():
         require_csrf()
         project = validate_project(request.form.get("project"))
         project_for_log = project
-        glpi_image = request.form.get("glpi_image", "").strip()
-        mariadb_image = request.form.get("mariadb_image", "").strip()
-        if ":" not in glpi_image:
-            raise ValueError("Vul een GLPI image inclusief tag in, bijvoorbeeld glpi/glpi:11.0.8")
-        if ":" not in mariadb_image:
-            raise ValueError("Vul een MariaDB image inclusief tag in, bijvoorbeeld mariadb:12.2.2")
+        glpi_image = validate_local_image(request.form.get("glpi_image"), "glpi")
+        mariadb_image = validate_local_image(request.form.get("mariadb_image"), "database")
 
         host_port = validate_port(request.form.get("host_port"), "Hostpoort")
         container_port = validate_port(request.form.get("container_port"), "Containerpoort")
@@ -1993,6 +2030,99 @@ a {{ color: #1f6feb; }}
 </div>
 </body>
 </html>"""
+
+
+V11_HTML = r"""<!doctype html>
+<html lang="nl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GLPI Project Builder</title>
+<style>
+:root{--bg:#f3f6f9;--card:#fff;--line:#d8e0e8;--ink:#17212b;--muted:#667483;--brand:#16704a;--danger:#b42318}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px system-ui,-apple-system,"Segoe UI",sans-serif}
+header{background:#102a43;color:#fff;padding:20px}header div,main{max-width:1080px;margin:auto}h1{margin:0;font-size:25px}h2{margin:0 0 14px}h3{margin:0 0 8px}
+main{padding:24px 18px 50px}.toolbar,.grid,.row{display:grid;gap:14px}.toolbar{grid-template-columns:1fr auto;align-items:center}.grid{grid-template-columns:repeat(auto-fit,minmax(290px,1fr));margin:16px 0 26px}.row{grid-template-columns:1fr 1fr}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px;box-shadow:0 1px 2px #102a4310}.project{display:flex;flex-direction:column;gap:10px}.meta{color:var(--muted);font-size:13px}.status{display:inline-block;border-radius:999px;padding:3px 9px;background:#eef2f6;font-size:12px}.running{background:#e8f7ef;color:#16643d}.notice{padding:12px 14px;border-radius:9px;margin-bottom:10px;background:#eef5ff;border:1px solid #b9d3f8}.notice.err{background:#fff0ef;border-color:#f5b1ab}.notice.ok{background:#ecfdf3;border-color:#9bd7b5}
+label{display:block;font-weight:650;margin:12px 0 5px}input,select{width:100%;min-height:42px;border:1px solid #b9c5d0;border-radius:8px;padding:8px 10px;background:#fff}button,.button{display:inline-block;border:0;border-radius:8px;padding:10px 14px;background:var(--brand);color:#fff;font-weight:700;text-decoration:none;cursor:pointer}.secondary{background:#425466}.danger{background:var(--danger)}details{border-top:1px solid var(--line);margin-top:14px;padding-top:12px}summary{font-weight:700;cursor:pointer}.actions{display:flex;gap:8px;flex-wrap:wrap}.actions form{display:inline}.actions form input{width:auto}.empty{text-align:center;color:var(--muted);padding:35px}.step{border-left:4px solid var(--brand);padding-left:13px;margin:20px 0}.check{display:flex;align-items:flex-start;gap:8px;font-weight:500}.check input{width:auto;min-height:auto;margin-top:4px}small{color:var(--muted)}
+@media(max-width:700px){.row,.toolbar{grid-template-columns:1fr}.toolbar .button{width:100%;text-align:center}}
+</style></head><body>
+<header><div><h1>GLPI Project Builder</h1><div class="meta" style="color:#c9d8e6">{{ app_version }} · intern beheerhulpmiddel · zet de Builder na gebruik uit</div></div></header>
+<main>
+{% with messages=get_flashed_messages(with_categories=true) %}{% for category,message in messages %}<div class="notice {{ category }}">{{ message|safe }}</div>{% endfor %}{% endwith %}
+<div class="toolbar"><div><h2>Projecten</h2><div class="meta">Status, webpoort en laatste beheeractie in één overzicht.</div></div><a class="button" href="#nieuw">Nieuw project of restore</a></div>
+<div class="grid">
+{% for p in projects %}<article class="card project"><div><h3>{{ p.name }}</h3><span class="status {{ 'running' if p.glpi_status=='running' else '' }}">GLPI {{ p.glpi_status }}</span> <span class="status {{ 'running' if p.db_status=='running' else '' }}">DB {{ p.db_status }}</span></div>
+<div><strong>Webpoort:</strong> {{ p.active_port or 'niet ingesteld' }}</div><div class="meta">{{ p.glpi_image }}<br>{{ p.mariadb_image }}</div>
+<div class="actions">{% if p.glpi_status=='running' and p.active_port %}<a class="button" href="http://{{ request.host.split(':')[0] }}:{{ p.active_port }}" target="_blank">Open GLPI</a>{% endif %}<a class="button secondary" href="#beheer-{{ p.name }}">Beheren</a></div>
+<details id="beheer-{{ p.name }}"><summary>Projectbeheer</summary>
+<form method="post" action="{{ url_for('change_port_route') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="project" value="{{ p.name }}"><label>Nieuwe webpoort</label><input type="number" name="host_port" min="1" max="65535" value="{{ p.active_port }}" required><button>Poort toepassen</button></form>
+<form method="post" action="{{ url_for('rebuild_glpi_route') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="project" value="{{ p.name }}"><button class="secondary">GLPI-container opnieuw toepassen</button></form>
+<details><summary>SSO- en cookie-instellingen</summary><form method="post" action="{{ url_for('change_cookie_route') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="project" value="{{ p.name }}"><div class="row"><div><label>SameSite</label><select name="cookie_samesite"><option {{ 'selected' if p.cookie_samesite=='Lax' }}>Lax</option><option {{ 'selected' if p.cookie_samesite=='Strict' }}>Strict</option><option {{ 'selected' if p.cookie_samesite=='None' }}>None</option></select></div><div><label>Secure</label><select name="cookie_secure"><option {{ 'selected' if p.cookie_secure=='Off' }}>Off</option><option {{ 'selected' if p.cookie_secure=='On' }}>On</option></select></div></div><button>Instellingen toepassen</button></form></details>
+<details><summary>Diagnose en logs</summary><div class="actions"><form method="post" action="{{ url_for('diagnose') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="project" value="{{ p.name }}"><button class="secondary">Diagnose</button></form><form method="post" action="{{ url_for('testdb_route') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="project" value="{{ p.name }}"><button class="secondary">Database testen</button></form></div>{% for log in p.logs %}<div><a href="{{ url_for('view_log',project=p.name,filename=log) }}">{{ log }}</a></div>{% endfor %}</details>
+</details></article>{% else %}<div class="card empty">Nog geen beheerde GLPI-projecten gevonden.</div>{% endfor %}
+</div>
+
+<section class="card" id="nieuw"><h2>Nieuw project of restore</h2><p class="meta">Doorloop de vier stappen. De vastgelegde YAML-opbouw wordt ongewijzigd gebruikt.</p>
+<form method="post" action="{{ url_for('create') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="backup_root" value="{{ backup_root }}"><input type="hidden" name="container_port" value="8080">
+<div class="step"><h3>1. Project</h3><div class="row"><div><label>Projectnaam</label><input name="project" pattern="[a-z0-9][a-z0-9_-]{2,50}" placeholder="glpi-productie" required></div><div><label>Webpoort</label><input type="number" name="host_port" min="1" max="65535" value="8775" required></div></div></div>
+<div class="step"><h3>2. Versies</h3><div class="row"><div><label>GLPI-image</label><select name="glpi_image" required>{% for image in glpi_images %}<option>{{ image }}</option>{% else %}<option value="">Geen toegestane lokale GLPI-image</option>{% endfor %}</select></div><div><label>Database-image</label><select name="mariadb_image" required>{% for image in db_images %}<option>{{ image }}</option>{% else %}<option value="">Geen toegestane lokale database-image</option>{% endfor %}</select></div></div></div>
+<div class="step"><h3>3. Optionele restore</h3><div class="row"><div><label>Databaseback-up</label><select name="db_backup_select"><option value="">Geen</option>{% for value,label in db_backups %}<option value="{{ value }}">{{ label }}</option>{% endfor %}</select></div><div><label>GLPI-bestanden of map</label><select name="file_backup_select"><option value="">Geen</option>{% for value,label in file_backups %}<option value="{{ value }}">{{ label }}</option>{% endfor %}</select></div></div><input type="hidden" name="db_backup_manual"><input type="hidden" name="file_backup_manual"></div>
+<div class="step"><h3>4. Controleren en uitvoeren</h3><details><summary>Geavanceerde instellingen</summary><div class="row"><div><label>Tijdzone</label><input name="tz" value="{{ tz_default }}"></div><div><label>Cookie SameSite</label><select name="cookie_samesite"><option>Lax</option><option>Strict</option><option>None</option></select></div></div><label>Cookie Secure</label><select name="cookie_secure"><option>Off</option><option>On</option></select><label class="check"><input type="checkbox" name="restore_everything" value="yes">Alles restoren</label><label class="check"><input type="checkbox" name="force_recreate" value="yes">Bestaande GLPI-container opnieuw aanmaken</label><label class="check"><input type="checkbox" name="clean_db" value="yes">Database schoon opbouwen</label></details>
+<label class="check"><input type="checkbox" name="confirm_destructive" value="yes">Ik begrijp dat een bestaande projectnaam data of containers kan wijzigen.</label><label>Typ bij een bestaand project de projectnaam ter bevestiging</label><input name="confirm_project"><button>Project aanmaken / restore starten</button></div></form></section>
+</main></body></html>"""
+
+
+@app.before_request
+def v11_single_mutation_guard():
+    if request.method != "POST":
+        return None
+    if not MUTATION_LOCK.acquire(blocking=False):
+        return ("Er loopt al een beheeractie. Wacht tot die voltooid is.", 409)
+    g.mutation_lock_held = True
+    return None
+
+
+@app.teardown_request
+def v11_release_mutation_lock(_error=None):
+    if getattr(g, "mutation_lock_held", False):
+        MUTATION_LOCK.release()
+
+
+@app.route("/healthz")
+def healthz():
+    checks = {"app": "ok", "base_path": BASE_PATH.is_dir(), "backup_root": BACKUP_ROOT.is_dir()}
+    try:
+        docker_client().ping()
+        checks["docker"] = True
+    except Exception:
+        checks["docker"] = False
+    status = 200 if all(value is True or value == "ok" for value in checks.values()) else 503
+    return jsonify({"version": APP_VERSION, "checks": checks}), status
+
+
+def v11_index():
+    backup_root = BACKUP_ROOT
+    return render_template_string(
+        V11_HTML,
+        projects=discover_projects(),
+        backup_root=str(backup_root),
+        db_backups=scan_files(backup_root, DB_EXTENSIONS),
+        file_backups=scan_files(backup_root, FILE_EXTENSIONS, include_dirs=True),
+        glpi_images=local_image_tags("glpi"),
+        db_images=local_image_tags("database"),
+        tz_default=TZ_DEFAULT,
+    )
+
+
+app.view_functions["index"] = v11_index
+
+
+@app.after_request
+def v11_security_headers(response):
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Content-Security-Policy"] = "default-src 'self'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'"
+    return response
 
 
 if __name__ == "__main__":

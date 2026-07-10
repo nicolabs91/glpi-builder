@@ -1,120 +1,65 @@
-# GLPI Project Builder Full Restore v10.4 - SSO cookie explicit, YAML locked
+# GLPI Project Builder v11 voor Synology
 
-Deze versie bouwt verder op de werkende v7/v8-opbouw. De gegenereerde project-`docker-compose.yml` blijft bewust in dezelfde custom vorm staan, omdat die opbouw nodig was om het officiële GLPI-image stabiel te laten draaien op jouw Synology-opzet.
+Deze versie beheert interne GLPI Docker-projecten op een Synology RS822RP+.
+De bewezen v7-opbouw van de gegenereerde `docker-compose.yml` is bewust
+ongewijzigd en wordt door `tests/test_yaml_contract.py` bewaakt.
 
-Belangrijk uitgangspunt:
+## Belangrijk beveiligingsmodel
 
-```text
-De v7 YAML-opbouw is leidend.
-Alle nieuwe functies mogen die opbouw niet onnodig veranderen.
-```
+Er is op verzoek geen app-login. Publiceer poort 5055 nooit op internet. Bind de
+Builder standaard aan `127.0.0.1` of vul in `.env` expliciet het interne
+beheer-IP van de NAS in. De Builder heeft via de Docker-socket verregaande
+rechten. Start hem alleen voor beheer en stop hem daarna.
 
-## Wat v10.4 doet
+## Verbeteringen
 
-- Bestaande projecten automatisch tonen.
-- Huidige poort, actieve Docker-poortmapping en containerstatus tonen.
-- Bij nieuw project een hostpoort instellen.
-- Achteraf de hostpoort aanpassen en alleen de GLPI-container opnieuw aanmaken.
-- Vooraf controleren of de gekozen poort al door een andere Docker-container wordt gebruikt.
-- Alleen de GLPI-container opnieuw aanmaken zonder database en GLPI-bestanden te raken.
-- Bevestiging vragen bij acties die bestaande data kunnen overschrijven of verwijderen.
-- Restore- en beheerlogs opslaan in `/volume1/docker/<project>/_builder_logs`.
-- Zip/tar backups veiliger uitpakken: geen absolute paden, pad-traversal, symlinks, hardlinks of device-bestanden.
-- Database-restore gebruikt `GLPI_DB_NAME` uit `.env`.
-- HTML-output van logs en diagnose wordt escaped.
-- POST-acties gebruiken CSRF-token.
-- De builder-container start niet automatisch opnieuw: `--restart no` / `restart: "no"`.
-
-## SSO-cookie-instellingen
-
-Voor SSO is dit essentieel:
-
-```ini
-session.cookie_samesite = "Lax"
-session.cookie_httponly = On
-session.cookie_secure = Off
-```
-
-Nieuwe projecten krijgen standaard:
-
-```env
-GLPI_SESSION_COOKIE_SAMESITE=Lax
-GLPI_SESSION_COOKIE_SECURE=Off
-```
-
-De GLPI-service krijgt deze waarden expliciet in de gegenereerde YAML:
-
-```yaml
-GLPI_SESSION_COOKIE_SAMESITE: ${GLPI_SESSION_COOKIE_SAMESITE}
-GLPI_SESSION_COOKIE_SECURE: ${GLPI_SESSION_COOKIE_SECURE}
-```
-
-Bij elke GLPI-containerstart schrijft het bestaande custom entrypoint een PHP ini-bestand in de container en kopieert dat naar de aanwezige PHP `conf.d`-mappen. Er wordt dus geen extra host-volume toegevoegd. Dat houdt de YAML dichter bij de bewezen v7-opbouw.
-
-Waarom niet meer via `/volume1/docker/<project>/php`?
-
-```text
-Dat werkte waarschijnlijk ook, maar het voegde een extra GLPI-volume toe.
-Omdat jouw YAML gevoelig is, is v10.4 conservatiever:
-de SSO-cookiefix blijft aanwezig, maar zonder extra mount.
-```
-
-## SameSite-keuzes
-
-- `Lax`: standaard en bedoeld voor normale SSO-redirects.
-- `Strict`: strenger, maar kan SSO breken.
-- `None`: alleen gebruiken bij speciale flows. De app forceert dan automatisch `Cookie Secure = On`, omdat browsers `SameSite=None` normaal alleen met Secure/HTTPS accepteren.
-
-`Cookie Secure` staat standaard op `Off`, omdat interne HTTP-toegang anders kan breken. Zet dit alleen op `On` als GLPI echt uitsluitend via HTTPS wordt geopend.
-
-## Diagnose
-
-De diagnose toont nu:
-
-- waarden uit `.env`
-- relevante container-environment
-- poortmapping
-- de PHP cookie override die bij containerstart wordt geschreven
-- de effectieve PHP cookie-instellingen binnen de draaiende GLPI-container via `php -r` / `ini_get`
-- de gegenereerde `docker-compose.yml`
-
-Daarmee kun je na restore controleren of SSO-cookieinstellingen echt actief zijn.
+- rustig projectdashboard en begeleide create/restore-wizard;
+- bestaande projecten beheren vanuit één projectkaart;
+- backupselectie uitsluitend onder de vaste `BACKUP_ROOT`;
+- whitelists voor lokaal beschikbare GLPI- en database-images;
+- één muterende beheeractie tegelijk;
+- `/healthz`, beveiligingsheaders en browsercache uitgeschakeld;
+- configureerbaar bind-IP, poort, tijdzone en imagebeleid;
+- gecontroleerde installer met automatische rollback;
+- onveranderlijk YAML-contract en statische securitytest.
 
 ## Installatie
 
-Verwijder de oude buildermap en pak deze zip opnieuw uit:
+1. Plaats de map in `/volume1/docker/glpi-project-builder-v11`.
+2. Kopieer `.env.example` naar `.env` of laat de installer dit doen.
+3. Zet `BUILDER_BIND_IP` op het interne beheer-IP indien toegang vanaf een
+   beheerpc nodig is. `127.0.0.1` is de veiligste default.
+4. Installeer:
 
-```bash
-sudo rm -rf /volume1/docker/glpi-project-builder-full-restore
-sudo mkdir -p /volume1/docker/glpi-project-builder-full-restore
-```
-
-Pak de inhoud van deze zip uit in:
-
-```text
-/volume1/docker/glpi-project-builder-full-restore
-```
-
-Daarna:
-
-```bash
-cd /volume1/docker/glpi-project-builder-full-restore
+```sh
+cd /volume1/docker/glpi-project-builder-v11
 sudo sh install_on_synology.sh
 ```
 
-Open:
+Rollback:
 
-```text
-http://<NAS-IP>:5055
+```sh
+sudo sh rollback_on_synology.sh
 ```
 
-## Testadvies
+Stoppen na gebruik:
 
-Test eerst met een testprojectnaam. Voor jouw SSO begin je met:
-
-```text
-Cookie SameSite: Lax
-Cookie Secure: Off
+```sh
+sudo docker stop glpi-project-builder-full-restore
 ```
 
-Als GLPI alleen via HTTPS wordt geopend, kun je daarna eventueel `Cookie Secure: On` proberen.
+## Tests
+
+```sh
+python3 -m py_compile app.py
+python3 tests/test_yaml_contract.py
+python3 tests/test_static_security.py
+```
+
+## Operationele aandachtspunten
+
+- Maak back-ups van database, `/var/glpi`, plugins, `.env` en composebestanden.
+- Bewaar minstens één back-up buiten dezelfde NAS.
+- Controleer vrije schijfruimte en roteer containerlogs.
+- Test grote restores eerst in een apart project.
+- Upgrade MariaDB niet over grote versies zonder dump en hersteltest.

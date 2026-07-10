@@ -1,15 +1,18 @@
 services:
   glpi-project-builder-full-restore:
     build: .
-    image: glpi-project-builder-full-restore-v10-4-sso-yaml-locked:latest
+    image: glpi-project-builder-v11:latest
     container_name: glpi-project-builder-full-restore
     restart: "no"
     ports:
-      - "5055:8080"
+      - "${BUILDER_BIND_IP:-127.0.0.1}:${BUILDER_PORT:-5055}:8080"
     environment:
       BASE_PATH: /volume1/docker
       BACKUP_ROOT: /volume1/docker/_BACKUPS
-      TZ: Europe/Amsterdam
+      TZ: ${TZ:-Europe/Brussels}
+      FLASK_SECRET_KEY: ${FLASK_SECRET_KEY}
+      ALLOWED_GLPI_IMAGES: ${ALLOWED_GLPI_IMAGES:-glpi/glpi:}
+      ALLOWED_DB_IMAGES: ${ALLOWED_DB_IMAGES:-mariadb:,mysql:}
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
       - /volume1/docker:/volume1/docker
