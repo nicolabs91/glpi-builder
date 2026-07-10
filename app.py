@@ -18,7 +18,7 @@ import docker
 from docker.errors import NotFound, ContainerError
 from flask import Flask, request, redirect, url_for, render_template_string, flash, session, g, jsonify
 
-APP_VERSION = "v11.0 - Synology production workflow, YAML locked"
+APP_VERSION = "v11.1 - preview en bevestiging, YAML locked"
 APP_PORT = int(os.environ.get("APP_PORT", "8080"))
 BASE_PATH = Path(os.environ.get("BASE_PATH", "/volume1/docker"))
 BACKUP_ROOT = Path(os.environ.get("BACKUP_ROOT", "/volume1/docker/_BACKUPS"))
@@ -31,6 +31,7 @@ DEFAULT_SESSION_COOKIE_SAMESITE = os.environ.get("DEFAULT_GLPI_SESSION_COOKIE_SA
 DEFAULT_SESSION_COOKIE_SECURE = os.environ.get("DEFAULT_GLPI_SESSION_COOKIE_SECURE", "Off")
 COOKIE_SAMESITE_CHOICES = ("Lax", "Strict", "None")
 COOKIE_SECURE_CHOICES = ("Off", "On")
+CREATE_PREVIEW_TTL_SECONDS = 10 * 60
 
 PROJECT_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{2,50}$")
 LOG_FILE_RE = re.compile(r"^[0-9]{8}-[0-9]{6}-[a-z0-9_-]+\.log$")
@@ -596,9 +597,17 @@ def project_has_existing_state(project):
     return False
 
 
-def require_destructive_confirmation(project):
-    checkbox = request.form.get("confirm_destructive") == "yes"
-    typed = (request.form.get("confirm_project") or "").strip().lower()
+def form_flag(source, name):
+    value = source.get(name)
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def require_destructive_confirmation(project, source=None):
+    source = source or request.form
+    checkbox = form_flag(source, "confirm_destructive")
+    typed = (source.get("confirm_project") or "").strip().lower()
     if not checkbox or typed != project:
         raise ValueError(
             "Deze actie kan bestaande containers, database of GLPI-bestanden aanpassen/verwijderen. "
@@ -624,6 +633,155 @@ def require_csrf():
     supplied = request.form.get("csrf_token", "")
     if not expected or not supplied or not hmac.compare_digest(expected, supplied):
         raise ValueError("Beveiligingstoken ontbreekt of is verlopen. Herlaad de pagina en probeer opnieuw.")
+
+
+def validate_backup_choice(value, extensions, label, allow_dir=False):
+    value = str(value or "").strip()
+    if not value:
+        return ""
+    path = Path(value).resolve()
+    if not path.exists():
+        raise ValueError(f"{label} bestaat niet: {path}")
+    if path.is_symlink():
+        raise ValueError(f"{label} mag geen symlink zijn.")
+    if not path_under_backup_root(path):
+        raise ValueError(f"{label} moet onder {BACKUP_ROOT} staan.")
+    if path.is_dir():
+        if allow_dir:
+            return str(path)
+        raise ValueError(f"{label} moet een bestand zijn.")
+    if not path.is_file() or not path.name.lower().endswith(extensions):
+        allowed = ", ".join(extensions)
+        raise ValueError(f"{label} heeft geen ondersteund formaat ({allowed}).")
+    return str(path)
+
+
+def validate_create_request(source):
+    project = validate_project(source.get("project"))
+    glpi_image = validate_local_image(source.get("glpi_image"), "glpi")
+    mariadb_image = validate_local_image(source.get("mariadb_image"), "database")
+    host_port = validate_port(source.get("host_port"), "Hostpoort")
+    container_port = validate_port(source.get("container_port"), "Containerpoort")
+    if container_port != 8080:
+        raise ValueError(
+            "Deze versie volgt de bewezen YAML en gebruikt intern poort 8080. "
+            "Laat containerpoort op 8080 staan."
+        )
+
+    tz = str(source.get("tz") or TZ_DEFAULT).strip() or TZ_DEFAULT
+    cookie_samesite = validate_cookie_samesite(source.get("cookie_samesite"))
+    cookie_secure = validate_cookie_secure(source.get("cookie_secure"))
+    clean_db = form_flag(source, "clean_db")
+    force_recreate = form_flag(source, "force_recreate")
+    restore_everything = form_flag(source, "restore_everything")
+    db_backup = (
+        source.get("db_backup")
+        or source.get("db_backup_manual")
+        or source.get("db_backup_select")
+        or ""
+    )
+    file_backup = (
+        source.get("file_backup")
+        or source.get("file_backup_manual")
+        or source.get("file_backup_select")
+        or ""
+    )
+    db_backup = validate_backup_choice(db_backup, DB_EXTENSIONS, "Databaseback-up")
+    file_backup = validate_backup_choice(
+        file_backup,
+        FILE_EXTENSIONS,
+        "GLPI-bestandenback-up",
+        allow_dir=True,
+    )
+
+    if restore_everything and not db_backup:
+        raise ValueError("Alles restoren staat aan, maar er is geen databaseback-up gekozen.")
+    if restore_everything and not file_backup:
+        raise ValueError("Alles restoren staat aan, maar er is geen GLPI-bestandenback-up gekozen.")
+
+    existing_state = project_has_existing_state(project)
+    if existing_state and (clean_db or db_backup or file_backup):
+        require_destructive_confirmation(project, source)
+
+    if not force_recreate and get_container(project):
+        current_ports = host_ports_for_container(project)
+        if current_ports and host_port not in current_ports:
+            raise ValueError(
+                f"Project {project} heeft al een GLPI-container op poort {current_ports[0]}. "
+                "Gebruik Poort aanpassen of vink GLPI-container opnieuw aanmaken aan."
+            )
+
+    exclude = {project} if force_recreate else set()
+    assert_docker_port_free(host_port, exclude_containers=exclude)
+    return {
+        "project": project,
+        "glpi_image": glpi_image,
+        "mariadb_image": mariadb_image,
+        "host_port": host_port,
+        "container_port": container_port,
+        "tz": tz,
+        "cookie_samesite": cookie_samesite,
+        "cookie_secure": cookie_secure,
+        "clean_db": clean_db,
+        "force_recreate": force_recreate,
+        "restore_everything": restore_everything,
+        "db_backup": db_backup,
+        "file_backup": file_backup,
+        "existing_state": existing_state,
+        "confirm_destructive": form_flag(source, "confirm_destructive"),
+        "confirm_project": str(source.get("confirm_project") or ""),
+        "backup_root": str(source.get("backup_root") or BACKUP_ROOT),
+    }
+
+
+def build_create_plan(data):
+    destructive = bool(data["existing_state"] and (data["clean_db"] or data["db_backup"] or data["file_backup"]))
+    return {
+        "title": "Bestaand project herstellen" if data["existing_state"] else "Nieuw GLPI-project aanmaken",
+        "risk": "Hoog - bestaande data wordt vervangen" if destructive else "Normaal - geen bevestigde dataverwijdering",
+        "destructive": destructive,
+        "rows": [
+            ("Project", data["project"]),
+            ("Webpoort", f"{data['host_port']}:8080"),
+            ("GLPI-image", data["glpi_image"]),
+            ("Database-image", data["mariadb_image"]),
+            ("Database", "schoon opnieuw opbouwen" if data["clean_db"] else "bestaande databasebestanden behouden"),
+            ("Databaseback-up", data["db_backup"] or "geen"),
+            ("GLPI-bestandenback-up", data["file_backup"] or "geen"),
+            ("GLPI-container", "opnieuw aanmaken" if data["force_recreate"] else "bestaande container hergebruiken indien aanwezig"),
+            ("Cookiebeleid", f"SameSite={data['cookie_samesite']}, Secure={data['cookie_secure']}"),
+            ("Tijdzone", data["tz"]),
+        ],
+        "steps": [
+            "Preflight opnieuw controleren (images, back-ups en vrije poort)",
+            "Projectmappen, .env en vergrendelde composeconfiguratie schrijven",
+            "Databasecontainer controleren of opnieuw opbouwen",
+            "Geselecteerde database- en bestandenback-ups herstellen",
+            "GLPI-container toepassen en het volledige actielog opslaan",
+        ],
+    }
+
+
+def store_create_preview(data):
+    token = secrets.token_urlsafe(32)
+    session["pending_create_preview"] = {
+        "token": token,
+        "created_at": int(time.time()),
+        "data": data,
+    }
+    session.modified = True
+    return token
+
+
+def consume_create_preview(token):
+    pending = session.pop("pending_create_preview", None)
+    session.modified = True
+    if not pending or not token or not hmac.compare_digest(str(pending.get("token", "")), str(token)):
+        raise ValueError("De uitvoerpreview ontbreekt of is ongeldig. Maak een nieuwe preview.")
+    created_at = int(pending.get("created_at") or 0)
+    if created_at < int(time.time()) - CREATE_PREVIEW_TTL_SECONDS:
+        raise ValueError("De uitvoerpreview is verlopen. Controleer het plan opnieuw.")
+    return pending["data"]
 
 
 def scan_files(root, extensions, include_dirs=False):
@@ -1810,6 +1968,29 @@ Als je een bestaande projectnaam gebruikt of schoon begint, moet je hieronder be
 """
 
 
+CREATE_PREVIEW_HTML = r"""<!doctype html>
+<html lang="nl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Uitvoerplan · GLPI Project Builder</title>
+<style>
+:root{--bg:#f3f6f9;--card:#fff;--line:#d8e0e8;--ink:#17212b;--muted:#667483;--brand:#16704a;--danger:#b42318}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px system-ui,-apple-system,"Segoe UI",sans-serif}
+header{background:#102a43;color:#fff;padding:20px}header div,main{max-width:900px;margin:auto}main{padding:28px 18px 50px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:20px;box-shadow:0 1px 2px #102a4310;margin-bottom:18px}
+h1,h2{margin-top:0}.meta{color:var(--muted)}.risk{border-left:5px solid var(--brand);padding:12px 14px;background:#edf8f3;border-radius:8px}.risk.danger{border-color:var(--danger);background:#fff0ef}
+dl{display:grid;grid-template-columns:minmax(170px,240px) 1fr;gap:0;border-top:1px solid var(--line)}dt,dd{margin:0;padding:10px 0;border-bottom:1px solid var(--line)}dt{font-weight:700;padding-right:15px}dd{overflow-wrap:anywhere}
+ol{padding-left:22px}li{margin:9px 0}.actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center}button,.button{border:0;border-radius:8px;padding:11px 15px;background:var(--brand);color:#fff;font-weight:750;text-decoration:none;cursor:pointer}.secondary{background:#425466}
+@media(max-width:640px){dl{grid-template-columns:1fr}dt{border-bottom:0;padding-bottom:0}dd{padding-top:4px}}
+</style></head><body>
+<header><div><h1>Controleer het uitvoerplan</h1><div>{{ app_version }} · er is nog niets gewijzigd</div></div></header>
+<main>
+<section class="card"><h2>{{ plan.title }}</h2><p class="risk {{ 'danger' if plan.destructive else '' }}"><strong>Risico:</strong> {{ plan.risk }}</p>
+<dl>{% for label,value in plan.rows %}<dt>{{ label }}</dt><dd>{{ value }}</dd>{% endfor %}</dl></section>
+<section class="card"><h2>Uitvoervolgorde</h2><ol>{% for step in plan.steps %}<li>{{ step }}</li>{% endfor %}</ol>
+<p class="meta">De preflight wordt vlak vóór uitvoering opnieuw gedaan. Is de poort, image of back-up intussen gewijzigd, dan stopt de actie veilig.</p></section>
+<section class="card"><div class="actions"><form method="post" action="{{ url_for('execute_create') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="preview_token" value="{{ preview_token }}"><button type="submit">Plan bevestigen en uitvoeren</button></form><a class="button secondary" href="{{ url_for('index') }}#nieuw">Terug en aanpassen</a></div></section>
+</main></body></html>"""
+
+
 @app.route("/", methods=["GET"])
 def index():
     backup_root = request.args.get("backup_root", BACKUP_ROOT)
@@ -1833,55 +2014,57 @@ def create():
     project_for_log = None
     try:
         require_csrf()
-        project = validate_project(request.form.get("project"))
+        data = validate_create_request(request.form)
+        project_for_log = data["project"]
+        preview_token = store_create_preview(data)
+        return render_template_string(
+            CREATE_PREVIEW_HTML,
+            plan=build_create_plan(data),
+            preview_token=preview_token,
+        )
+    except Exception as exc:
+        flash_error(str(exc), project_for_log, "create-preview-fout")
+    return redirect(url_for("index", backup_root=backup_root))
+
+
+@app.route("/create/execute", methods=["POST"])
+def execute_create():
+    backup_root = BACKUP_ROOT
+    project_for_log = None
+    try:
+        require_csrf()
+        stored_data = consume_create_preview(request.form.get("preview_token"))
+        backup_root = stored_data.get("backup_root") or BACKUP_ROOT
+        data = validate_create_request(stored_data)
+        project = data["project"]
         project_for_log = project
-        glpi_image = validate_local_image(request.form.get("glpi_image"), "glpi")
-        mariadb_image = validate_local_image(request.form.get("mariadb_image"), "database")
-
-        host_port = validate_port(request.form.get("host_port"), "Hostpoort")
-        container_port = validate_port(request.form.get("container_port"), "Containerpoort")
-        if container_port != 8080:
-            raise ValueError("Deze versie volgt je werkende YAML en gebruikt intern poort 8080. Laat containerpoort op 8080 staan.")
-
-        tz = request.form.get("tz", TZ_DEFAULT).strip() or TZ_DEFAULT
-        cookie_samesite = validate_cookie_samesite(request.form.get("cookie_samesite"))
-        cookie_secure = validate_cookie_secure(request.form.get("cookie_secure"))
-        clean_db = bool(request.form.get("clean_db"))
-        force_recreate = bool(request.form.get("force_recreate"))
-        restore_everything = bool(request.form.get("restore_everything"))
-
-        db_backup = request.form.get("db_backup_manual", "").strip() or request.form.get("db_backup_select", "").strip()
-        file_backup = request.form.get("file_backup_manual", "").strip() or request.form.get("file_backup_select", "").strip()
-
-        if restore_everything and not db_backup:
-            raise ValueError("Alles restoren staat aan, maar er is geen databasebackup gekozen.")
-        if restore_everything and not file_backup:
-            raise ValueError("Alles restoren staat aan, maar er is geen GLPI bestanden/config/plugins backup gekozen.")
-
-        existing_state = project_has_existing_state(project)
-        if existing_state and (clean_db or db_backup or file_backup):
-            require_destructive_confirmation(project)
-
-        if not force_recreate and get_container(project):
-            current_ports = host_ports_for_container(project)
-            if current_ports and host_port not in current_ports:
-                raise ValueError(
-                    f"Project {project} heeft al een GLPI-container op poort {current_ports[0]}. "
-                    "Gebruik Poort aanpassen of vink GLPI-container opnieuw aanmaken aan."
-                )
-
-        exclude = {project} if force_recreate else set()
-        assert_docker_port_free(host_port, exclude_containers=exclude)
 
         ensure_dirs(project)
-        env = build_env(project, glpi_image, mariadb_image, host_port, container_port, tz, clean_db, cookie_samesite=cookie_samesite, cookie_secure=cookie_secure)
+        env = build_env(
+            project,
+            data["glpi_image"],
+            data["mariadb_image"],
+            data["host_port"],
+            data["container_port"],
+            data["tz"],
+            data["clean_db"],
+            cookie_samesite=data["cookie_samesite"],
+            cookie_secure=data["cookie_secure"],
+        )
         validate_db_identifier(env["GLPI_DB_NAME"])
         write_env(project, env)
         write_compose(project, env)
 
-        messages = create_or_restore(project, env, clean_db, force_recreate, db_backup, file_backup)
+        messages = create_or_restore(
+            project,
+            env,
+            data["clean_db"],
+            data["force_recreate"],
+            data["db_backup"],
+            data["file_backup"],
+        )
         messages.append(f"Projectmap: {project_dir(project)}")
-        messages.append(f"GLPI-poort: {host_port}:8080")
+        messages.append(f"GLPI-poort: {data['host_port']}:8080")
         messages.append(f"Cookie SameSite: {env['GLPI_SESSION_COOKIE_SAMESITE']}")
         messages.append(f"Cookie Secure: {env['GLPI_SESSION_COOKIE_SECURE']}")
         flash_action_success(project, "create-restore", messages)
@@ -2066,7 +2249,7 @@ label{display:block;font-weight:650;margin:12px 0 5px}input,select{width:100%;mi
 <div class="step"><h3>2. Versies</h3><div class="row"><div><label>GLPI-image</label><select name="glpi_image" required>{% for image in glpi_images %}<option>{{ image }}</option>{% else %}<option value="">Geen toegestane lokale GLPI-image</option>{% endfor %}</select></div><div><label>Database-image</label><select name="mariadb_image" required>{% for image in db_images %}<option>{{ image }}</option>{% else %}<option value="">Geen toegestane lokale database-image</option>{% endfor %}</select></div></div></div>
 <div class="step"><h3>3. Optionele restore</h3><div class="row"><div><label>Databaseback-up</label><select name="db_backup_select"><option value="">Geen</option>{% for value,label in db_backups %}<option value="{{ value }}">{{ label }}</option>{% endfor %}</select></div><div><label>GLPI-bestanden of map</label><select name="file_backup_select"><option value="">Geen</option>{% for value,label in file_backups %}<option value="{{ value }}">{{ label }}</option>{% endfor %}</select></div></div><input type="hidden" name="db_backup_manual"><input type="hidden" name="file_backup_manual"></div>
 <div class="step"><h3>4. Controleren en uitvoeren</h3><details><summary>Geavanceerde instellingen</summary><div class="row"><div><label>Tijdzone</label><input name="tz" value="{{ tz_default }}"></div><div><label>Cookie SameSite</label><select name="cookie_samesite"><option>Lax</option><option>Strict</option><option>None</option></select></div></div><label>Cookie Secure</label><select name="cookie_secure"><option>Off</option><option>On</option></select><label class="check"><input type="checkbox" name="restore_everything" value="yes">Alles restoren</label><label class="check"><input type="checkbox" name="force_recreate" value="yes">Bestaande GLPI-container opnieuw aanmaken</label><label class="check"><input type="checkbox" name="clean_db" value="yes">Database schoon opbouwen</label></details>
-<label class="check"><input type="checkbox" name="confirm_destructive" value="yes">Ik begrijp dat een bestaande projectnaam data of containers kan wijzigen.</label><label>Typ bij een bestaand project de projectnaam ter bevestiging</label><input name="confirm_project"><button>Project aanmaken / restore starten</button></div></form></section>
+<label class="check"><input type="checkbox" name="confirm_destructive" value="yes">Ik begrijp dat een bestaande projectnaam data of containers kan wijzigen.</label><label>Typ bij een bestaand project de projectnaam ter bevestiging</label><input name="confirm_project"><button>Plan controleren</button><small>Er wordt pas iets gewijzigd nadat je het uitvoerplan op de volgende pagina bevestigt.</small></div></form></section>
 </main></body></html>"""
 
 

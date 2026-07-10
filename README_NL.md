@@ -14,6 +14,8 @@ rechten. Start hem alleen voor beheer en stop hem daarna.
 ## Verbeteringen
 
 - rustig projectdashboard en begeleide create/restore-wizard;
+- server-side preflight met een apart uitvoerplan dat binnen tien minuten expliciet bevestigd moet worden;
+- hercontrole van images, back-ups, poort en bestaand project vlak vóór uitvoering;
 - bestaande projecten beheren vanuit één projectkaart;
 - backupselectie uitsluitend onder de vaste `BACKUP_ROOT`;
 - whitelists voor lokaal beschikbare GLPI- en database-images;
@@ -54,6 +56,7 @@ sudo docker stop glpi-project-builder-full-restore
 python3 -m py_compile app.py
 python3 tests/test_yaml_contract.py
 python3 tests/test_static_security.py
+python3 tests/test_preview_flow.py
 ```
 
 ## Operationele aandachtspunten

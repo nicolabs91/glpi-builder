@@ -5,8 +5,10 @@ source = (Path(__file__).resolve().parents[1] / "app.py").read_text(encoding="ut
 required = [
     "path_under_backup_root(backup_path)",
     "path_under_backup_root(source)",
-    "validate_local_image(request.form.get(\"glpi_image\")",
+    "validate_local_image(source.get(\"glpi_image\")",
     "MUTATION_LOCK.acquire(blocking=False)",
+    'session["pending_create_preview"]',
+    '@app.route("/create/execute", methods=["POST"])',
     '@app.route("/healthz")',
 ]
 missing = [item for item in required if item not in source]
