@@ -29,6 +29,10 @@ class UiLanguageAndProgressTest(unittest.TestCase):
         self.assertIn(b"row row-settings", response.data)
         self.assertIn(b"compact-control", response.data)
         self.assertIn(b"font:inherit", response.data)
+        self.assertIn(b'value="restore" checked', response.data)
+        self.assertIn(b"Full restore (standard)", response.data)
+        self.assertIn(b"Fresh installation (rare)", response.data)
+        self.assertIn(b"Restore without plugins", response.data)
         self.assertNotIn(b"Projecten", response.data)
         self.assertNotIn(b"Nieuw project", response.data)
 

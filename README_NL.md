@@ -17,6 +17,9 @@ rechten. Start hem alleen voor beheer en stop hem daarna.
 - volledig Engelstalige gebruikersinterface en operationele meldingen;
 - inhoudsafhankelijke, evenwichtige formulierbreedtes voor desktop en mobiel;
 - echte restorevoortgang met actuele fase, percentage, verstreken tijd en activiteitenlog;
+- Full restore als standaard met verplichte database- en GLPI-configback-up;
+- expliciete Fresh installation voor een zeldzame volledig lege installatie;
+- optioneel herstellen zonder plugins, marketplace-data en plugincache;
 - restore-uitvoering in één bewaakte achtergrondtaak, zodat de voortgangspagina beschikbaar blijft;
 - rustig projectdashboard en begeleide create/restore-wizard;
 - server-side preflight met een apart uitvoerplan dat binnen tien minuten expliciet bevestigd moet worden;

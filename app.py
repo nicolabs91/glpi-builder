@@ -18,7 +18,7 @@ import docker
 from docker.errors import NotFound, ContainerError
 from flask import Flask, request, redirect, url_for, render_template_string, flash, session, g, jsonify
 
-APP_VERSION = "v11.3 - balanced forms and restore progress, YAML locked"
+APP_VERSION = "v11.4 - restore-first workflow and fresh install, YAML locked"
 APP_PORT = int(os.environ.get("APP_PORT", "8080"))
 BASE_PATH = Path(os.environ.get("BASE_PATH", "/volume1/docker"))
 BACKUP_ROOT = Path(os.environ.get("BACKUP_ROOT", "/volume1/docker/_BACKUPS"))
@@ -35,6 +35,7 @@ COOKIE_SAMESITE_CHOICES = ("Lax", "Strict", "None")
 COOKIE_SECURE_CHOICES = ("Off", "On")
 CREATE_PREVIEW_TTL_SECONDS = 10 * 60
 PROGRESS_JOB_TTL_SECONDS = 6 * 60 * 60
+OPERATION_MODES = ("restore", "fresh")
 
 PROJECT_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{2,50}$")
 LOG_FILE_RE = re.compile(r"^[0-9]{8}-[0-9]{6}-[a-z0-9_-]+\.log$")
@@ -508,7 +509,12 @@ def wait_db(project, seconds=180):
     while time.time() < deadline:
         try:
             db = docker_client().containers.get(f"{project}-db")
-            result = db.exec_run('sh -lc \'mariadb-admin ping -uroot -p"$MARIADB_ROOT_PASSWORD" --silent\'', demux=True)
+            result = db.exec_run(
+                'sh -lc \'case "$(cat /proc/1/comm 2>/dev/null)" in '
+                'mariadbd|mysqld) mariadb-admin ping -uroot -p"$MARIADB_ROOT_PASSWORD" --silent ;; '
+                '*) exit 1 ;; esac\'',
+                demux=True,
+            )
             stdout, stderr = result.output if isinstance(result.output, tuple) else (result.output, b"")
             last = ((stdout or b"") + (stderr or b"")).decode("utf-8", errors="replace")
             if result.exit_code == 0:
@@ -674,9 +680,14 @@ def validate_create_request(source):
     tz = str(source.get("tz") or TZ_DEFAULT).strip() or TZ_DEFAULT
     cookie_samesite = validate_cookie_samesite(source.get("cookie_samesite"))
     cookie_secure = validate_cookie_secure(source.get("cookie_secure"))
-    clean_db = form_flag(source, "clean_db")
-    force_recreate = form_flag(source, "force_recreate")
-    restore_everything = form_flag(source, "restore_everything")
+    operation_mode = str(source.get("operation_mode") or "restore").strip().lower()
+    if operation_mode not in OPERATION_MODES:
+        raise ValueError("Operation mode must be Full restore or Fresh installation.")
+    fresh_install = operation_mode == "fresh"
+    clean_db = fresh_install
+    force_recreate = True
+    restore_everything = not fresh_install
+    skip_plugins = fresh_install or form_flag(source, "skip_plugins")
     db_backup = (
         source.get("db_backup")
         or source.get("db_backup_manual")
@@ -697,10 +708,12 @@ def validate_create_request(source):
         allow_dir=True,
     )
 
-    if restore_everything and not db_backup:
-        raise ValueError("Restore everything is enabled, but no database backup was selected.")
-    if restore_everything and not file_backup:
-        raise ValueError("Restore everything is enabled, but no GLPI files backup was selected.")
+    if operation_mode == "restore" and not db_backup:
+        raise ValueError("Full restore requires a database backup.")
+    if operation_mode == "restore" and not file_backup:
+        raise ValueError("Full restore requires a GLPI files/config backup.")
+    if fresh_install and (db_backup or file_backup):
+        raise ValueError("Fresh installation must not include backup selections. Clear both backup fields first.")
 
     existing_state = project_has_existing_state(project)
     if existing_state and (clean_db or db_backup or file_backup):
@@ -725,9 +738,12 @@ def validate_create_request(source):
         "tz": tz,
         "cookie_samesite": cookie_samesite,
         "cookie_secure": cookie_secure,
+        "operation_mode": operation_mode,
+        "fresh_install": fresh_install,
         "clean_db": clean_db,
         "force_recreate": force_recreate,
         "restore_everything": restore_everything,
+        "skip_plugins": skip_plugins,
         "db_backup": db_backup,
         "file_backup": file_backup,
         "existing_state": existing_state,
@@ -738,30 +754,48 @@ def validate_create_request(source):
 
 
 def build_create_plan(data):
-    destructive = bool(data["existing_state"] and (data["clean_db"] or data["db_backup"] or data["file_backup"]))
+    fresh_install = data["fresh_install"]
+    destructive = bool(data["existing_state"])
+    mode_title = "Fresh installation (rare)" if fresh_install else "Full restore (standard)"
+    database_action = "delete all database storage and install an empty GLPI database" if fresh_install else "replace the GLPI database from the selected backup"
+    files_action = "use only the original files from the GLPI image" if fresh_install else "restore GLPI config and files from backup"
+    plugin_action = "start without plugins" if data["skip_plugins"] else "restore plugins from backup"
+    steps = [
+        "Repeat the preflight checks (images, backups and free port)",
+        "Write project folders, .env and the locked compose configuration",
+    ]
+    if fresh_install:
+        steps.extend([
+            "Delete the database storage, GLPI config/files and plugin data",
+            "Create a clean database container and run the one-time GLPI installer as www-data",
+            "Verify config_db.php and save the complete action log",
+        ])
+    else:
+        steps.extend([
+            "Import the required database backup",
+            "Restore the required GLPI files/config backup",
+            "Remove plugin data when Restore without plugins is selected",
+            "Reapply the GLPI container and save the complete action log",
+        ])
     return {
-        "title": "Restore existing project" if data["existing_state"] else "Create new GLPI project",
-        "risk": "High - existing data will be replaced" if destructive else "Normal - no confirmed data removal",
+        "title": mode_title,
+        "risk": "High - all existing project data will be deleted" if fresh_install else ("High - existing project data will be replaced" if destructive else "Normal - required backups will be restored"),
         "destructive": destructive,
         "rows": [
             ("Project", data["project"]),
+            ("Mode", mode_title),
             ("Web port", f"{data['host_port']}:8080"),
             ("GLPI image", data["glpi_image"]),
             ("Database image", data["mariadb_image"]),
-            ("Database", "rebuild from scratch" if data["clean_db"] else "keep existing database files"),
+            ("Database", database_action),
+            ("GLPI files/config", files_action),
+            ("Plugins", plugin_action),
             ("Database backup", data["db_backup"] or "none"),
             ("GLPI files backup", data["file_backup"] or "none"),
-            ("GLPI container", "recreate" if data["force_recreate"] else "reuse existing container when available"),
             ("Cookie policy", f"SameSite={data['cookie_samesite']}, Secure={data['cookie_secure']}"),
             ("Time zone", data["tz"]),
         ],
-        "steps": [
-            "Repeat the preflight checks (images, backups and free port)",
-            "Write project folders, .env and the locked compose configuration",
-            "Check or rebuild the database container",
-            "Restore the selected database and files backups",
-            "Apply the GLPI container and save the complete action log",
-        ],
+        "steps": steps,
     }
 
 
@@ -1250,7 +1284,27 @@ def patch_config_db(project):
     return "No config_db.php file was changed or found."
 
 
-def restore_glpi_files(project, file_source):
+def clear_plugin_data(project):
+    targets = [
+        project_dir(project) / "plugins",
+        project_dir(project) / "glpi" / "marketplace",
+        project_dir(project) / "glpi" / "files" / "_plugins",
+    ]
+    for target in targets:
+        empty_dir(target)
+    return "Plugin directories were intentionally emptied. Database references to plugins may still exist."
+
+
+def prepare_fresh_install(project):
+    empty_dir(project_dir(project) / "glpi")
+    empty_dir(project_dir(project) / "plugins")
+    for folder in ["config", "marketplace", "logs"]:
+        (project_dir(project) / "glpi" / folder).mkdir(parents=True, exist_ok=True)
+    ensure_glpi_writable_dirs(project)
+    return "Removed existing GLPI config, files, marketplace and plugin data for a fresh installation."
+
+
+def restore_glpi_files(project, file_source, restore_plugins=True):
     root, tmp = extract_source(file_source)
     messages = []
 
@@ -1269,7 +1323,9 @@ def restore_glpi_files(project, file_source):
         messages.append(f"Restored /var/glpi from {var_glpi}")
 
         empty_dir(plugins_target)
-        if plugins:
+        if not restore_plugins:
+            messages.append(clear_plugin_data(project))
+        elif plugins:
             copy_tree_contents(plugins, plugins_target)
             messages.append(f"Restored plugins from {plugins}")
         else:
@@ -1419,12 +1475,74 @@ def create_glpi_container(project, env, force_recreate=True, pull_image=True):
     return f"Created GLPI container using the custom v7 YAML template: {project} ({host_port}:8080)"
 
 
-def create_or_restore(project, env, clean_db, force_recreate, db_backup, file_backup, progress=None):
+def install_fresh_glpi(project, env):
+    command = r'''exec php bin/console database:install \
+  --db-host="$GLPI_DB_HOST" \
+  --db-port="$GLPI_DB_PORT" \
+  --db-name="$GLPI_DB_NAME" \
+  --db-user="$GLPI_DB_USER" \
+  --db-password="$GLPI_DB_PASSWORD" \
+  --no-interaction --quiet'''
+    try:
+        output = docker_client().containers.run(
+            env["GLPI_IMAGE"],
+            command=["-lc", command],
+            entrypoint="/bin/sh",
+            working_dir="/var/www/glpi",
+            user="33:33",
+            remove=True,
+            detach=False,
+            environment={
+                "GLPI_DB_HOST": f"{project}-db",
+                "GLPI_DB_PORT": "3306",
+                "GLPI_DB_NAME": env["GLPI_DB_NAME"],
+                "GLPI_DB_USER": env["GLPI_DB_USER"],
+                "GLPI_DB_PASSWORD": env["GLPI_DB_PASSWORD"],
+            },
+            volumes={
+                str(project_dir(project) / "glpi"): {"bind": "/var/glpi", "mode": "rw"},
+                str(project_dir(project) / "plugins"): {"bind": "/var/www/glpi/plugins", "mode": "rw"},
+            },
+            network=f"{project}-network",
+            stdout=True,
+            stderr=True,
+        )
+        config_file = project_dir(project) / "glpi" / "config" / "config_db.php"
+        for _ in range(40):
+            if config_file.is_file():
+                break
+            time.sleep(0.25)
+        if not config_file.is_file():
+            raise RuntimeError("Fresh installation completed without creating config_db.php.")
+        text = output.decode("utf-8", errors="replace") if isinstance(output, (bytes, bytearray)) else str(output or "")
+        return "Fresh GLPI database installation completed as www-data and config_db.php was verified." + ("\n" + text if text else "")
+    except ContainerError as exc:
+        stderr = getattr(exc, "stderr", b"") or b""
+        stdout = getattr(exc, "stdout", b"") or b""
+        details = (stdout + stderr).decode("utf-8", errors="replace") if isinstance(stdout, bytes) and isinstance(stderr, bytes) else str(exc)
+        raise RuntimeError("Fresh GLPI database installation failed:\n" + tail_text(details, 5000))
+
+
+def create_or_restore(
+    project,
+    env,
+    clean_db,
+    force_recreate,
+    db_backup,
+    file_backup,
+    progress=None,
+    fresh_install=False,
+    skip_plugins=False,
+):
     messages = []
     report = progress or (lambda _percent, _stage, _message=None: None)
 
     report(18, "Preparing project", "Creating and checking the project folders.")
     ensure_dirs(project)
+    if fresh_install:
+        report(22, "Clearing GLPI data", "Removing existing GLPI config, files and plugins.")
+        messages.append(prepare_fresh_install(project))
+        messages.append(fix_permissions(project))
     report(26, "Preparing network", "Checking the isolated Docker network.")
     ensure_network(project)
     messages.append(f"Checked network: {project}-network")
@@ -1447,24 +1565,33 @@ def create_or_restore(project, env, clean_db, force_recreate, db_backup, file_ba
         messages.append("Database backup restored successfully.")
         messages.append(out)
     else:
-        report(57, "Synchronizing database user", "No database backup selected; synchronizing the database account.")
-        ok, out = reset_db_user(project)
-        messages.append(out)
-        if not ok:
-            raise RuntimeError(out)
+        report(57, "Preparing empty database", "Preparing database credentials for the fresh GLPI installation.")
+        if fresh_install:
+            messages.append("MariaDB created the empty GLPI database and application user from the locked environment settings.")
+        else:
+            ok, out = reset_db_user(project)
+            messages.append(out)
+            if not ok:
+                raise RuntimeError(out)
 
     if file_backup:
         report(72, "Restoring GLPI files", "Extracting and copying the selected GLPI files backup.")
-        messages.extend(restore_glpi_files(project, file_backup))
+        messages.extend(restore_glpi_files(project, file_backup, restore_plugins=not skip_plugins))
     else:
-        report(72, "Keeping GLPI files", "No files backup selected; existing GLPI files are kept.")
-        messages.append("No GLPI files backup was provided; existing /var/glpi and plugins remain in place.")
+        report(72, "Using image defaults", "No files backup is used; GLPI will create only its standard config and data.")
+        messages.append("Fresh installation uses only the original GLPI image files and empty persistent directories.")
+
+    if fresh_install:
+        report(78, "Installing empty GLPI database", "Running the GLPI database installer once as www-data.")
+        messages.append(install_fresh_glpi(project, env))
 
     report(84, "Applying permissions", "Applying the required permissions to persistent GLPI data.")
     ensure_glpi_writable_dirs(project)
     messages.append(fix_permissions(project))
     report(92, "Applying GLPI container", "Creating or updating the GLPI application container.")
     messages.append(create_glpi_container(project, env, force_recreate=force_recreate))
+    if fresh_install:
+        messages.append("Initial GLPI credentials are glpi / glpi. Change this password immediately after signing in.")
     return messages
 
 
@@ -1502,25 +1629,34 @@ def run_create_job(job_token, data):
             data["db_backup"],
             data["file_backup"],
             progress=report,
+            fresh_install=data["fresh_install"],
+            skip_plugins=data["skip_plugins"],
         )
         messages.append(f"Project folder: {project_dir(project)}")
         messages.append(f"GLPI port: {data['host_port']}:8080")
         messages.append(f"Cookie SameSite: {env['GLPI_SESSION_COOKIE_SAMESITE']}")
         messages.append(f"Cookie Secure: {env['GLPI_SESSION_COOKIE_SECURE']}")
-        update_progress_job(job_token, 98, "Saving action log", "Saving the complete restore log.")
-        log_name = write_action_log(project, "create-restore", messages)
+        update_progress_job(job_token, 98, "Saving action log", "Saving the complete action log.")
+        action_name = "fresh-install" if data["fresh_install"] else "full-restore"
+        log_name = write_action_log(project, action_name, messages)
+        completion_message = (
+            "Fresh installation completed. Sign in with glpi / glpi and change the password immediately."
+            if data["fresh_install"]
+            else "The full GLPI restore completed successfully."
+        )
         update_progress_job(
             job_token,
             100,
             "Completed",
-            "The GLPI project was applied successfully.",
+            completion_message,
             status="completed",
             log_name=log_name,
         )
     except Exception as exc:
         error_text = str(exc)
         try:
-            log_name = write_action_log(project, "create-restore-error", ["ERROR", error_text] + messages)
+            action_name = "fresh-install-error" if data.get("fresh_install") else "full-restore-error"
+            log_name = write_action_log(project, action_name, ["ERROR", error_text] + messages)
         except Exception:
             log_name = ""
         update_progress_job(
@@ -2384,8 +2520,8 @@ V11_HTML = r"""<!doctype html>
 header{background:#102a43;color:#fff;padding:20px}header div,main{max-width:1080px;margin:auto}h1{margin:0;font-size:25px}h2{margin:0 0 14px}h3{margin:0 0 8px}
 main{padding:24px 18px 50px}.toolbar,.grid,.row{display:grid;gap:14px}.toolbar{grid-template-columns:1fr auto;align-items:center}.grid{grid-template-columns:repeat(auto-fit,minmax(290px,1fr));margin:16px 0 26px}.row{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}.row-project{grid-template-columns:minmax(0,1fr) minmax(140px,180px)}.row-settings{grid-template-columns:minmax(220px,280px) repeat(2,minmax(150px,180px));justify-content:start}#new-project form{max-width:920px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px;box-shadow:0 1px 2px #102a4310}.project{display:flex;flex-direction:column;gap:10px}.meta{color:var(--muted);font-size:13px}.status{display:inline-block;border-radius:999px;padding:3px 9px;background:#eef2f6;font-size:12px}.running{background:#e8f7ef;color:#16643d}.notice{padding:12px 14px;border-radius:9px;margin-bottom:10px;background:#eef5ff;border:1px solid #b9d3f8}.notice.err{background:#fff0ef;border-color:#f5b1ab}.notice.ok{background:#ecfdf3;border-color:#9bd7b5}
-label{display:block;font-size:14px;line-height:1.35;font-weight:600;margin:14px 0 7px}input,select{width:100%;min-height:40px;border:1px solid #b9c5d0;border-radius:8px;padding:8px 11px;background:#fff;color:var(--ink);font:inherit;font-size:15px;line-height:1.2}.compact-control{max-width:180px}.confirm-field{max-width:360px}button,.button{display:inline-block;border:0;border-radius:8px;padding:10px 14px;background:var(--brand);color:#fff;font:inherit;font-weight:700;text-decoration:none;cursor:pointer}.secondary{background:#425466}.danger{background:var(--danger)}details{border-top:1px solid var(--line);margin-top:14px;padding-top:12px}summary{font-weight:700;cursor:pointer}.actions{display:flex;gap:8px;flex-wrap:wrap}.actions form{display:inline}.actions form input{width:auto}.empty{text-align:center;color:var(--muted);padding:35px}.step{border-left:4px solid var(--brand);padding-left:13px;margin:22px 0}.check{display:flex;align-items:flex-start;gap:8px;font-weight:500}.check input{width:auto;min-height:auto;margin-top:4px}small{display:inline-block;color:var(--muted);line-height:1.4;margin-top:6px}
-@media(max-width:700px){.row,.row-project,.row-settings,.toolbar{grid-template-columns:1fr}.toolbar .button{width:100%;text-align:center}input,select{min-height:44px}.compact-control,.confirm-field{max-width:none}#new-project form{max-width:none}}
+label{display:block;font-size:14px;line-height:1.35;font-weight:600;margin:14px 0 7px}input,select{width:100%;min-height:40px;border:1px solid #b9c5d0;border-radius:8px;padding:8px 11px;background:#fff;color:var(--ink);font:inherit;font-size:15px;line-height:1.2}.compact-control{max-width:180px}.confirm-field{max-width:360px}button,.button{display:inline-block;border:0;border-radius:8px;padding:10px 14px;background:var(--brand);color:#fff;font:inherit;font-weight:700;text-decoration:none;cursor:pointer}.secondary{background:#425466}.danger{background:var(--danger)}details{border-top:1px solid var(--line);margin-top:14px;padding-top:12px}summary{font-weight:700;cursor:pointer}.actions{display:flex;gap:8px;flex-wrap:wrap}.actions form{display:inline}.actions form input{width:auto}.empty{text-align:center;color:var(--muted);padding:35px}.step{border-left:4px solid var(--brand);padding-left:13px;margin:22px 0}.check{display:flex;align-items:flex-start;gap:8px;font-weight:500}.check input,.mode-option input{width:auto;min-height:auto;margin-top:4px}.mode-grid{display:grid;grid-template-columns:minmax(0,2fr) minmax(250px,1fr);gap:12px}.mode-option{display:flex;gap:10px;border:1px solid #9bcfb5;border-radius:9px;padding:12px;margin:12px 0 0;background:#f1fbf6;font-weight:500}.mode-option.rare{border-color:#e7b1ab;background:#fff7f5}.mode-option strong{display:block}.mode-option small{margin-top:3px}.required-note{color:#7a4b00;font-weight:600}small{display:inline-block;color:var(--muted);line-height:1.4;margin-top:6px}
+@media(max-width:700px){.row,.row-project,.row-settings,.toolbar,.mode-grid{grid-template-columns:1fr}.toolbar .button{width:100%;text-align:center}input,select{min-height:44px}.compact-control,.confirm-field{max-width:none}#new-project form{max-width:none}}
 </style></head><body>
 <header><div><h1>GLPI Project Builder</h1><div class="meta" style="color:#c9d8e6">{{ app_version }} · internal administration tool · stop the Builder after use</div></div></header>
 <main>
@@ -2407,8 +2543,8 @@ label{display:block;font-size:14px;line-height:1.35;font-weight:600;margin:14px 
 <form method="post" action="{{ url_for('create') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="backup_root" value="{{ backup_root }}"><input type="hidden" name="container_port" value="8080">
 <div class="step"><h3>1. Project</h3><div class="row row-project"><div><label>Project name</label><input name="project" pattern="[a-z0-9][a-z0-9_-]{2,50}" placeholder="glpi-production" required></div><div><label>Web port</label><input type="number" name="host_port" min="1" max="65535" value="8775" required></div></div></div>
 <div class="step"><h3>2. Versions</h3><div class="row"><div><label>GLPI image</label><select name="glpi_image" required>{% for image in glpi_images %}<option>{{ image }}</option>{% else %}<option value="">No allowed local GLPI image</option>{% endfor %}</select></div><div><label>Database image</label><select name="mariadb_image" required>{% for image in db_images %}<option>{{ image }}</option>{% else %}<option value="">No allowed local database image</option>{% endfor %}</select></div></div></div>
-<div class="step"><h3>3. Optional restore</h3><div class="row"><div><label>Database backup</label><select name="db_backup_select"><option value="">None</option>{% for value,label in db_backups %}<option value="{{ value }}">{{ label }}</option>{% endfor %}</select></div><div><label>GLPI files or folder</label><select name="file_backup_select"><option value="">None</option>{% for value,label in file_backups %}<option value="{{ value }}">{{ label }}</option>{% endfor %}</select></div></div><input type="hidden" name="db_backup_manual"><input type="hidden" name="file_backup_manual"></div>
-<div class="step"><h3>4. Review and execute</h3><details><summary>Advanced settings</summary><div class="row row-settings"><div><label>Time zone</label><input name="tz" value="{{ tz_default }}"></div><div><label>Cookie SameSite</label><select name="cookie_samesite"><option>Lax</option><option>Strict</option><option>None</option></select></div><div><label>Cookie Secure</label><select name="cookie_secure"><option>Off</option><option>On</option></select></div></div><label class="check"><input type="checkbox" name="restore_everything" value="yes">Restore everything</label><label class="check"><input type="checkbox" name="force_recreate" value="yes">Recreate existing GLPI container</label><label class="check"><input type="checkbox" name="clean_db" value="yes">Rebuild database from scratch</label></details>
+<div class="step"><h3>3. Mode and required backups</h3><div class="mode-grid"><label class="mode-option"><input type="radio" name="operation_mode" value="restore" checked><span><strong>Full restore (standard)</strong><small>Used in normal operation. Both the database and GLPI files/config backups are required.</small></span></label><label class="mode-option rare"><input type="radio" name="operation_mode" value="fresh"><span><strong>Fresh installation (rare)</strong><small>Deletes database, config, files and plugins. Leave both backup fields empty.</small></span></label></div><p class="required-note">Full restore is the default and requires both selections below.</p><div class="row"><div><label>Database backup</label><select name="db_backup_select"><option value="">Select required database backup</option>{% for value,label in db_backups %}<option value="{{ value }}">{{ label }}</option>{% endfor %}</select></div><div><label>GLPI files/config backup</label><select name="file_backup_select"><option value="">Select required GLPI files/config backup</option>{% for value,label in file_backups %}<option value="{{ value }}">{{ label }}</option>{% endfor %}</select></div></div><input type="hidden" name="db_backup_manual"><input type="hidden" name="file_backup_manual"><label class="check"><input type="checkbox" name="skip_plugins" value="yes">Restore without plugins</label><small>GLPI config and files are restored, but plugins, marketplace data and plugin cache are emptied. Database references to plugins may remain.</small></div>
+<div class="step"><h3>4. Review and execute</h3><details><summary>Advanced settings</summary><div class="row row-settings"><div><label>Time zone</label><input name="tz" value="{{ tz_default }}"></div><div><label>Cookie SameSite</label><select name="cookie_samesite"><option>Lax</option><option>Strict</option><option>None</option></select></div><div><label>Cookie Secure</label><select name="cookie_secure"><option>Off</option><option>On</option></select></div></div></details>
 <label class="check"><input type="checkbox" name="confirm_destructive" value="yes">I understand that an existing project name can modify data or containers.</label><label>For an existing project, type the project name to confirm</label><input class="confirm-field" name="confirm_project"><button>Review plan</button><small>Nothing is changed until you confirm the execution plan on the next page.</small></div></form></section>
 </main></body></html>"""
 

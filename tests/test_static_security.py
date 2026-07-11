@@ -11,6 +11,11 @@ required = [
     '@app.route("/create/execute", methods=["POST"])',
     '@app.route("/progress/<job_token>", methods=["GET"])',
     "target=run_create_job",
+    '"GLPI_SKIP_AUTOINSTALL": "true"',
+    'user="33:33"',
+    "install_fresh_glpi(project, env)",
+    "clear_plugin_data(project)",
+    'cat /proc/1/comm',
     '@app.route("/healthz")',
 ]
 missing = [item for item in required if item not in source]

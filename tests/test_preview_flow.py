@@ -40,7 +40,7 @@ class PreviewFlowTest(unittest.TestCase):
             "tz": "Europe/Brussels",
             "cookie_samesite": "Lax",
             "cookie_secure": "Off",
-            "force_recreate": "yes",
+            "operation_mode": "fresh",
         }
 
     def validation_patches(self):
@@ -60,6 +60,7 @@ class PreviewFlowTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn(b"Review the execution plan", response.data)
         self.assertIn(b"glpi-preview-test", response.data)
+        self.assertIn(b"Fresh installation (rare)", response.data)
         ensure_dirs.assert_not_called()
         with self.client.session_transaction() as flask_session:
             self.assertIn("pending_create_preview", flask_session)
@@ -95,12 +96,24 @@ class PreviewFlowTest(unittest.TestCase):
         self.assertEqual(response.status_code, 302)
         self.assertIn("/progress/", response.headers["Location"])
         execute.assert_called_once()
+        self.assertTrue(execute.call_args.kwargs["fresh_install"])
+        self.assertTrue(execute.call_args.kwargs["skip_plugins"])
         progress_response = self.client.get(response.headers["Location"])
         self.assertEqual(progress_response.status_code, 200)
         self.assertIn(b"Completed", progress_response.data)
         self.assertIn(b"100%", progress_response.data)
         with self.client.session_transaction() as flask_session:
             self.assertNotIn("pending_create_preview", flask_session)
+
+    def test_full_restore_rejects_missing_required_backups(self):
+        payload = self.payload()
+        payload["operation_mode"] = "restore"
+        patches = self.validation_patches()
+        with patches[0], patches[1], patches[2], patches[3]:
+            response = self.client.post("/create", data=payload, follow_redirects=True)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"Full restore requires a database backup", response.data)
 
 
 if __name__ == "__main__":
