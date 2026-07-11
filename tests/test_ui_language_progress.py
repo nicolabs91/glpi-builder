@@ -16,6 +16,7 @@ class UiLanguageAndProgressTest(unittest.TestCase):
         self.client = module.app.test_client()
 
     def test_dashboard_is_english(self):
+        self.assertEqual(module.APP_VERSION, "0.1")
         with patch.object(module, "discover_projects", return_value=[]), \
              patch.object(module, "scan_files", return_value=[]), \
              patch.object(module, "local_image_tags", side_effect=lambda kind: ["glpi/glpi:test"] if kind == "glpi" else ["mariadb:test"]):
@@ -24,6 +25,8 @@ class UiLanguageAndProgressTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn(b"Projects", response.data)
         self.assertIn(b"New project or restore", response.data)
+        self.assertEqual(response.data.count(b"New project or restore"), 1)
+        self.assertNotIn(b'href="#new-project"', response.data)
         self.assertIn(b"Review plan", response.data)
         self.assertIn(b"row row-project", response.data)
         self.assertIn(b"row row-settings", response.data)
@@ -42,7 +45,7 @@ class UiLanguageAndProgressTest(unittest.TestCase):
         self.assertIn(b"Type the project name to confirm overwrite", response.data)
         self.assertNotIn(b"For an existing project, type the project name to confirm", response.data)
         self.assertNotIn(b"I understand that an existing project name", response.data)
-        self.assertIn(b'class="version">v11.4', response.data)
+        self.assertIn(b'class="version">0.1</div>', response.data)
         self.assertNotIn(b"internal administration tool", response.data)
         self.assertNotIn(b"Status, web port and recent administration activity", response.data)
         self.assertNotIn(b"Complete these four steps", response.data)
@@ -69,6 +72,8 @@ class UiLanguageAndProgressTest(unittest.TestCase):
         self.assertIn(b'http-equiv="refresh"', response.data)
         self.assertIn(b"Restoring database", response.data)
         self.assertIn(b"57%", response.data)
+        self.assertIn(b"<div>0.1</div>", response.data)
+        self.assertNotIn(b"0.1 \xc2\xb7 project", response.data)
 
     def test_completed_progress_page_stops_refreshing(self):
         token = module.create_progress_job("glpi-progress-test", module.BACKUP_ROOT)

@@ -18,7 +18,7 @@ import docker
 from docker.errors import NotFound, ContainerError
 from flask import Flask, request, redirect, url_for, render_template_string, flash, session, g, jsonify
 
-APP_VERSION = "v11.4 - restore-first workflow and fresh install, YAML locked"
+APP_VERSION = "0.1"
 APP_PORT = int(os.environ.get("APP_PORT", "8080"))
 BASE_PATH = Path(os.environ.get("BASE_PATH", "/volume1/docker"))
 BACKUP_ROOT = Path(os.environ.get("BACKUP_ROOT", "/volume1/docker/_BACKUPS"))
@@ -2262,7 +2262,7 @@ dl{display:grid;grid-template-columns:minmax(170px,240px) 1fr;gap:0;border-top:1
 ol{padding-left:22px}li{margin:9px 0}.actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center}button,.button{border:0;border-radius:8px;padding:11px 15px;background:var(--brand);color:#fff;font-weight:750;text-decoration:none;cursor:pointer}.secondary{background:#425466}
 @media(max-width:640px){dl{grid-template-columns:1fr}dt{border-bottom:0;padding-bottom:0}dd{padding-top:4px}}
 </style></head><body>
-<header><div><h1>Review the execution plan</h1><div>{{ app_version }} · nothing has been changed yet</div></div></header>
+<header><div><h1>Review the execution plan</h1><div>{{ app_version }}</div></div></header>
 <main>
 <section class="card"><h2>{{ plan.title }}</h2><p class="risk {{ 'danger' if plan.destructive else '' }}"><strong>Risk:</strong> {{ plan.risk }}</p>
 <dl>{% for label,value in plan.rows %}<dt>{{ label }}</dt><dd>{{ value }}</dd>{% endfor %}</dl></section>
@@ -2285,7 +2285,7 @@ h1,h2{margin-top:0}.meta{color:var(--muted)}.status{display:inline-block;border-
 progress{display:block;width:100%;height:24px;margin:16px 0;accent-color:var(--brand)}.percent{font-size:28px;font-weight:800}.timeline{list-style:none;padding:0;margin:0}.timeline li{padding:10px 0 10px 20px;border-left:3px solid #a9d8c3;position:relative}.timeline li:before{content:"";position:absolute;left:-7px;top:16px;width:11px;height:11px;border-radius:50%;background:var(--brand)}
 .error{white-space:pre-wrap;background:#fff0ef;border:1px solid #f5b1ab;padding:12px;border-radius:8px;color:#7a271a}.actions{display:flex;gap:10px;flex-wrap:wrap}.button{display:inline-block;border-radius:8px;padding:10px 14px;background:var(--brand);color:#fff;font-weight:700;text-decoration:none}.secondary{background:#425466}
 </style></head><body>
-<header><div><h1>Restore progress</h1><div>{{ app_version }} · project {{ job.project }}</div></div></header>
+<header><div><h1>Restore progress</h1><div>{{ app_version }}</div></div></header>
 <main>
 <section class="card"><span class="status {{ job.status }}">{{ job.status|capitalize }}</span><h2 style="margin-top:14px">{{ job.stage }}</h2><div class="percent">{{ job.percent }}%</div><progress max="100" value="{{ job.percent }}">{{ job.percent }}%</progress><p class="meta">Elapsed time: {{ elapsed }} seconds{% if job.status in ['queued','running'] %} · this page refreshes automatically{% endif %}</p></section>
 {% if job.error %}<section class="card"><h2>Error</h2><div class="error">{{ job.error }}</div></section>{% endif %}
@@ -2519,15 +2519,15 @@ V11_HTML = r"""<!doctype html>
 :root{--bg:#f3f6f9;--card:#fff;--line:#d8e0e8;--ink:#17212b;--muted:#667483;--brand:#16704a;--danger:#b42318}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px system-ui,-apple-system,"Segoe UI",sans-serif}
 header{background:#102a43;color:#fff;padding:20px}header .header-inner,main{max-width:1080px;margin:auto}.header-inner{display:flex;justify-content:space-between;align-items:flex-start;gap:18px}.version{color:#c9d8e6;font-size:13px;line-height:1.3;padding-top:6px;text-align:right;white-space:nowrap}h1{margin:0;font-size:25px}h2{margin:0 0 14px}h3{margin:0 0 8px}
-main{padding:24px 18px 50px}.toolbar,.grid,.row{display:grid;gap:14px}.toolbar{grid-template-columns:1fr auto;align-items:center}.grid{grid-template-columns:repeat(auto-fit,minmax(290px,1fr));margin:16px 0 26px}.row{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}.row-project{grid-template-columns:minmax(0,1fr) minmax(140px,180px)}.row-settings{grid-template-columns:minmax(220px,280px) repeat(2,minmax(150px,180px));justify-content:start}#new-project form{max-width:920px}
+main{padding:24px 18px 50px}.grid,.row{display:grid;gap:14px}.grid{grid-template-columns:repeat(auto-fit,minmax(290px,1fr));margin:16px 0 26px}.row{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}.row-project{grid-template-columns:minmax(0,1fr) minmax(140px,180px)}.row-settings{grid-template-columns:minmax(220px,280px) repeat(2,minmax(150px,180px));justify-content:start}#new-project form{max-width:920px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px;box-shadow:0 1px 2px #102a4310}.project{display:flex;flex-direction:column;gap:10px}.meta{color:var(--muted);font-size:13px}.status{display:inline-block;border-radius:999px;padding:3px 9px;background:#eef2f6;font-size:12px}.running{background:#e8f7ef;color:#16643d}.notice{padding:12px 14px;border-radius:9px;margin-bottom:10px;background:#eef5ff;border:1px solid #b9d3f8}.notice.err{background:#fff0ef;border-color:#f5b1ab}.notice.ok{background:#ecfdf3;border-color:#9bd7b5}
 label{display:block;font-size:14px;line-height:1.35;font-weight:600;margin:14px 0 7px}input,select{width:100%;min-height:40px;border:1px solid #b9c5d0;border-radius:8px;padding:8px 11px;background:#fff;color:var(--ink);font:inherit;font-size:15px;line-height:1.2}.compact-control{max-width:180px}.confirm-field{max-width:360px}.overwrite-confirmation{display:none}.overwrite-option:has(#overwrite-existing:checked) .overwrite-confirmation{display:block}button,.button{display:inline-block;border:0;border-radius:8px;padding:10px 14px;background:var(--brand);color:#fff;font:inherit;font-weight:700;text-decoration:none;cursor:pointer}.secondary{background:#425466}.danger{background:var(--danger)}details{border-top:1px solid var(--line);margin-top:14px;padding-top:12px}summary{font-weight:700;cursor:pointer}.actions{display:flex;gap:8px;flex-wrap:wrap}.actions form{display:inline}.actions form input{width:auto}.empty{text-align:center;color:var(--muted);padding:35px}.step{border-left:4px solid var(--brand);padding-left:13px;margin:22px 0}.check{display:flex;align-items:flex-start;gap:8px;font-weight:500}.check input,.mode-option input{width:auto;min-height:auto;margin-top:4px}.mode-grid{display:grid;grid-template-columns:minmax(0,2fr) minmax(250px,1fr);gap:12px}.mode-option{display:flex;gap:10px;border:1px solid #9bcfb5;border-radius:9px;padding:12px;margin:12px 0 0;background:#f1fbf6;font-weight:500}.mode-option.rare{border-color:#e7b1ab;background:#fff7f5}.mode-option strong{display:block}small{display:inline-block;color:var(--muted);line-height:1.4;margin-top:6px}
-@media(max-width:700px){.row,.row-project,.row-settings,.toolbar,.mode-grid{grid-template-columns:1fr}.toolbar .button{width:100%;text-align:center}input,select{min-height:44px}.compact-control,.confirm-field{max-width:none}#new-project form{max-width:none}.version{font-size:12px;white-space:normal}}
+@media(max-width:700px){.row,.row-project,.row-settings,.mode-grid{grid-template-columns:1fr}input,select{min-height:44px}.compact-control,.confirm-field{max-width:none}#new-project form{max-width:none}.version{font-size:12px;white-space:normal}}
 </style></head><body>
 <header><div class="header-inner"><h1>GLPI Project Builder</h1><div class="version">{{ app_version }}</div></div></header>
 <main>
 {% with messages=get_flashed_messages(with_categories=true) %}{% for category,message in messages %}<div class="notice {{ category }}">{{ message|safe }}</div>{% endfor %}{% endwith %}
-<div class="toolbar" id="projects"><h2>Projects</h2><a class="button" href="#new-project">New project or restore</a></div>
+<div id="projects"><h2>Projects</h2></div>
 <div class="grid">
 {% for p in projects %}<article class="card project"><div><h3>{{ p.name }}</h3><span class="status {{ 'running' if p.glpi_status=='running' else '' }}">GLPI {{ p.glpi_status }}</span> <span class="status {{ 'running' if p.db_status=='running' else '' }}">DB {{ p.db_status }}</span></div>
 <div><strong>Web port:</strong> {{ p.active_port or 'not configured' }}</div><div class="meta">{{ p.glpi_image }}<br>{{ p.mariadb_image }}</div>
