@@ -8,8 +8,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import app as module
 
 
+class ImmediateThread:
+    def __init__(self, target, args=(), **_kwargs):
+        self.target = target
+        self.args = args
+
+    def start(self):
+        self.target(*self.args)
+
+
 class PreviewFlowTest(unittest.TestCase):
     def setUp(self):
+        if module.MUTATION_LOCK.locked():
+            module.MUTATION_LOCK.release()
+        with module.PROGRESS_LOCK:
+            module.PROGRESS_JOBS.clear()
         module.app.config.update(TESTING=True, SECRET_KEY="preview-test-secret")
         self.client = module.app.test_client()
         with self.client.session_transaction() as flask_session:
@@ -45,7 +58,7 @@ class PreviewFlowTest(unittest.TestCase):
             response = self.client.post("/create", data=self.payload())
 
         self.assertEqual(response.status_code, 200)
-        self.assertIn(b"Controleer het uitvoerplan", response.data)
+        self.assertIn(b"Review the execution plan", response.data)
         self.assertIn(b"glpi-preview-test", response.data)
         ensure_dirs.assert_not_called()
         with self.client.session_transaction() as flask_session:
@@ -71,15 +84,21 @@ class PreviewFlowTest(unittest.TestCase):
              patch.object(module, "build_env", return_value=env), \
              patch.object(module, "write_env"), \
              patch.object(module, "write_compose"), \
-             patch.object(module, "create_or_restore", return_value=["uitgevoerd"]) as execute, \
-             patch.object(module, "flash_action_success"):
+             patch.object(module, "create_or_restore", return_value=["completed"]) as execute, \
+             patch.object(module, "write_action_log", return_value="test-create-restore.log"), \
+             patch.object(module.threading, "Thread", ImmediateThread):
             response = self.client.post(
                 "/create/execute",
                 data={"csrf_token": "csrf-test", "preview_token": token},
             )
 
         self.assertEqual(response.status_code, 302)
+        self.assertIn("/progress/", response.headers["Location"])
         execute.assert_called_once()
+        progress_response = self.client.get(response.headers["Location"])
+        self.assertEqual(progress_response.status_code, 200)
+        self.assertIn(b"Completed", progress_response.data)
+        self.assertIn(b"100%", progress_response.data)
         with self.client.session_transaction() as flask_session:
             self.assertNotIn("pending_create_preview", flask_session)
 

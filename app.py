@@ -18,7 +18,7 @@ import docker
 from docker.errors import NotFound, ContainerError
 from flask import Flask, request, redirect, url_for, render_template_string, flash, session, g, jsonify
 
-APP_VERSION = "v11.1 - preview en bevestiging, YAML locked"
+APP_VERSION = "v11.2 - English UI and restore progress, YAML locked"
 APP_PORT = int(os.environ.get("APP_PORT", "8080"))
 BASE_PATH = Path(os.environ.get("BASE_PATH", "/volume1/docker"))
 BACKUP_ROOT = Path(os.environ.get("BACKUP_ROOT", "/volume1/docker/_BACKUPS"))
@@ -27,11 +27,14 @@ MAX_SCAN_ENTRIES = int(os.environ.get("MAX_SCAN_ENTRIES", "500"))
 ALLOWED_GLPI_IMAGES = tuple(filter(None, os.environ.get("ALLOWED_GLPI_IMAGES", "glpi/glpi:,diouxx/glpi:").split(",")))
 ALLOWED_DB_IMAGES = tuple(filter(None, os.environ.get("ALLOWED_DB_IMAGES", "mariadb:,mysql:").split(",")))
 MUTATION_LOCK = threading.Lock()
+PROGRESS_LOCK = threading.Lock()
+PROGRESS_JOBS = {}
 DEFAULT_SESSION_COOKIE_SAMESITE = os.environ.get("DEFAULT_GLPI_SESSION_COOKIE_SAMESITE", "Lax")
 DEFAULT_SESSION_COOKIE_SECURE = os.environ.get("DEFAULT_GLPI_SESSION_COOKIE_SECURE", "Off")
 COOKIE_SAMESITE_CHOICES = ("Lax", "Strict", "None")
 COOKIE_SECURE_CHOICES = ("Off", "On")
 CREATE_PREVIEW_TTL_SECONDS = 10 * 60
+PROGRESS_JOB_TTL_SECONDS = 6 * 60 * 60
 
 PROJECT_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{2,50}$")
 LOG_FILE_RE = re.compile(r"^[0-9]{8}-[0-9]{6}-[a-z0-9_-]+\.log$")
@@ -132,7 +135,7 @@ def safe_password(length=30):
 def validate_project(name):
     name = (name or "").strip().lower()
     if not PROJECT_RE.match(name):
-        raise ValueError("Ongeldige projectnaam. Gebruik kleine letters, cijfers, _ of -. Minimaal 3 tekens.")
+        raise ValueError("Invalid project name. Use lowercase letters, numbers, _ or -. Minimum length is 3 characters.")
     return name
 
 
@@ -140,9 +143,9 @@ def validate_port(value, label):
     try:
         value = int(str(value).strip())
     except Exception:
-        raise ValueError(f"{label} moet een nummer zijn.")
+        raise ValueError(f"{label} must be a number.")
     if value < 1 or value > 65535:
-        raise ValueError(f"{label} moet tussen 1 en 65535 zijn.")
+        raise ValueError(f"{label} must be between 1 and 65535.")
     return value
 
 
@@ -152,7 +155,7 @@ def validate_cookie_samesite(value, label="Cookie SameSite"):
     normalized = lookup.get(value.lower())
     if not normalized:
         allowed = ", ".join(COOKIE_SAMESITE_CHOICES)
-        raise ValueError(f"{label} moet een van deze waarden zijn: {allowed}.")
+        raise ValueError(f"{label} must be one of these values: {allowed}.")
     return normalized
 
 
@@ -165,7 +168,7 @@ def validate_cookie_secure(value, label="Cookie Secure"):
     normalized = aliases.get(value.lower())
     if not normalized:
         allowed = ", ".join(COOKIE_SECURE_CHOICES)
-        raise ValueError(f"{label} moet een van deze waarden zijn: {allowed}.")
+        raise ValueError(f"{label} must be one of these values: {allowed}.")
     return normalized
 
 
@@ -183,20 +186,20 @@ def cookie_samesite_for_display(env):
     try:
         return validate_cookie_samesite((env or {}).get("GLPI_SESSION_COOKIE_SAMESITE"))
     except Exception:
-        return (env or {}).get("GLPI_SESSION_COOKIE_SAMESITE") or "ongeldig"
+        return (env or {}).get("GLPI_SESSION_COOKIE_SAMESITE") or "invalid"
 
 
 def cookie_secure_for_display(env):
     try:
         return normalize_env_defaults(env or {}).get("GLPI_SESSION_COOKIE_SECURE", "Off")
     except Exception:
-        return (env or {}).get("GLPI_SESSION_COOKIE_SECURE") or "ongeldig"
+        return (env or {}).get("GLPI_SESSION_COOKIE_SECURE") or "invalid"
 
 
-def validate_db_identifier(value, label="Databasenaam"):
+def validate_db_identifier(value, label="Database name"):
     value = (value or "").strip()
     if not re.match(r"^[A-Za-z0-9_]+$", value):
-        raise ValueError(f"{label} mag alleen letters, cijfers en _ bevatten.")
+        raise ValueError(f"{label} may only contain letters, numbers and _.")
     return value
 
 
@@ -281,10 +284,10 @@ def validate_local_image(image, kind):
     image = str(image or "").strip()
     prefixes = ALLOWED_GLPI_IMAGES if kind == "glpi" else ALLOWED_DB_IMAGES
     if not image or not any(image.startswith(prefix) for prefix in prefixes):
-        raise ValueError(f"Niet-toegestane {kind}-image: {image or 'leeg'}.")
+        raise ValueError(f"Disallowed {kind} image: {image or 'empty'}.")
     tags = {tag for item in docker_client().images.list() for tag in (item.tags or [])}
     if image not in tags:
-        raise ValueError(f"Docker-image is niet lokaal beschikbaar: {image}")
+        raise ValueError(f"Docker image is not available locally: {image}")
     return image
 
 
@@ -513,7 +516,7 @@ def wait_db(project, seconds=180):
         except Exception as exc:
             last = str(exc)
         time.sleep(3)
-    return False, f"MariaDB werd niet ready. Laatste melding: {last}"
+    return False, f"MariaDB did not become ready. Last message: {last}"
 
 
 def container_port_mappings(container):
@@ -565,7 +568,7 @@ def docker_port_usage(host_port, exclude_containers=None):
                 if int(mapping["host_port"]) == int(host_port):
                     return {
                         "container": container.name,
-                        "status": getattr(container, "status", "onbekend"),
+                        "status": getattr(container, "status", "unknown"),
                         "mapping": mapping["mapping"],
                     }
             except Exception:
@@ -577,8 +580,8 @@ def assert_docker_port_free(host_port, exclude_containers=None):
     usage = docker_port_usage(host_port, exclude_containers=exclude_containers)
     if usage:
         raise ValueError(
-            f"Poort {host_port} is al in gebruik door Docker-container {usage['container']} "
-            f"({usage['mapping']}, status: {usage['status']}). Kies een andere hostpoort."
+            f"Port {host_port} is already used by Docker container {usage['container']} "
+            f"({usage['mapping']}, status: {usage['status']}). Choose a different host port."
         )
 
 
@@ -610,8 +613,8 @@ def require_destructive_confirmation(project, source=None):
     typed = (source.get("confirm_project") or "").strip().lower()
     if not checkbox or typed != project:
         raise ValueError(
-            "Deze actie kan bestaande containers, database of GLPI-bestanden aanpassen/verwijderen. "
-            "Vink de bevestiging aan en typ exact de projectnaam in het bevestigingsveld."
+            "This action can modify or remove existing containers, database data or GLPI files. "
+            "Select the confirmation box and type the exact project name."
         )
 
 
@@ -632,7 +635,7 @@ def require_csrf():
     expected = session.get("csrf_token", "")
     supplied = request.form.get("csrf_token", "")
     if not expected or not supplied or not hmac.compare_digest(expected, supplied):
-        raise ValueError("Beveiligingstoken ontbreekt of is verlopen. Herlaad de pagina en probeer opnieuw.")
+        raise ValueError("The security token is missing or expired. Reload the page and try again.")
 
 
 def validate_backup_choice(value, extensions, label, allow_dir=False):
@@ -641,18 +644,18 @@ def validate_backup_choice(value, extensions, label, allow_dir=False):
         return ""
     path = Path(value).resolve()
     if not path.exists():
-        raise ValueError(f"{label} bestaat niet: {path}")
+        raise ValueError(f"{label} does not exist: {path}")
     if path.is_symlink():
-        raise ValueError(f"{label} mag geen symlink zijn.")
+        raise ValueError(f"{label} must not be a symlink.")
     if not path_under_backup_root(path):
-        raise ValueError(f"{label} moet onder {BACKUP_ROOT} staan.")
+        raise ValueError(f"{label} must be located below {BACKUP_ROOT}.")
     if path.is_dir():
         if allow_dir:
             return str(path)
-        raise ValueError(f"{label} moet een bestand zijn.")
+        raise ValueError(f"{label} must be a file.")
     if not path.is_file() or not path.name.lower().endswith(extensions):
         allowed = ", ".join(extensions)
-        raise ValueError(f"{label} heeft geen ondersteund formaat ({allowed}).")
+        raise ValueError(f"{label} has an unsupported format ({allowed}).")
     return str(path)
 
 
@@ -660,12 +663,12 @@ def validate_create_request(source):
     project = validate_project(source.get("project"))
     glpi_image = validate_local_image(source.get("glpi_image"), "glpi")
     mariadb_image = validate_local_image(source.get("mariadb_image"), "database")
-    host_port = validate_port(source.get("host_port"), "Hostpoort")
-    container_port = validate_port(source.get("container_port"), "Containerpoort")
+    host_port = validate_port(source.get("host_port"), "Host port")
+    container_port = validate_port(source.get("container_port"), "Container port")
     if container_port != 8080:
         raise ValueError(
-            "Deze versie volgt de bewezen YAML en gebruikt intern poort 8080. "
-            "Laat containerpoort op 8080 staan."
+            "This version follows the proven YAML and uses internal port 8080. "
+            "Keep the container port set to 8080."
         )
 
     tz = str(source.get("tz") or TZ_DEFAULT).strip() or TZ_DEFAULT
@@ -686,18 +689,18 @@ def validate_create_request(source):
         or source.get("file_backup_select")
         or ""
     )
-    db_backup = validate_backup_choice(db_backup, DB_EXTENSIONS, "Databaseback-up")
+    db_backup = validate_backup_choice(db_backup, DB_EXTENSIONS, "Database backup")
     file_backup = validate_backup_choice(
         file_backup,
         FILE_EXTENSIONS,
-        "GLPI-bestandenback-up",
+        "GLPI files backup",
         allow_dir=True,
     )
 
     if restore_everything and not db_backup:
-        raise ValueError("Alles restoren staat aan, maar er is geen databaseback-up gekozen.")
+        raise ValueError("Restore everything is enabled, but no database backup was selected.")
     if restore_everything and not file_backup:
-        raise ValueError("Alles restoren staat aan, maar er is geen GLPI-bestandenback-up gekozen.")
+        raise ValueError("Restore everything is enabled, but no GLPI files backup was selected.")
 
     existing_state = project_has_existing_state(project)
     if existing_state and (clean_db or db_backup or file_backup):
@@ -707,8 +710,8 @@ def validate_create_request(source):
         current_ports = host_ports_for_container(project)
         if current_ports and host_port not in current_ports:
             raise ValueError(
-                f"Project {project} heeft al een GLPI-container op poort {current_ports[0]}. "
-                "Gebruik Poort aanpassen of vink GLPI-container opnieuw aanmaken aan."
+                f"Project {project} already has a GLPI container on port {current_ports[0]}. "
+                "Use Change port or select Recreate existing GLPI container."
             )
 
     exclude = {project} if force_recreate else set()
@@ -737,27 +740,27 @@ def validate_create_request(source):
 def build_create_plan(data):
     destructive = bool(data["existing_state"] and (data["clean_db"] or data["db_backup"] or data["file_backup"]))
     return {
-        "title": "Bestaand project herstellen" if data["existing_state"] else "Nieuw GLPI-project aanmaken",
-        "risk": "Hoog - bestaande data wordt vervangen" if destructive else "Normaal - geen bevestigde dataverwijdering",
+        "title": "Restore existing project" if data["existing_state"] else "Create new GLPI project",
+        "risk": "High - existing data will be replaced" if destructive else "Normal - no confirmed data removal",
         "destructive": destructive,
         "rows": [
             ("Project", data["project"]),
-            ("Webpoort", f"{data['host_port']}:8080"),
-            ("GLPI-image", data["glpi_image"]),
-            ("Database-image", data["mariadb_image"]),
-            ("Database", "schoon opnieuw opbouwen" if data["clean_db"] else "bestaande databasebestanden behouden"),
-            ("Databaseback-up", data["db_backup"] or "geen"),
-            ("GLPI-bestandenback-up", data["file_backup"] or "geen"),
-            ("GLPI-container", "opnieuw aanmaken" if data["force_recreate"] else "bestaande container hergebruiken indien aanwezig"),
-            ("Cookiebeleid", f"SameSite={data['cookie_samesite']}, Secure={data['cookie_secure']}"),
-            ("Tijdzone", data["tz"]),
+            ("Web port", f"{data['host_port']}:8080"),
+            ("GLPI image", data["glpi_image"]),
+            ("Database image", data["mariadb_image"]),
+            ("Database", "rebuild from scratch" if data["clean_db"] else "keep existing database files"),
+            ("Database backup", data["db_backup"] or "none"),
+            ("GLPI files backup", data["file_backup"] or "none"),
+            ("GLPI container", "recreate" if data["force_recreate"] else "reuse existing container when available"),
+            ("Cookie policy", f"SameSite={data['cookie_samesite']}, Secure={data['cookie_secure']}"),
+            ("Time zone", data["tz"]),
         ],
         "steps": [
-            "Preflight opnieuw controleren (images, back-ups en vrije poort)",
-            "Projectmappen, .env en vergrendelde composeconfiguratie schrijven",
-            "Databasecontainer controleren of opnieuw opbouwen",
-            "Geselecteerde database- en bestandenback-ups herstellen",
-            "GLPI-container toepassen en het volledige actielog opslaan",
+            "Repeat the preflight checks (images, backups and free port)",
+            "Write project folders, .env and the locked compose configuration",
+            "Check or rebuild the database container",
+            "Restore the selected database and files backups",
+            "Apply the GLPI container and save the complete action log",
         ],
     }
 
@@ -777,11 +780,74 @@ def consume_create_preview(token):
     pending = session.pop("pending_create_preview", None)
     session.modified = True
     if not pending or not token or not hmac.compare_digest(str(pending.get("token", "")), str(token)):
-        raise ValueError("De uitvoerpreview ontbreekt of is ongeldig. Maak een nieuwe preview.")
+        raise ValueError("The execution preview is missing or invalid. Create a new preview.")
     created_at = int(pending.get("created_at") or 0)
     if created_at < int(time.time()) - CREATE_PREVIEW_TTL_SECONDS:
-        raise ValueError("De uitvoerpreview is verlopen. Controleer het plan opnieuw.")
+        raise ValueError("The execution preview has expired. Review the plan again.")
     return pending["data"]
+
+
+def create_progress_job(project, backup_root):
+    token = secrets.token_urlsafe(32)
+    now = int(time.time())
+    job = {
+        "token": token,
+        "project": project,
+        "backup_root": str(backup_root or BACKUP_ROOT),
+        "status": "queued",
+        "percent": 2,
+        "stage": "Queued",
+        "messages": ["Restore job accepted and waiting to start."],
+        "created_at": now,
+        "updated_at": now,
+        "finished_at": 0,
+        "log_name": "",
+        "error": "",
+    }
+    with PROGRESS_LOCK:
+        cutoff = now - PROGRESS_JOB_TTL_SECONDS
+        expired = [
+            key for key, value in PROGRESS_JOBS.items()
+            if value.get("finished_at") and value.get("finished_at", 0) < cutoff
+        ]
+        for key in expired:
+            PROGRESS_JOBS.pop(key, None)
+        PROGRESS_JOBS[token] = job
+    return token
+
+
+def update_progress_job(token, percent=None, stage=None, message=None, status=None, log_name=None, error=None):
+    now = int(time.time())
+    with PROGRESS_LOCK:
+        job = PROGRESS_JOBS.get(token)
+        if not job:
+            return
+        if percent is not None:
+            job["percent"] = max(0, min(100, int(percent)))
+        if stage is not None:
+            job["stage"] = str(stage)
+        if message:
+            job["messages"].append(str(message))
+            job["messages"] = job["messages"][-60:]
+        if status is not None:
+            job["status"] = status
+        if log_name is not None:
+            job["log_name"] = log_name
+        if error is not None:
+            job["error"] = str(error)
+        job["updated_at"] = now
+        if status in {"completed", "failed"}:
+            job["finished_at"] = now
+
+
+def progress_job_snapshot(token):
+    with PROGRESS_LOCK:
+        job = PROGRESS_JOBS.get(token)
+        if not job:
+            return None
+        result = dict(job)
+        result["messages"] = list(job["messages"])
+        return result
 
 
 def scan_files(root, extensions, include_dirs=False):
@@ -809,7 +875,7 @@ def scan_files(root, extensions, include_dirs=False):
 
 
 def write_action_log(project, action, messages):
-    action = SAFE_ACTION_RE.sub("-", (action or "actie").lower()).strip("-") or "actie"
+    action = SAFE_ACTION_RE.sub("-", (action or "action").lower()).strip("-") or "action"
     folder = log_dir(project)
     folder.mkdir(parents=True, exist_ok=True)
     filename = datetime.now().strftime("%Y%m%d-%H%M%S") + f"-{action}.log"
@@ -817,8 +883,8 @@ def write_action_log(project, action, messages):
     content = [
         f"GLPI Project Builder {APP_VERSION}",
         f"Project: {project}",
-        f"Actie: {action}",
-        f"Tijd: {datetime.now().isoformat(timespec='seconds')}",
+        f"Action: {action}",
+        f"Time: {datetime.now().isoformat(timespec='seconds')}",
         "",
     ]
     if isinstance(messages, (list, tuple)):
@@ -858,20 +924,20 @@ def flash_action_success(project, action, messages):
             msg = msg[:600] + "\n...\n" + msg[-600:]
         preview_items.append(text_to_html(msg))
     if len(messages) > 12:
-        preview_items.append(f"Nog {len(messages) - 12} regels in het logbestand.")
+        preview_items.append(f"Another {len(messages) - 12} lines are available in the log file.")
     preview_items.append(
-        "Volledig log: "
+        "Full log: "
         + f"<a href=\"{url_for('view_log', project=project, filename=log_name)}\">{esc(log_name)}</a>"
     )
     flash("<br>".join(preview_items), "ok")
 
 
-def flash_error(message, project=None, action="fout"):
+def flash_error(message, project=None, action="error"):
     suffix = ""
     if project:
         try:
-            log_name = write_action_log(project, action, ["FOUT", message])
-            suffix = "<br>Foutlog: " + f"<a href=\"{url_for('view_log', project=project, filename=log_name)}\">{esc(log_name)}</a>"
+            log_name = write_action_log(project, action, ["ERROR", message])
+            suffix = "<br>Error log: " + f"<a href=\"{url_for('view_log', project=project, filename=log_name)}\">{esc(log_name)}</a>"
         except Exception:
             suffix = ""
     flash(text_to_html(message) + suffix, "err")
@@ -896,7 +962,7 @@ def reset_db_user(project):
     result = db.exec_run(["mariadb", "-uroot", f"-p{root_pw}", "-e", sql], demux=True)
     stdout, stderr = result.output if isinstance(result.output, tuple) else (result.output, b"")
     output = ((stdout or b"") + (stderr or b"")).decode("utf-8", errors="replace")
-    return result.exit_code == 0, output or "Database-user wachtwoord is gelijkgezet met .env."
+    return result.exit_code == 0, output or "Database user password was synchronized with .env."
 
 
 def restore_database(project, backup_file):
@@ -905,36 +971,36 @@ def restore_database(project, backup_file):
     db_name = validate_db_identifier(env.get("GLPI_DB_NAME", "glpi"))
 
     if not backup_path.exists() or not backup_path.is_file():
-        return False, f"Databasebackup bestaat niet: {backup_path}"
+        return False, f"Database backup does not exist: {backup_path}"
     if not path_under_backup_root(backup_path):
-        return False, f"Databasebackup moet onder {BACKUP_ROOT} staan."
+        return False, f"Database backup must be located below {BACKUP_ROOT}."
     if backup_path.is_symlink():
-        return False, "Databasebackup mag geen symlink zijn."
+        return False, "Database backup must not be a symlink."
     if not backup_path.name.lower().endswith(DB_EXTENSIONS):
-        return False, "Alleen .sql, .sql.gz, .dump en .dump.gz worden ondersteund als databasebackup."
+        return False, "Only .sql, .sql.gz, .dump and .dump.gz database backups are supported."
 
     command = r"""sh -lc '
 set -eu
 
-echo "Wachten op MariaDB TCP in databasecontainer..."
+echo "Waiting for MariaDB TCP in the database container..."
 for i in $(seq 1 60); do
   if mariadb -h "$DB_HOST" -uroot -p"$MARIADB_ROOT_PASSWORD" -e "SELECT 1" >/dev/null 2>&1; then
-    echo "MariaDB TCP is bereikbaar."
+    echo "MariaDB TCP is available."
     break
   fi
-  echo "Nog niet bereikbaar, poging $i/60..."
+  echo "Not available yet, attempt $i/60..."
   sleep 2
 done
 
 mariadb -h "$DB_HOST" -uroot -p"$MARIADB_ROOT_PASSWORD" -e "SELECT 1" >/dev/null
 
-echo "Reset database $GLPI_DB_NAME..."
+echo "Resetting database $GLPI_DB_NAME..."
 mariadb -h "$DB_HOST" -uroot -p"$MARIADB_ROOT_PASSWORD" -e "
 DROP DATABASE IF EXISTS \`$GLPI_DB_NAME\`;
 CREATE DATABASE \`$GLPI_DB_NAME\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
 "
 
-echo "Import databasebackup: $BACKUP_FILE"
+echo "Importing database backup: $BACKUP_FILE"
 case "$BACKUP_FILE" in
   *.gz)
     gzip -dc "$BACKUP_FILE" | mariadb -h "$DB_HOST" -uroot -p"$MARIADB_ROOT_PASSWORD" "$GLPI_DB_NAME"
@@ -944,7 +1010,7 @@ case "$BACKUP_FILE" in
     ;;
 esac
 
-echo "Database restore klaar."
+echo "Database restore completed."
 ' """
 
     try:
@@ -990,7 +1056,7 @@ def empty_dir(path):
         elif child.is_dir():
             shutil.rmtree(child)
         else:
-            raise ValueError(f"Onbekend bestandstype in doelmap: {child}")
+            raise ValueError(f"Unknown file type in target folder: {child}")
 
 
 def copy_tree_contents(src, dst):
@@ -999,7 +1065,7 @@ def copy_tree_contents(src, dst):
     dst.mkdir(parents=True, exist_ok=True)
     for item in src.iterdir():
         if item.is_symlink():
-            raise ValueError(f"Symlink in GLPI bestandenbackup is geweigerd: {item}")
+            raise ValueError(f"Symlink in GLPI files backup was rejected: {item}")
         target = dst / item.name
         if item.is_dir():
             if target.exists():
@@ -1017,21 +1083,21 @@ def copy_tree_contents(src, dst):
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(item, target)
         else:
-            raise ValueError(f"Onbekend bestandstype in GLPI bestandenbackup: {item}")
+            raise ValueError(f"Unknown file type in GLPI files backup: {item}")
 
 
 def safe_member_target(dest, member_name, archive_type):
     if not member_name or "\x00" in member_name:
-        raise ValueError(f"Onveilig pad in {archive_type}bestand.")
+        raise ValueError(f"Unsafe path in {archive_type} archive.")
     pure = Path(member_name)
     if pure.is_absolute():
-        raise ValueError(f"Absoluut pad in {archive_type}bestand geweigerd: {member_name}")
+        raise ValueError(f"Absolute path in {archive_type} archive was rejected: {member_name}")
     dest_resolved = dest.resolve()
     target = (dest / member_name).resolve()
     try:
         target.relative_to(dest_resolved)
     except Exception:
-        raise ValueError(f"Pad buiten doelmap in {archive_type}bestand geweigerd: {member_name}")
+        raise ValueError(f"Path outside the target folder in {archive_type} archive was rejected: {member_name}")
     return target
 
 
@@ -1042,13 +1108,13 @@ def safe_extract_zip(zip_path, dest):
             target = safe_member_target(dest, member.filename, "zip")
             mode = member.external_attr >> 16
             if stat.S_ISLNK(mode):
-                raise ValueError(f"Symlink in zipbestand geweigerd: {member.filename}")
+                raise ValueError(f"Symlink in zip archive was rejected: {member.filename}")
             if member.is_dir():
                 target.mkdir(parents=True, exist_ok=True)
                 continue
             file_type = stat.S_IFMT(mode) if mode else 0
             if file_type and file_type != stat.S_IFREG:
-                raise ValueError(f"Onveilig bestandstype in zipbestand geweigerd: {member.filename}")
+                raise ValueError(f"Unsafe file type in zip archive was rejected: {member.filename}")
             target.parent.mkdir(parents=True, exist_ok=True)
             with z.open(member, "r") as src, open(target, "wb") as dst:
                 shutil.copyfileobj(src, dst)
@@ -1060,18 +1126,18 @@ def safe_extract_tar(tar_path, dest):
         for member in t.getmembers():
             target = safe_member_target(dest, member.name, "tar")
             if member.issym() or member.islnk():
-                raise ValueError(f"Symlink/hardlink in tarbestand geweigerd: {member.name}")
+                raise ValueError(f"Symlink or hardlink in tar archive was rejected: {member.name}")
             if member.isdev():
-                raise ValueError(f"Device-bestand in tarbestand geweigerd: {member.name}")
+                raise ValueError(f"Device file in tar archive was rejected: {member.name}")
             if member.isdir():
                 target.mkdir(parents=True, exist_ok=True)
                 continue
             if not member.isfile():
-                raise ValueError(f"Onveilig bestandstype in tarbestand geweigerd: {member.name}")
+                raise ValueError(f"Unsafe file type in tar archive was rejected: {member.name}")
             target.parent.mkdir(parents=True, exist_ok=True)
             source = t.extractfile(member)
             if source is None:
-                raise ValueError(f"Kon tarbestand niet lezen: {member.name}")
+                raise ValueError(f"Could not read tar archive member: {member.name}")
             with source, open(target, "wb") as dst:
                 shutil.copyfileobj(source, dst)
 
@@ -1080,17 +1146,17 @@ def extract_source(source):
     source = Path(source).resolve()
 
     if not source.exists():
-        raise ValueError(f"GLPI bestandenbackup bestaat niet: {source}")
+        raise ValueError(f"GLPI files backup does not exist: {source}")
     if not path_under_backup_root(source):
-        raise ValueError(f"GLPI bestandenbackup moet onder {BACKUP_ROOT} staan.")
+        raise ValueError(f"GLPI files backup must be located below {BACKUP_ROOT}.")
     if source.is_symlink():
-        raise ValueError("GLPI bestandenbackup mag geen symlink zijn.")
+        raise ValueError("GLPI files backup must not be a symlink.")
 
     if source.is_dir():
         return source, None
 
     if not source.name.lower().endswith(FILE_EXTENSIONS):
-        raise ValueError("GLPI bestandenbackup moet een map, .zip, .tar, .tar.gz, .tgz, .tar.bz2, .tbz2, .tar.xz of .txz zijn.")
+        raise ValueError("GLPI files backup must be a folder or a supported zip/tar archive.")
 
     tmp = Path(tempfile.mkdtemp(prefix="glpi_full_restore_"))
     if source.name.lower().endswith(".zip"):
@@ -1154,7 +1220,7 @@ def patch_config_db(project):
     env = read_env(project)
     config_root = project_dir(project) / "glpi" / "config"
     if not config_root.exists():
-        return "Geen config-map gevonden om config_db.php te patchen."
+        return "No config folder was found for patching config_db.php."
 
     replacements = {
         "dbhost": f"{project}-db",
@@ -1166,7 +1232,7 @@ def patch_config_db(project):
     changed = []
     for file in config_root.rglob("config_db.php"):
         if file.is_symlink():
-            raise ValueError(f"Symlink config_db.php geweigerd: {file}")
+            raise ValueError(f"Symlink config_db.php was rejected: {file}")
         text = file.read_text(encoding="utf-8", errors="ignore")
         original = text
 
@@ -1180,8 +1246,8 @@ def patch_config_db(project):
             changed.append(str(file))
 
     if changed:
-        return "config_db.php gepatcht: " + ", ".join(changed)
-    return "Geen config_db.php aangepast of bestand niet gevonden."
+        return "Patched config_db.php: " + ", ".join(changed)
+    return "No config_db.php file was changed or found."
 
 
 def restore_glpi_files(project, file_source):
@@ -1193,21 +1259,21 @@ def restore_glpi_files(project, file_source):
         plugins = find_plugins_root(root)
 
         if not var_glpi:
-            raise ValueError("Geen GLPI /var/glpi structuur gevonden in bestandenbackup. Verwacht map met config/files/marketplace/logs.")
+            raise ValueError("No GLPI /var/glpi structure was found in the files backup. Expected config/files/marketplace/logs folders.")
 
         glpi_target = project_dir(project) / "glpi"
         plugins_target = project_dir(project) / "plugins"
 
         empty_dir(glpi_target)
         copy_tree_contents(var_glpi, glpi_target)
-        messages.append(f"/var/glpi restored uit {var_glpi}")
+        messages.append(f"Restored /var/glpi from {var_glpi}")
 
         empty_dir(plugins_target)
         if plugins:
             copy_tree_contents(plugins, plugins_target)
-            messages.append(f"plugins restored uit {plugins}")
+            messages.append(f"Restored plugins from {plugins}")
         else:
-            messages.append("Geen plugins-map gevonden in backup; plugins-map leeg gemaakt.")
+            messages.append("No plugins folder was found in the backup; the plugins folder was emptied.")
 
         ensure_glpi_writable_dirs(project)
         messages.append(patch_config_db(project))
@@ -1229,20 +1295,20 @@ def fix_permissions(project):
         root.mkdir(parents=True, exist_ok=True)
         for path in [root] + list(root.rglob("*")):
             if path.is_symlink():
-                warnings.append(f"symlink overgeslagen: {path}")
+                warnings.append(f"Skipped symlink: {path}")
                 continue
             try:
                 os.chown(path, 33, 33)
             except Exception as exc:
-                warnings.append(f"chown mislukt voor {path}: {exc}")
+                warnings.append(f"chown failed for {path}: {exc}")
             try:
                 os.chmod(path, 0o775 if path.is_dir() else 0o664)
             except Exception as exc:
-                warnings.append(f"chmod mislukt voor {path}: {exc}")
+                warnings.append(f"chmod failed for {path}: {exc}")
 
-    msg = "Permissions gezet op /var/glpi en plugins volumes."
+    msg = "Permissions were applied to the /var/glpi and plugins volumes."
     if warnings:
-        msg += "\nLaatste waarschuwingen:\n" + "\n".join(warnings[-20:])
+        msg += "\nLatest warnings:\n" + "\n".join(warnings[-20:])
     return msg
 
 
@@ -1263,10 +1329,10 @@ def create_db_container(project, env, clean_db):
             existing.reload()
             if existing.status != "running":
                 existing.start()
-                return f"DB-container bestond al en is gestart: {project}-db"
+                return f"Existing database container was started: {project}-db"
         except Exception:
             pass
-        return "DB-container bestaat al; wordt hergebruikt."
+        return "The existing database container is being reused."
 
     cli.images.pull(env["MARIADB_IMAGE"])
     cli.containers.run(
@@ -1287,7 +1353,7 @@ def create_db_container(project, env, clean_db):
         volumes={str(project_dir(project) / "db"): {"bind": "/var/lib/mysql", "mode": "rw"}},
         network=f"{project}-network",
     )
-    return f"DB-container aangemaakt: {project}-db"
+    return f"Created database container: {project}-db"
 
 
 def create_glpi_container(project, env, force_recreate=True, pull_image=True):
@@ -1300,17 +1366,17 @@ def create_glpi_container(project, env, force_recreate=True, pull_image=True):
         current_ports = host_ports_for_container(project)
         if current_ports and host_port not in current_ports:
             raise RuntimeError(
-                f"GLPI-container {project} bestaat al op poort {current_ports[0]}, maar .env vraagt poort {host_port}. "
-                "Vink GLPI-container opnieuw aanmaken aan of gebruik Poort aanpassen."
+                f"GLPI container {project} already uses port {current_ports[0]}, but .env requests port {host_port}. "
+                "Select Recreate existing GLPI container or use Change port."
             )
         try:
             existing.reload()
             if existing.status != "running":
                 existing.start()
-                return f"GLPI-container bestond al en is gestart: {project}"
+                return f"Existing GLPI container was started: {project}"
         except Exception:
             pass
-        return f"GLPI-container bestaat al en wordt hergebruikt: {project}"
+        return f"The existing GLPI container is being reused: {project}"
 
     assert_docker_port_free(host_port, exclude_containers={project})
 
@@ -1350,18 +1416,23 @@ def create_glpi_container(project, env, force_recreate=True, pull_image=True):
         ports={"8080/tcp": host_port},
         network=f"{project}-network",
     )
-    return f"GLPI-container aangemaakt volgens de custom v7 YAML-template: {project} ({host_port}:8080)"
+    return f"Created GLPI container using the custom v7 YAML template: {project} ({host_port}:8080)"
 
 
-def create_or_restore(project, env, clean_db, force_recreate, db_backup, file_backup):
+def create_or_restore(project, env, clean_db, force_recreate, db_backup, file_backup, progress=None):
     messages = []
+    report = progress or (lambda _percent, _stage, _message=None: None)
 
+    report(18, "Preparing project", "Creating and checking the project folders.")
     ensure_dirs(project)
+    report(26, "Preparing network", "Checking the isolated Docker network.")
     ensure_network(project)
-    messages.append(f"Netwerk gecontroleerd: {project}-network")
+    messages.append(f"Checked network: {project}-network")
 
+    report(36, "Database container", "Checking or rebuilding the database container.")
     messages.append(create_db_container(project, env, clean_db))
 
+    report(45, "Waiting for MariaDB", "Waiting until MariaDB accepts connections.")
     ensure_container_network(project, f"{project}-db")
     ok, msg = wait_db(project)
     messages.append(msg)
@@ -1369,39 +1440,112 @@ def create_or_restore(project, env, clean_db, force_recreate, db_backup, file_ba
         raise RuntimeError(msg)
 
     if db_backup:
+        report(57, "Restoring database", "Importing the selected database backup. This can take several minutes.")
         ok, out = restore_database(project, db_backup)
         if not ok:
-            raise RuntimeError("Database restore mislukt:\n" + tail_text(out, 5000))
-        messages.append("Databasebackup succesvol gerestored.")
+            raise RuntimeError("Database restore failed:\n" + tail_text(out, 5000))
+        messages.append("Database backup restored successfully.")
         messages.append(out)
     else:
+        report(57, "Synchronizing database user", "No database backup selected; synchronizing the database account.")
         ok, out = reset_db_user(project)
         messages.append(out)
         if not ok:
             raise RuntimeError(out)
 
     if file_backup:
+        report(72, "Restoring GLPI files", "Extracting and copying the selected GLPI files backup.")
         messages.extend(restore_glpi_files(project, file_backup))
     else:
-        messages.append("Geen GLPI bestandenbackup opgegeven; bestaande /var/glpi en plugins blijven staan.")
+        report(72, "Keeping GLPI files", "No files backup selected; existing GLPI files are kept.")
+        messages.append("No GLPI files backup was provided; existing /var/glpi and plugins remain in place.")
 
+    report(84, "Applying permissions", "Applying the required permissions to persistent GLPI data.")
     ensure_glpi_writable_dirs(project)
     messages.append(fix_permissions(project))
+    report(92, "Applying GLPI container", "Creating or updating the GLPI application container.")
     messages.append(create_glpi_container(project, env, force_recreate=force_recreate))
     return messages
+
+
+def run_create_job(job_token, data):
+    project = data["project"]
+    messages = []
+    log_name = ""
+    try:
+        update_progress_job(job_token, 5, "Starting", "Background restore started.", status="running")
+        ensure_dirs(project)
+        update_progress_job(job_token, 10, "Writing configuration", "Writing .env and the locked compose configuration.")
+        env = build_env(
+            project,
+            data["glpi_image"],
+            data["mariadb_image"],
+            data["host_port"],
+            data["container_port"],
+            data["tz"],
+            data["clean_db"],
+            cookie_samesite=data["cookie_samesite"],
+            cookie_secure=data["cookie_secure"],
+        )
+        validate_db_identifier(env["GLPI_DB_NAME"])
+        write_env(project, env)
+        write_compose(project, env)
+
+        def report(percent, stage, message=None):
+            update_progress_job(job_token, percent, stage, message)
+
+        messages = create_or_restore(
+            project,
+            env,
+            data["clean_db"],
+            data["force_recreate"],
+            data["db_backup"],
+            data["file_backup"],
+            progress=report,
+        )
+        messages.append(f"Project folder: {project_dir(project)}")
+        messages.append(f"GLPI port: {data['host_port']}:8080")
+        messages.append(f"Cookie SameSite: {env['GLPI_SESSION_COOKIE_SAMESITE']}")
+        messages.append(f"Cookie Secure: {env['GLPI_SESSION_COOKIE_SECURE']}")
+        update_progress_job(job_token, 98, "Saving action log", "Saving the complete restore log.")
+        log_name = write_action_log(project, "create-restore", messages)
+        update_progress_job(
+            job_token,
+            100,
+            "Completed",
+            "The GLPI project was applied successfully.",
+            status="completed",
+            log_name=log_name,
+        )
+    except Exception as exc:
+        error_text = str(exc)
+        try:
+            log_name = write_action_log(project, "create-restore-error", ["ERROR", error_text] + messages)
+        except Exception:
+            log_name = ""
+        update_progress_job(
+            job_token,
+            stage="Failed",
+            message="The restore stopped safely. Review the error below and the action log.",
+            status="failed",
+            log_name=log_name,
+            error=error_text,
+        )
+    finally:
+        MUTATION_LOCK.release()
 
 
 def change_project_port(project, host_port):
     env = read_env(project)
     if not env:
-        raise ValueError(f"Geen .env gevonden voor {project}. Maak of herstel het project eerst.")
+        raise ValueError(f"No .env file was found for {project}. Create or restore the project first.")
 
     env = normalize_env_defaults(env)
-    host_port = validate_port(host_port, "Nieuwe host poort")
+    host_port = validate_port(host_port, "New host port")
     assert_docker_port_free(host_port, exclude_containers={project})
 
     old_env = dict(env)
-    old_port = old_env.get("GLPI_HTTP_PORT", "onbekend")
+    old_port = old_env.get("GLPI_HTTP_PORT", "unknown")
 
     env["GLPI_HTTP_PORT"] = str(host_port)
     env["GLPI_CONTAINER_PORT"] = "8080"
@@ -1412,7 +1556,7 @@ def change_project_port(project, host_port):
     try:
         docker_client().containers.get(f"{project}-db")
     except NotFound:
-        raise ValueError(f"Databasecontainer {project}-db bestaat niet. Kan GLPI-container niet veilig opnieuw aanmaken.")
+        raise ValueError(f"Database container {project}-db does not exist. The GLPI container cannot be recreated safely.")
 
     ensure_container_network(project, f"{project}-db")
 
@@ -1421,9 +1565,9 @@ def change_project_port(project, host_port):
         write_compose(project, env)
         message = create_glpi_container(project, env, force_recreate=True, pull_image=False)
         return [
-            f"Poort aangepast van {old_port} naar {host_port}.",
+            f"Changed port from {old_port} to {host_port}.",
             message,
-            f"Nieuwe mapping: {host_port}:8080",
+            f"New mapping: {host_port}:8080",
         ]
     except Exception as exc:
         rollback_error = None
@@ -1436,17 +1580,17 @@ def change_project_port(project, host_port):
 
         if rollback_error:
             raise RuntimeError(
-                f"Poortwijziging mislukt: {exc}. Rollback naar oude poort {old_port} is ook mislukt: {rollback_error}"
+                f"Port change failed: {exc}. Rollback to the old port {old_port} also failed: {rollback_error}"
             )
         raise RuntimeError(
-            f"Poortwijziging mislukt: {exc}. Oude poort {old_port} is teruggezet en de GLPI-container is opnieuw aangemaakt."
+            f"Port change failed: {exc}. The old port {old_port} was restored and the GLPI container was recreated."
         )
 
 
 def change_cookie_settings(project, cookie_samesite, cookie_secure=None):
     env = read_env(project)
     if not env:
-        raise ValueError(f"Geen .env gevonden voor {project}. Maak of herstel het project eerst.")
+        raise ValueError(f"No .env file was found for {project}. Create or restore the project first.")
     env = normalize_env_defaults(env)
     new_value = validate_cookie_samesite(cookie_samesite)
     new_secure = validate_cookie_secure(cookie_secure or env.get("GLPI_SESSION_COOKIE_SECURE"))
@@ -1466,7 +1610,7 @@ def change_cookie_settings(project, cookie_samesite, cookie_secure=None):
     try:
         docker_client().containers.get(f"{project}-db")
     except NotFound:
-        raise ValueError(f"Databasecontainer {project}-db bestaat niet. Kan GLPI-container niet veilig opnieuw aanmaken.")
+        raise ValueError(f"Database container {project}-db does not exist. The GLPI container cannot be recreated safely.")
 
     ensure_container_network(project, f"{project}-db")
 
@@ -1475,11 +1619,11 @@ def change_cookie_settings(project, cookie_samesite, cookie_secure=None):
         write_compose(project, env)
         message = create_glpi_container(project, env, force_recreate=True, pull_image=False)
         return [
-            f"Cookie SameSite aangepast van {old_value} naar {new_value}.",
-            f"Cookie Secure aangepast van {old_secure} naar {new_secure}.",
-            "PHP cookie override wordt bij containerstart uit .env gegenereerd.",
+            f"Changed Cookie SameSite from {old_value} to {new_value}.",
+            f"Changed Cookie Secure from {old_secure} to {new_secure}.",
+            "The PHP cookie override is generated from .env when the container starts.",
             message,
-            "Database, databasebestanden, GLPI-bestanden en plugins zijn niet verwijderd.",
+            "The database, database files, GLPI files and plugins were not removed.",
         ]
     except Exception as exc:
         rollback_error = None
@@ -1492,10 +1636,10 @@ def change_cookie_settings(project, cookie_samesite, cookie_secure=None):
 
         if rollback_error:
             raise RuntimeError(
-                f"Cookie-instelling aanpassen mislukt: {exc}. Rollback naar {old_value}/{old_secure} is ook mislukt: {rollback_error}"
+                f"Changing the cookie settings failed: {exc}. Rollback to {old_value}/{old_secure} also failed: {rollback_error}"
             )
         raise RuntimeError(
-            f"Cookie-instelling aanpassen mislukt: {exc}. Oude instelling {old_value}/{old_secure} is teruggezet en de GLPI-container is opnieuw aangemaakt."
+            f"Changing the cookie settings failed: {exc}. The old setting {old_value}/{old_secure} was restored and the GLPI container was recreated."
         )
 
 
@@ -1503,7 +1647,7 @@ def change_cookie_settings(project, cookie_samesite, cookie_secure=None):
 def rebuild_glpi(project):
     env = read_env(project)
     if not env:
-        raise ValueError(f"Geen .env gevonden voor {project}.")
+        raise ValueError(f"No .env file was found for {project}.")
     env = normalize_env_defaults(env)
     host_port = validate_port(env.get("GLPI_HTTP_PORT"), "GLPI_HTTP_PORT")
     assert_docker_port_free(host_port, exclude_containers={project})
@@ -1512,16 +1656,16 @@ def rebuild_glpi(project):
     try:
         docker_client().containers.get(f"{project}-db")
     except NotFound:
-        raise ValueError(f"Databasecontainer {project}-db bestaat niet. Eerst project herstellen of databasecontainer starten.")
+        raise ValueError(f"Database container {project}-db does not exist. Restore the project or start the database container first.")
     ensure_container_network(project, f"{project}-db")
     write_env(project, env)
     write_compose(project, env)
     message = create_glpi_container(project, env, force_recreate=True, pull_image=False)
     return [
-        f"GLPI-container opnieuw aangemaakt met bestaande poort {host_port}.",
-        f"Cookie-instellingen toegepast: SameSite={env['GLPI_SESSION_COOKIE_SAMESITE']}, Secure={env['GLPI_SESSION_COOKIE_SECURE']}. De PHP override wordt bij containerstart gegenereerd.",
+        f"Recreated the GLPI container with existing port {host_port}.",
+        f"Applied cookie settings: SameSite={env['GLPI_SESSION_COOKIE_SAMESITE']}, Secure={env['GLPI_SESSION_COOKIE_SECURE']}. The PHP override is generated when the container starts.",
         message,
-        "Database, databasebestanden, GLPI-bestanden en plugins zijn niet verwijderd.",
+        "The database, database files, GLPI files and plugins were not removed.",
     ]
 
 
@@ -1552,7 +1696,7 @@ def mask(value):
 def container_env(name):
     c = get_container(name)
     if not c:
-        return [f"{name}: container bestaat niet"]
+        return [f"{name}: container does not exist"]
     output = []
     for line in c.attrs.get("Config", {}).get("Env", []) or []:
         key, _, value = line.partition("=")
@@ -1560,7 +1704,7 @@ def container_env(name):
             if "PASSWORD" in key:
                 value = mask(value)
             output.append(f"{key}={value}")
-    return output or ["Geen relevante env-regels gevonden."]
+    return output or ["No relevant environment entries found."]
 
 
 def php_cookie_runtime_status(project):
@@ -1571,13 +1715,13 @@ def php_cookie_runtime_status(project):
     """
     c = get_container(project)
     if not c:
-        return "GLPI-container bestaat niet"
+        return "GLPI container does not exist"
     try:
         c.reload()
         if c.status != "running":
-            return f"GLPI-container is niet actief: {c.status}"
+            return f"GLPI container is not running: {c.status}"
     except Exception as exc:
-        return f"Containerstatus lezen mislukt: {exc}"
+        return f"Reading the container status failed: {exc}"
 
     php_code = (
         'echo "session.cookie_samesite=" . ini_get("session.cookie_samesite") . PHP_EOL;'
@@ -1595,21 +1739,21 @@ def php_cookie_runtime_status(project):
             out = result.output or b""
         text = (out + err).decode("utf-8", errors="replace").strip()
         if not text:
-            text = "geen output"
+            text = "no output"
         return text
     except Exception as exc:
-        return f"Runtime PHP-cookiecheck mislukt: {exc}"
+        return f"Runtime PHP cookie check failed: {exc}"
 
 
 def container_status(name):
     c = get_container(name)
     if not c:
-        return "niet aanwezig"
+        return "not present"
     try:
         c.reload()
     except Exception:
         pass
-    return getattr(c, "status", "onbekend")
+    return getattr(c, "status", "unknown")
 
 
 def discover_projects():
@@ -1969,8 +2113,8 @@ Als je een bestaande projectnaam gebruikt of schoon begint, moet je hieronder be
 
 
 CREATE_PREVIEW_HTML = r"""<!doctype html>
-<html lang="nl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Uitvoerplan · GLPI Project Builder</title>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Execution plan · GLPI Project Builder</title>
 <style>
 :root{--bg:#f3f6f9;--card:#fff;--line:#d8e0e8;--ink:#17212b;--muted:#667483;--brand:#16704a;--danger:#b42318}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px system-ui,-apple-system,"Segoe UI",sans-serif}
@@ -1981,13 +2125,35 @@ dl{display:grid;grid-template-columns:minmax(170px,240px) 1fr;gap:0;border-top:1
 ol{padding-left:22px}li{margin:9px 0}.actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center}button,.button{border:0;border-radius:8px;padding:11px 15px;background:var(--brand);color:#fff;font-weight:750;text-decoration:none;cursor:pointer}.secondary{background:#425466}
 @media(max-width:640px){dl{grid-template-columns:1fr}dt{border-bottom:0;padding-bottom:0}dd{padding-top:4px}}
 </style></head><body>
-<header><div><h1>Controleer het uitvoerplan</h1><div>{{ app_version }} · er is nog niets gewijzigd</div></div></header>
+<header><div><h1>Review the execution plan</h1><div>{{ app_version }} · nothing has been changed yet</div></div></header>
 <main>
-<section class="card"><h2>{{ plan.title }}</h2><p class="risk {{ 'danger' if plan.destructive else '' }}"><strong>Risico:</strong> {{ plan.risk }}</p>
+<section class="card"><h2>{{ plan.title }}</h2><p class="risk {{ 'danger' if plan.destructive else '' }}"><strong>Risk:</strong> {{ plan.risk }}</p>
 <dl>{% for label,value in plan.rows %}<dt>{{ label }}</dt><dd>{{ value }}</dd>{% endfor %}</dl></section>
-<section class="card"><h2>Uitvoervolgorde</h2><ol>{% for step in plan.steps %}<li>{{ step }}</li>{% endfor %}</ol>
-<p class="meta">De preflight wordt vlak vóór uitvoering opnieuw gedaan. Is de poort, image of back-up intussen gewijzigd, dan stopt de actie veilig.</p></section>
-<section class="card"><div class="actions"><form method="post" action="{{ url_for('execute_create') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="preview_token" value="{{ preview_token }}"><button type="submit">Plan bevestigen en uitvoeren</button></form><a class="button secondary" href="{{ url_for('index') }}#nieuw">Terug en aanpassen</a></div></section>
+<section class="card"><h2>Execution order</h2><ol>{% for step in plan.steps %}<li>{{ step }}</li>{% endfor %}</ol>
+<p class="meta">The preflight checks run again immediately before execution. The action stops safely if a port, image or backup changed in the meantime.</p></section>
+<section class="card"><div class="actions"><form method="post" action="{{ url_for('execute_create') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="preview_token" value="{{ preview_token }}"><button type="submit">Confirm plan and start</button></form><a class="button secondary" href="{{ url_for('index') }}#new-project">Back and edit</a></div></section>
+</main></body></html>"""
+
+
+PROGRESS_HTML = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+{% if job.status in ['queued', 'running'] %}<meta http-equiv="refresh" content="2">{% endif %}
+<title>Restore progress · {{ job.project }} · GLPI Project Builder</title>
+<style>
+:root{--bg:#f3f6f9;--card:#fff;--line:#d8e0e8;--ink:#17212b;--muted:#667483;--brand:#16704a;--danger:#b42318;--wait:#a15c00}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px system-ui,-apple-system,"Segoe UI",sans-serif}
+header{background:#102a43;color:#fff;padding:20px}header div,main{max-width:900px;margin:auto}main{padding:28px 18px 50px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:20px;box-shadow:0 1px 2px #102a4310;margin-bottom:18px}
+h1,h2{margin-top:0}.meta{color:var(--muted)}.status{display:inline-block;border-radius:999px;padding:5px 10px;background:#edf8f3;color:#16643d;font-weight:750}.status.failed{background:#fff0ef;color:var(--danger)}.status.running,.status.queued{background:#fff7e6;color:var(--wait)}
+progress{display:block;width:100%;height:24px;margin:16px 0;accent-color:var(--brand)}.percent{font-size:28px;font-weight:800}.timeline{list-style:none;padding:0;margin:0}.timeline li{padding:10px 0 10px 20px;border-left:3px solid #a9d8c3;position:relative}.timeline li:before{content:"";position:absolute;left:-7px;top:16px;width:11px;height:11px;border-radius:50%;background:var(--brand)}
+.error{white-space:pre-wrap;background:#fff0ef;border:1px solid #f5b1ab;padding:12px;border-radius:8px;color:#7a271a}.actions{display:flex;gap:10px;flex-wrap:wrap}.button{display:inline-block;border-radius:8px;padding:10px 14px;background:var(--brand);color:#fff;font-weight:700;text-decoration:none}.secondary{background:#425466}
+</style></head><body>
+<header><div><h1>Restore progress</h1><div>{{ app_version }} · project {{ job.project }}</div></div></header>
+<main>
+<section class="card"><span class="status {{ job.status }}">{{ job.status|capitalize }}</span><h2 style="margin-top:14px">{{ job.stage }}</h2><div class="percent">{{ job.percent }}%</div><progress max="100" value="{{ job.percent }}">{{ job.percent }}%</progress><p class="meta">Elapsed time: {{ elapsed }} seconds{% if job.status in ['queued','running'] %} · this page refreshes automatically{% endif %}</p></section>
+{% if job.error %}<section class="card"><h2>Error</h2><div class="error">{{ job.error }}</div></section>{% endif %}
+<section class="card"><h2>Activity</h2><ol class="timeline">{% for message in job.messages %}<li>{{ message }}</li>{% endfor %}</ol></section>
+<section class="card"><div class="actions"><a class="button secondary" href="{{ url_for('index') }}#projects">Dashboard</a>{% if job.log_name %}<a class="button" href="{{ url_for('view_log', project=job.project, filename=job.log_name) }}">Open full log</a>{% endif %}</div></section>
 </main></body></html>"""
 
 
@@ -2038,39 +2204,33 @@ def execute_create():
         data = validate_create_request(stored_data)
         project = data["project"]
         project_for_log = project
-
-        ensure_dirs(project)
-        env = build_env(
-            project,
-            data["glpi_image"],
-            data["mariadb_image"],
-            data["host_port"],
-            data["container_port"],
-            data["tz"],
-            data["clean_db"],
-            cookie_samesite=data["cookie_samesite"],
-            cookie_secure=data["cookie_secure"],
+        job_token = create_progress_job(project, backup_root)
+        worker = threading.Thread(
+            target=run_create_job,
+            args=(job_token, data),
+            name=f"glpi-restore-{project}",
+            daemon=True,
         )
-        validate_db_identifier(env["GLPI_DB_NAME"])
-        write_env(project, env)
-        write_compose(project, env)
-
-        messages = create_or_restore(
-            project,
-            env,
-            data["clean_db"],
-            data["force_recreate"],
-            data["db_backup"],
-            data["file_backup"],
-        )
-        messages.append(f"Projectmap: {project_dir(project)}")
-        messages.append(f"GLPI-poort: {data['host_port']}:8080")
-        messages.append(f"Cookie SameSite: {env['GLPI_SESSION_COOKIE_SAMESITE']}")
-        messages.append(f"Cookie Secure: {env['GLPI_SESSION_COOKIE_SECURE']}")
-        flash_action_success(project, "create-restore", messages)
+        g.mutation_lock_held = False
+        try:
+            worker.start()
+        except Exception:
+            g.mutation_lock_held = True
+            raise
+        return redirect(url_for("restore_progress", job_token=job_token))
     except Exception as exc:
-        flash_error(str(exc), project_for_log, "create-restore-fout")
+        flash_error(str(exc), project_for_log, "create-restore-error")
     return redirect(url_for("index", backup_root=backup_root))
+
+
+@app.route("/progress/<job_token>", methods=["GET"])
+def restore_progress(job_token):
+    job = progress_job_snapshot(job_token)
+    if not job:
+        flash("This restore progress link is invalid or has expired.", "err")
+        return redirect(url_for("index"))
+    elapsed = max(0, (job["finished_at"] or int(time.time())) - job["created_at"])
+    return render_template_string(PROGRESS_HTML, job=job, elapsed=elapsed)
 
 
 @app.route("/change-port", methods=["POST"])
@@ -2080,11 +2240,11 @@ def change_port_route():
         require_csrf()
         project = validate_project(request.form.get("project"))
         project_for_log = project
-        host_port = validate_port(request.form.get("host_port"), "Nieuwe hostpoort")
+        host_port = validate_port(request.form.get("host_port"), "New host port")
         messages = change_project_port(project, host_port)
-        flash_action_success(project, "poort-wijzigen", messages)
+        flash_action_success(project, "change-port", messages)
     except Exception as exc:
-        flash_error(str(exc), project_for_log, "poort-wijzigen-fout")
+        flash_error(str(exc), project_for_log, "change-port-error")
     return redirect(url_for("index"))
 
 
@@ -2098,9 +2258,9 @@ def change_cookie_route():
         cookie_samesite = validate_cookie_samesite(request.form.get("cookie_samesite"))
         cookie_secure = validate_cookie_secure(request.form.get("cookie_secure"))
         messages = change_cookie_settings(project, cookie_samesite, cookie_secure)
-        flash_action_success(project, "cookie-samesite-wijzigen", messages)
+        flash_action_success(project, "change-cookie-settings", messages)
     except Exception as exc:
-        flash_error(str(exc), project_for_log, "cookie-samesite-wijzigen-fout")
+        flash_error(str(exc), project_for_log, "change-cookie-settings-error")
     return redirect(url_for("index"))
 
 
@@ -2112,9 +2272,9 @@ def rebuild_glpi_route():
         project = validate_project(request.form.get("project"))
         project_for_log = project
         messages = rebuild_glpi(project)
-        flash_action_success(project, "glpi-herbouwen", messages)
+        flash_action_success(project, "rebuild-glpi", messages)
     except Exception as exc:
-        flash_error(str(exc), project_for_log, "glpi-herbouwen-fout")
+        flash_error(str(exc), project_for_log, "rebuild-glpi-error")
     return redirect(url_for("index"))
 
 
@@ -2127,7 +2287,7 @@ def diagnose():
         project_for_log = project
         env = read_env(project)
         if not env:
-            raise ValueError(f"Geen .env gevonden voor {project}")
+            raise ValueError(f"No .env file was found for {project}")
         lines = []
         for key in ["PROJECT_NAME", "GLPI_IMAGE", "MARIADB_IMAGE", "GLPI_HTTP_PORT", "GLPI_CONTAINER_PORT", "GLPI_SESSION_COOKIE_SAMESITE", "GLPI_SESSION_COOKIE_SECURE", "GLPI_DB_NAME", "GLPI_DB_USER", "GLPI_DB_PASSWORD", "MARIADB_ROOT_PASSWORD", "TZ"]:
             if key in env:
@@ -2139,15 +2299,15 @@ def diagnose():
             ports = [m["mapping"] for m in container_port_mappings(c)]
         html = "<h3>.env</h3>" + safe_pre("\n".join(lines))
         html += f"<h3>{esc(project)}</h3>" + safe_pre("\n".join(container_env(project)))
-        html += "<h3>Poortmappings</h3>" + safe_pre("\n".join(ports) if ports else "geen actieve poortmapping gevonden")
-        html += "<h3>PHP cookie override die bij start wordt geschreven</h3>" + safe_pre(php_session_override_text(env) + "\nWordt bij containerstart uit .env gegenereerd en naar PHP conf.d gekopieerd.")
-        html += "<h3>Effectieve PHP cookie-instellingen in container</h3>" + safe_pre(php_cookie_runtime_status(project))
+        html += "<h3>Port mappings</h3>" + safe_pre("\n".join(ports) if ports else "no active port mapping found")
+        html += "<h3>PHP cookie override written at startup</h3>" + safe_pre(php_session_override_text(env) + "\nGenerated from .env when the container starts and copied to PHP conf.d.")
+        html += "<h3>Effective PHP cookie settings in the container</h3>" + safe_pre(php_cookie_runtime_status(project))
         html += f"<h3>{esc(project)}-db</h3>" + safe_pre("\n".join(container_env(f"{project}-db")))
-        html += "<h3>docker-compose.yml</h3>" + safe_pre(compose_file(project).read_text(encoding="utf-8") if compose_file(project).exists() else "niet gevonden")
+        html += "<h3>docker-compose.yml</h3>" + safe_pre(compose_file(project).read_text(encoding="utf-8") if compose_file(project).exists() else "not found")
         flash(html, "msg")
-        write_action_log(project, "diagnose", ["Diagnose bekeken", "\n".join(lines)])
+        write_action_log(project, "diagnostics", ["Diagnostics viewed", "\n".join(lines)])
     except Exception as exc:
-        flash_error(str(exc), project_for_log, "diagnose-fout")
+        flash_error(str(exc), project_for_log, "diagnostics-error")
     return redirect(url_for("index"))
 
 
@@ -2162,7 +2322,7 @@ def testdb_route():
         write_action_log(project, "database-test", [out])
         flash(safe_pre(out), "ok" if ok else "err")
     except Exception as exc:
-        flash_error(str(exc), project_for_log, "database-test-fout")
+        flash_error(str(exc), project_for_log, "database-test-error")
     return redirect(url_for("index"))
 
 
@@ -2174,12 +2334,12 @@ def resetdb_route():
         project = validate_project(request.form.get("project"))
         project_for_log = project
         if request.form.get("confirm_resetdb") != "yes":
-            raise ValueError("Vink eerst de bevestiging aan voor database-user reset.")
+            raise ValueError("Select the confirmation box before resetting the database user.")
         ok, out = reset_db_user(project)
         write_action_log(project, "database-user-reset", [out])
         flash(text_to_html(out), "ok" if ok else "err")
     except Exception as exc:
-        flash_error(str(exc), project_for_log, "database-user-reset-fout")
+        flash_error(str(exc), project_for_log, "database-user-reset-error")
     return redirect(url_for("index"))
 
 
@@ -2187,13 +2347,13 @@ def resetdb_route():
 def view_log(project, filename):
     project = validate_project(project)
     if not LOG_FILE_RE.match(filename):
-        raise ValueError("Ongeldige logbestandsnaam.")
+        raise ValueError("Invalid log file name.")
     path = log_dir(project) / filename
     if not path.exists() or not path_under_base(path):
-        raise ValueError("Logbestand niet gevonden.")
+        raise ValueError("Log file not found.")
     text = path.read_text(encoding="utf-8", errors="replace")
     return f"""<!doctype html>
-<html lang="nl">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <title>Log {esc(filename)}</title>
@@ -2206,7 +2366,7 @@ a {{ color: #1f6feb; }}
 </head>
 <body>
 <div class="card">
-<p><a href="{url_for('index')}">&larr; Terug</a></p>
+<p><a href="{url_for('index')}">&larr; Back</a></p>
 <h1>Log {esc(filename)}</h1>
 <p>Project: <code>{esc(project)}</code></p>
 <pre>{esc(text)}</pre>
@@ -2216,7 +2376,7 @@ a {{ color: #1f6feb; }}
 
 
 V11_HTML = r"""<!doctype html>
-<html lang="nl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>GLPI Project Builder</title>
 <style>
 :root{--bg:#f3f6f9;--card:#fff;--line:#d8e0e8;--ink:#17212b;--muted:#667483;--brand:#16704a;--danger:#b42318}
@@ -2227,29 +2387,29 @@ main{padding:24px 18px 50px}.toolbar,.grid,.row{display:grid;gap:14px}.toolbar{g
 label{display:block;font-weight:650;margin:12px 0 5px}input,select{width:100%;min-height:42px;border:1px solid #b9c5d0;border-radius:8px;padding:8px 10px;background:#fff}button,.button{display:inline-block;border:0;border-radius:8px;padding:10px 14px;background:var(--brand);color:#fff;font-weight:700;text-decoration:none;cursor:pointer}.secondary{background:#425466}.danger{background:var(--danger)}details{border-top:1px solid var(--line);margin-top:14px;padding-top:12px}summary{font-weight:700;cursor:pointer}.actions{display:flex;gap:8px;flex-wrap:wrap}.actions form{display:inline}.actions form input{width:auto}.empty{text-align:center;color:var(--muted);padding:35px}.step{border-left:4px solid var(--brand);padding-left:13px;margin:20px 0}.check{display:flex;align-items:flex-start;gap:8px;font-weight:500}.check input{width:auto;min-height:auto;margin-top:4px}small{color:var(--muted)}
 @media(max-width:700px){.row,.toolbar{grid-template-columns:1fr}.toolbar .button{width:100%;text-align:center}}
 </style></head><body>
-<header><div><h1>GLPI Project Builder</h1><div class="meta" style="color:#c9d8e6">{{ app_version }} · intern beheerhulpmiddel · zet de Builder na gebruik uit</div></div></header>
+<header><div><h1>GLPI Project Builder</h1><div class="meta" style="color:#c9d8e6">{{ app_version }} · internal administration tool · stop the Builder after use</div></div></header>
 <main>
 {% with messages=get_flashed_messages(with_categories=true) %}{% for category,message in messages %}<div class="notice {{ category }}">{{ message|safe }}</div>{% endfor %}{% endwith %}
-<div class="toolbar"><div><h2>Projecten</h2><div class="meta">Status, webpoort en laatste beheeractie in één overzicht.</div></div><a class="button" href="#nieuw">Nieuw project of restore</a></div>
+<div class="toolbar" id="projects"><div><h2>Projects</h2><div class="meta">Status, web port and recent administration activity in one view.</div></div><a class="button" href="#new-project">New project or restore</a></div>
 <div class="grid">
 {% for p in projects %}<article class="card project"><div><h3>{{ p.name }}</h3><span class="status {{ 'running' if p.glpi_status=='running' else '' }}">GLPI {{ p.glpi_status }}</span> <span class="status {{ 'running' if p.db_status=='running' else '' }}">DB {{ p.db_status }}</span></div>
-<div><strong>Webpoort:</strong> {{ p.active_port or 'niet ingesteld' }}</div><div class="meta">{{ p.glpi_image }}<br>{{ p.mariadb_image }}</div>
-<div class="actions">{% if p.glpi_status=='running' and p.active_port %}<a class="button" href="http://{{ request.host.split(':')[0] }}:{{ p.active_port }}" target="_blank">Open GLPI</a>{% endif %}<a class="button secondary" href="#beheer-{{ p.name }}">Beheren</a></div>
-<details id="beheer-{{ p.name }}"><summary>Projectbeheer</summary>
-<form method="post" action="{{ url_for('change_port_route') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="project" value="{{ p.name }}"><label>Nieuwe webpoort</label><input type="number" name="host_port" min="1" max="65535" value="{{ p.active_port }}" required><button>Poort toepassen</button></form>
-<form method="post" action="{{ url_for('rebuild_glpi_route') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="project" value="{{ p.name }}"><button class="secondary">GLPI-container opnieuw toepassen</button></form>
-<details><summary>SSO- en cookie-instellingen</summary><form method="post" action="{{ url_for('change_cookie_route') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="project" value="{{ p.name }}"><div class="row"><div><label>SameSite</label><select name="cookie_samesite"><option {{ 'selected' if p.cookie_samesite=='Lax' }}>Lax</option><option {{ 'selected' if p.cookie_samesite=='Strict' }}>Strict</option><option {{ 'selected' if p.cookie_samesite=='None' }}>None</option></select></div><div><label>Secure</label><select name="cookie_secure"><option {{ 'selected' if p.cookie_secure=='Off' }}>Off</option><option {{ 'selected' if p.cookie_secure=='On' }}>On</option></select></div></div><button>Instellingen toepassen</button></form></details>
-<details><summary>Diagnose en logs</summary><div class="actions"><form method="post" action="{{ url_for('diagnose') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="project" value="{{ p.name }}"><button class="secondary">Diagnose</button></form><form method="post" action="{{ url_for('testdb_route') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="project" value="{{ p.name }}"><button class="secondary">Database testen</button></form></div>{% for log in p.logs %}<div><a href="{{ url_for('view_log',project=p.name,filename=log) }}">{{ log }}</a></div>{% endfor %}</details>
-</details></article>{% else %}<div class="card empty">Nog geen beheerde GLPI-projecten gevonden.</div>{% endfor %}
+<div><strong>Web port:</strong> {{ p.active_port or 'not configured' }}</div><div class="meta">{{ p.glpi_image }}<br>{{ p.mariadb_image }}</div>
+<div class="actions">{% if p.glpi_status=='running' and p.active_port %}<a class="button" href="http://{{ request.host.split(':')[0] }}:{{ p.active_port }}" target="_blank">Open GLPI</a>{% endif %}<a class="button secondary" href="#manage-{{ p.name }}">Manage</a></div>
+<details id="manage-{{ p.name }}"><summary>Project management</summary>
+<form method="post" action="{{ url_for('change_port_route') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="project" value="{{ p.name }}"><label>New web port</label><input type="number" name="host_port" min="1" max="65535" value="{{ p.active_port }}" required><button>Apply port</button></form>
+<form method="post" action="{{ url_for('rebuild_glpi_route') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="project" value="{{ p.name }}"><button class="secondary">Reapply GLPI container</button></form>
+<details><summary>SSO and cookie settings</summary><form method="post" action="{{ url_for('change_cookie_route') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="project" value="{{ p.name }}"><div class="row"><div><label>SameSite</label><select name="cookie_samesite"><option {{ 'selected' if p.cookie_samesite=='Lax' }}>Lax</option><option {{ 'selected' if p.cookie_samesite=='Strict' }}>Strict</option><option {{ 'selected' if p.cookie_samesite=='None' }}>None</option></select></div><div><label>Secure</label><select name="cookie_secure"><option {{ 'selected' if p.cookie_secure=='Off' }}>Off</option><option {{ 'selected' if p.cookie_secure=='On' }}>On</option></select></div></div><button>Apply settings</button></form></details>
+<details><summary>Diagnostics and logs</summary><div class="actions"><form method="post" action="{{ url_for('diagnose') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="project" value="{{ p.name }}"><button class="secondary">Diagnostics</button></form><form method="post" action="{{ url_for('testdb_route') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="project" value="{{ p.name }}"><button class="secondary">Test database</button></form></div>{% for log in p.logs %}<div><a href="{{ url_for('view_log',project=p.name,filename=log) }}">{{ log }}</a></div>{% endfor %}</details>
+</details></article>{% else %}<div class="card empty">No managed GLPI projects found yet.</div>{% endfor %}
 </div>
 
-<section class="card" id="nieuw"><h2>Nieuw project of restore</h2><p class="meta">Doorloop de vier stappen. De vastgelegde YAML-opbouw wordt ongewijzigd gebruikt.</p>
+<section class="card" id="new-project"><h2>New project or restore</h2><p class="meta">Complete these four steps. The locked YAML structure is used without modification.</p>
 <form method="post" action="{{ url_for('create') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="backup_root" value="{{ backup_root }}"><input type="hidden" name="container_port" value="8080">
-<div class="step"><h3>1. Project</h3><div class="row"><div><label>Projectnaam</label><input name="project" pattern="[a-z0-9][a-z0-9_-]{2,50}" placeholder="glpi-productie" required></div><div><label>Webpoort</label><input type="number" name="host_port" min="1" max="65535" value="8775" required></div></div></div>
-<div class="step"><h3>2. Versies</h3><div class="row"><div><label>GLPI-image</label><select name="glpi_image" required>{% for image in glpi_images %}<option>{{ image }}</option>{% else %}<option value="">Geen toegestane lokale GLPI-image</option>{% endfor %}</select></div><div><label>Database-image</label><select name="mariadb_image" required>{% for image in db_images %}<option>{{ image }}</option>{% else %}<option value="">Geen toegestane lokale database-image</option>{% endfor %}</select></div></div></div>
-<div class="step"><h3>3. Optionele restore</h3><div class="row"><div><label>Databaseback-up</label><select name="db_backup_select"><option value="">Geen</option>{% for value,label in db_backups %}<option value="{{ value }}">{{ label }}</option>{% endfor %}</select></div><div><label>GLPI-bestanden of map</label><select name="file_backup_select"><option value="">Geen</option>{% for value,label in file_backups %}<option value="{{ value }}">{{ label }}</option>{% endfor %}</select></div></div><input type="hidden" name="db_backup_manual"><input type="hidden" name="file_backup_manual"></div>
-<div class="step"><h3>4. Controleren en uitvoeren</h3><details><summary>Geavanceerde instellingen</summary><div class="row"><div><label>Tijdzone</label><input name="tz" value="{{ tz_default }}"></div><div><label>Cookie SameSite</label><select name="cookie_samesite"><option>Lax</option><option>Strict</option><option>None</option></select></div></div><label>Cookie Secure</label><select name="cookie_secure"><option>Off</option><option>On</option></select><label class="check"><input type="checkbox" name="restore_everything" value="yes">Alles restoren</label><label class="check"><input type="checkbox" name="force_recreate" value="yes">Bestaande GLPI-container opnieuw aanmaken</label><label class="check"><input type="checkbox" name="clean_db" value="yes">Database schoon opbouwen</label></details>
-<label class="check"><input type="checkbox" name="confirm_destructive" value="yes">Ik begrijp dat een bestaande projectnaam data of containers kan wijzigen.</label><label>Typ bij een bestaand project de projectnaam ter bevestiging</label><input name="confirm_project"><button>Plan controleren</button><small>Er wordt pas iets gewijzigd nadat je het uitvoerplan op de volgende pagina bevestigt.</small></div></form></section>
+<div class="step"><h3>1. Project</h3><div class="row"><div><label>Project name</label><input name="project" pattern="[a-z0-9][a-z0-9_-]{2,50}" placeholder="glpi-production" required></div><div><label>Web port</label><input type="number" name="host_port" min="1" max="65535" value="8775" required></div></div></div>
+<div class="step"><h3>2. Versions</h3><div class="row"><div><label>GLPI image</label><select name="glpi_image" required>{% for image in glpi_images %}<option>{{ image }}</option>{% else %}<option value="">No allowed local GLPI image</option>{% endfor %}</select></div><div><label>Database image</label><select name="mariadb_image" required>{% for image in db_images %}<option>{{ image }}</option>{% else %}<option value="">No allowed local database image</option>{% endfor %}</select></div></div></div>
+<div class="step"><h3>3. Optional restore</h3><div class="row"><div><label>Database backup</label><select name="db_backup_select"><option value="">None</option>{% for value,label in db_backups %}<option value="{{ value }}">{{ label }}</option>{% endfor %}</select></div><div><label>GLPI files or folder</label><select name="file_backup_select"><option value="">None</option>{% for value,label in file_backups %}<option value="{{ value }}">{{ label }}</option>{% endfor %}</select></div></div><input type="hidden" name="db_backup_manual"><input type="hidden" name="file_backup_manual"></div>
+<div class="step"><h3>4. Review and execute</h3><details><summary>Advanced settings</summary><div class="row"><div><label>Time zone</label><input name="tz" value="{{ tz_default }}"></div><div><label>Cookie SameSite</label><select name="cookie_samesite"><option>Lax</option><option>Strict</option><option>None</option></select></div></div><label>Cookie Secure</label><select name="cookie_secure"><option>Off</option><option>On</option></select><label class="check"><input type="checkbox" name="restore_everything" value="yes">Restore everything</label><label class="check"><input type="checkbox" name="force_recreate" value="yes">Recreate existing GLPI container</label><label class="check"><input type="checkbox" name="clean_db" value="yes">Rebuild database from scratch</label></details>
+<label class="check"><input type="checkbox" name="confirm_destructive" value="yes">I understand that an existing project name can modify data or containers.</label><label>For an existing project, type the project name to confirm</label><input name="confirm_project"><button>Review plan</button><small>Nothing is changed until you confirm the execution plan on the next page.</small></div></form></section>
 </main></body></html>"""
 
 
@@ -2258,7 +2418,7 @@ def v11_single_mutation_guard():
     if request.method != "POST":
         return None
     if not MUTATION_LOCK.acquire(blocking=False):
-        return ("Er loopt al een beheeractie. Wacht tot die voltooid is.", 409)
+        return ("Another administration action is already running. Wait until it completes.", 409)
     g.mutation_lock_held = True
     return None
 

@@ -9,6 +9,8 @@ required = [
     "MUTATION_LOCK.acquire(blocking=False)",
     'session["pending_create_preview"]',
     '@app.route("/create/execute", methods=["POST"])',
+    '@app.route("/progress/<job_token>", methods=["GET"])',
+    "target=run_create_job",
     '@app.route("/healthz")',
 ]
 missing = [item for item in required if item not in source]

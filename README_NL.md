@@ -14,6 +14,9 @@ rechten. Start hem alleen voor beheer en stop hem daarna.
 
 ## Verbeteringen
 
+- volledig Engelstalige gebruikersinterface en operationele meldingen;
+- echte restorevoortgang met actuele fase, percentage, verstreken tijd en activiteitenlog;
+- restore-uitvoering in één bewaakte achtergrondtaak, zodat de voortgangspagina beschikbaar blijft;
 - rustig projectdashboard en begeleide create/restore-wizard;
 - server-side preflight met een apart uitvoerplan dat binnen tien minuten expliciet bevestigd moet worden;
 - hercontrole van images, back-ups, poort en bestaand project vlak vóór uitvoering;
