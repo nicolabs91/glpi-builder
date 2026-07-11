@@ -16,9 +16,10 @@ from pathlib import Path
 
 import docker
 from docker.errors import NotFound, ContainerError
-from flask import Flask, request, redirect, url_for, render_template_string, flash, session, g, jsonify
+from flask import Flask, request, redirect, url_for, render_template_string, flash, session, g, jsonify, abort
 
 APP_VERSION = "0.1"
+UI_PREVIEW_MODE = os.environ.get("UI_PREVIEW_MODE", "0").strip().lower() in {"1", "true", "yes", "on"}
 APP_PORT = int(os.environ.get("APP_PORT", "8080"))
 BASE_PATH = Path(os.environ.get("BASE_PATH", "/volume1/docker"))
 BACKUP_ROOT = Path(os.environ.get("BACKUP_ROOT", "/volume1/docker/_BACKUPS"))
@@ -2268,7 +2269,7 @@ ol{padding-left:22px}li{margin:9px 0}.actions{display:flex;gap:10px;flex-wrap:wr
 <dl>{% for label,value in plan.rows %}<dt>{{ label }}</dt><dd>{{ value }}</dd>{% endfor %}</dl></section>
 <section class="card"><h2>Execution order</h2><ol>{% for step in plan.steps %}<li>{{ step }}</li>{% endfor %}</ol>
 <p class="meta">The preflight checks run again immediately before execution. The action stops safely if a port, image or backup changed in the meantime.</p></section>
-<section class="card"><div class="actions"><form method="post" action="{{ url_for('execute_create') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="preview_token" value="{{ preview_token }}"><button type="submit">Confirm plan and start</button></form><a class="button secondary" href="{{ url_for('index') }}#new-project">Back and edit</a></div></section>
+<section class="card"><div class="actions">{% if preview_only %}<strong>Preview only</strong>{% else %}<form method="post" action="{{ url_for('execute_create') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="preview_token" value="{{ preview_token }}"><button type="submit">Confirm plan and start</button></form>{% endif %}<a class="button secondary" href="{{ url_for('index') }}#new-project">{{ 'Back' if preview_only else 'Back and edit' }}</a></div></section>
 </main></body></html>"""
 
 
@@ -2324,6 +2325,7 @@ def create():
             CREATE_PREVIEW_HTML,
             plan=build_create_plan(data),
             preview_token=preview_token,
+            preview_only=False,
         )
     except Exception as exc:
         flash_error(str(exc), project_for_log, "create-preview-fout")
@@ -2368,6 +2370,32 @@ def restore_progress(job_token):
         return redirect(url_for("index"))
     elapsed = max(0, (job["finished_at"] or int(time.time())) - job["created_at"])
     return render_template_string(PROGRESS_HTML, job=job, elapsed=elapsed)
+
+
+@app.route("/ui-preview", methods=["GET"])
+def ui_preview():
+    if not UI_PREVIEW_MODE:
+        abort(404)
+    data = {
+        "project": "glpi-ui-preview",
+        "host_port": 8775,
+        "glpi_image": "glpi/glpi:11-preview",
+        "mariadb_image": "mariadb:11-preview",
+        "fresh_install": False,
+        "existing_state": False,
+        "skip_plugins": False,
+        "db_backup": "/volume1/docker/_BACKUPS/example-database.sql.gz",
+        "file_backup": "/volume1/docker/_BACKUPS/example-glpi-files.tar.gz",
+        "cookie_samesite": "Lax",
+        "cookie_secure": "Off",
+        "tz": TZ_DEFAULT,
+    }
+    return render_template_string(
+        CREATE_PREVIEW_HTML,
+        plan=build_create_plan(data),
+        preview_token="",
+        preview_only=True,
+    )
 
 
 @app.route("/change-port", methods=["POST"])
@@ -2521,7 +2549,7 @@ V11_HTML = r"""<!doctype html>
 header{background:#102a43;color:#fff;padding:20px}header .header-inner,main{max-width:1080px;margin:auto}.header-inner{display:flex;justify-content:space-between;align-items:flex-start;gap:18px}.version{color:#c9d8e6;font-size:13px;line-height:1.3;padding-top:6px;text-align:right;white-space:nowrap}h1{margin:0;font-size:25px}h2{margin:0 0 14px}h3{margin:0 0 8px}
 main{padding:24px 18px 50px}.grid,.row{display:grid;gap:14px}.grid{grid-template-columns:repeat(auto-fit,minmax(290px,1fr));margin:16px 0 26px}.row{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}.row-project{grid-template-columns:minmax(0,1fr) minmax(140px,180px)}.row-settings{grid-template-columns:minmax(220px,280px) repeat(2,minmax(150px,180px));justify-content:start}#new-project form{max-width:920px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px;box-shadow:0 1px 2px #102a4310}.project{display:flex;flex-direction:column;gap:10px}.meta{color:var(--muted);font-size:13px}.status{display:inline-block;border-radius:999px;padding:3px 9px;background:#eef2f6;font-size:12px}.running{background:#e8f7ef;color:#16643d}.notice{padding:12px 14px;border-radius:9px;margin-bottom:10px;background:#eef5ff;border:1px solid #b9d3f8}.notice.err{background:#fff0ef;border-color:#f5b1ab}.notice.ok{background:#ecfdf3;border-color:#9bd7b5}
-label{display:block;font-size:14px;line-height:1.35;font-weight:600;margin:14px 0 7px}input,select{width:100%;min-height:40px;border:1px solid #b9c5d0;border-radius:8px;padding:8px 11px;background:#fff;color:var(--ink);font:inherit;font-size:15px;line-height:1.2}.compact-control{max-width:180px}.confirm-field{max-width:360px}.overwrite-confirmation{display:none}.overwrite-option:has(#overwrite-existing:checked) .overwrite-confirmation{display:block}button,.button{display:inline-block;border:0;border-radius:8px;padding:10px 14px;background:var(--brand);color:#fff;font:inherit;font-weight:700;text-decoration:none;cursor:pointer}.review-button{margin-top:16px}.secondary{background:#425466}.danger{background:var(--danger)}details{border-top:1px solid var(--line);margin-top:14px;padding-top:12px}summary{font-weight:700;cursor:pointer}.actions{display:flex;gap:8px;flex-wrap:wrap}.actions form{display:inline}.actions form input{width:auto}.empty{text-align:center;color:var(--muted);padding:35px}.step{border-left:4px solid var(--brand);padding-left:13px;margin:22px 0}.check{display:flex;align-items:flex-start;gap:8px;font-weight:500}.check input,.mode-option input{width:auto;min-height:auto;margin-top:4px}.mode-grid{display:grid;grid-template-columns:minmax(0,2fr) minmax(250px,1fr);gap:12px}.mode-option{display:flex;gap:10px;border:1px solid #9bcfb5;border-radius:9px;padding:12px;margin:12px 0 0;background:#f1fbf6;font-weight:500}.mode-option.rare{border-color:#e7b1ab;background:#fff7f5}.mode-option strong{display:block}small{display:inline-block;color:var(--muted);line-height:1.4;margin-top:6px}
+label{display:block;font-size:14px;line-height:1.35;font-weight:600;margin:14px 0 7px}input,select{width:100%;min-height:40px;border:1px solid #b9c5d0;border-radius:8px;padding:8px 11px;background:#fff;color:var(--ink);font:inherit;font-size:15px;line-height:1.2}.compact-control{max-width:180px}.confirm-field{max-width:360px}.overwrite-confirmation{display:none}.overwrite-option:has(#overwrite-existing:checked) .overwrite-confirmation{display:block}button,.button{display:inline-block;border:0;border-radius:8px;padding:10px 14px;background:var(--brand);color:#fff;font:inherit;font-weight:700;text-decoration:none;cursor:pointer}.review-button{margin-top:16px}.preview-button{margin-top:14px}.secondary{background:#425466}.danger{background:var(--danger)}details{border-top:1px solid var(--line);margin-top:14px;padding-top:12px}summary{font-weight:700;cursor:pointer}.actions{display:flex;gap:8px;flex-wrap:wrap}.actions form{display:inline}.actions form input{width:auto}.empty{text-align:center;color:var(--muted);padding:35px}.step{border-left:4px solid var(--brand);padding-left:13px;margin:22px 0}.check{display:flex;align-items:flex-start;gap:8px;font-weight:500}.check input,.mode-option input{width:auto;min-height:auto;margin-top:4px}.mode-grid{display:grid;grid-template-columns:minmax(0,2fr) minmax(250px,1fr);gap:12px}.mode-option{display:flex;gap:10px;border:1px solid #9bcfb5;border-radius:9px;padding:12px;margin:12px 0 0;background:#f1fbf6;font-weight:500}.mode-option.rare{border-color:#e7b1ab;background:#fff7f5}.mode-option strong{display:block}small{display:inline-block;color:var(--muted);line-height:1.4;margin-top:6px}
 @media(max-width:700px){.row,.row-project,.row-settings,.mode-grid{grid-template-columns:1fr}input,select{min-height:44px}.compact-control,.confirm-field{max-width:none}#new-project form{max-width:none}.version{font-size:12px;white-space:normal}}
 </style></head><body>
 <header><div class="header-inner"><h1>GLPI Project Builder</h1><div class="version">{{ app_version }}</div></div></header>
@@ -2545,7 +2573,7 @@ label{display:block;font-size:14px;line-height:1.35;font-weight:600;margin:14px 
 <div class="step"><h3>1. Project</h3><div class="row row-project"><div><label>Project name</label><input name="project" pattern="[a-z0-9][a-z0-9_-]{2,50}" placeholder="glpi-production" required></div><div><label>Web port</label><input type="number" name="host_port" min="1" max="65535" value="8775" required></div></div></div>
 <div class="step"><h3>2. Versions</h3><div class="row"><div><label>GLPI image</label><select name="glpi_image" required>{% for image in glpi_images %}<option>{{ image }}</option>{% else %}<option value="">No allowed local GLPI image</option>{% endfor %}</select></div><div><label>Database image</label><select name="mariadb_image" required>{% for image in db_images %}<option>{{ image }}</option>{% else %}<option value="">No allowed local database image</option>{% endfor %}</select></div></div></div>
 <div class="step"><h3>3. Mode and required backups</h3><div class="mode-grid"><label class="mode-option"><input type="radio" name="operation_mode" value="restore" checked><span><strong>Full restore</strong></span></label><label class="mode-option rare"><input type="radio" name="operation_mode" value="fresh"><span><strong>Fresh installation</strong></span></label></div><div class="row"><div><label>Database backup</label><select name="db_backup_select"><option value="">Select required database backup</option>{% for value,label in db_backups %}<option value="{{ value }}">{{ label }}</option>{% endfor %}</select></div><div><label>GLPI files/config backup</label><select name="file_backup_select"><option value="">Select required GLPI files/config backup</option>{% for value,label in file_backups %}<option value="{{ value }}">{{ label }}</option>{% endfor %}</select></div></div><input type="hidden" name="db_backup_manual"><input type="hidden" name="file_backup_manual"><label class="check"><input type="checkbox" name="skip_plugins" value="yes">Restore without plugins</label></div>
-<div class="step"><h3>4. Review and execute</h3><details><summary>Advanced settings</summary><div class="row row-settings"><div><label>Time zone</label><input name="tz" value="{{ tz_default }}"></div><div><label>Cookie SameSite</label><select name="cookie_samesite"><option>Lax</option><option>Strict</option><option>None</option></select></div><div><label>Cookie Secure</label><select name="cookie_secure"><option>Off</option><option>On</option></select></div></div><div class="overwrite-option"><label class="check"><input id="overwrite-existing" type="checkbox" name="confirm_destructive" value="yes">Overwrite existing project</label><div id="overwrite-confirmation" class="overwrite-confirmation"><label for="confirm-project">Type the project name to confirm overwrite</label><input id="confirm-project" class="confirm-field" name="confirm_project" autocomplete="off"></div></div></details>
+<div class="step"><h3>4. Review and execute</h3><details><summary>Advanced settings</summary><div class="row row-settings"><div><label>Time zone</label><input name="tz" value="{{ tz_default }}"></div><div><label>Cookie SameSite</label><select name="cookie_samesite"><option>Lax</option><option>Strict</option><option>None</option></select></div><div><label>Cookie Secure</label><select name="cookie_secure"><option>Off</option><option>On</option></select></div></div><div class="overwrite-option"><label class="check"><input id="overwrite-existing" type="checkbox" name="confirm_destructive" value="yes">Overwrite existing project</label><div id="overwrite-confirmation" class="overwrite-confirmation"><label for="confirm-project">Type the project name to confirm overwrite</label><input id="confirm-project" class="confirm-field" name="confirm_project" autocomplete="off"></div></div>{% if ui_preview_mode %}<a class="button secondary preview-button" href="{{ url_for('ui_preview') }}">Preview review screen</a>{% endif %}</details>
 <button class="review-button">Review plan</button></div></form></section>
 </main></body></html>"""
 
@@ -2589,6 +2617,7 @@ def v11_index():
         glpi_images=local_image_tags("glpi"),
         db_images=local_image_tags("database"),
         tz_default=TZ_DEFAULT,
+        ui_preview_mode=UI_PREVIEW_MODE,
     )
 
 

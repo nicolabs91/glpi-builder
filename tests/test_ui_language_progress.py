@@ -77,6 +77,17 @@ class UiLanguageAndProgressTest(unittest.TestCase):
         self.assertIn(b"<div>0.1</div>", response.data)
         self.assertNotIn(b"0.1 \xc2\xb7 project", response.data)
 
+    def test_local_ui_preview_button_is_explicitly_gated(self):
+        with patch.object(module, "UI_PREVIEW_MODE", True), \
+             patch.object(module, "discover_projects", return_value=[]), \
+             patch.object(module, "scan_files", return_value=[]), \
+             patch.object(module, "local_image_tags", side_effect=lambda kind: ["glpi/glpi:test"] if kind == "glpi" else ["mariadb:test"]):
+            response = self.client.get("/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b'href="/ui-preview"', response.data)
+        self.assertIn(b"Preview review screen", response.data)
+
     def test_completed_progress_page_stops_refreshing(self):
         token = module.create_progress_job("glpi-progress-test", module.BACKUP_ROOT)
         module.update_progress_job(token, 100, "Completed", status="completed")
