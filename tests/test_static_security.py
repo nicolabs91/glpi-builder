@@ -17,6 +17,9 @@ required = [
     "clear_plugin_data(project)",
     'cat /proc/1/comm',
     '@app.route("/healthz")',
+    '@app.route("/set-backup-source", methods=["POST"])',
+    "atomic_write_text(BACKUP_ENV_PATH",
+    "if not UI_PREVIEW_MODE:",
 ]
 missing = [item for item in required if item not in source]
 if missing:

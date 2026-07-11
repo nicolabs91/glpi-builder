@@ -32,6 +32,8 @@ rechten. Start hem alleen voor beheer en stop hem daarna.
 - configureerbaar bind-IP, poort, tijdzone en imagebeleid;
 - gecontroleerde installer met automatische rollback;
 - onveranderlijk YAML-contract en statische securitytest.
+- centraal `GLPI_backup.env` dat door de Builder naar het actuele productieproject wordt bijgewerkt;
+- vast Synology-backupscript met locking, atomaire publicatie, checksums en 60 dagen retentie.
 
 ## Installatie
 
@@ -57,6 +59,24 @@ Stoppen na gebruik:
 ```sh
 sudo docker stop glpi-project-builder-full-restore
 ```
+
+## Synology Taakplanner-backup
+
+Gebruik één keer deze vaste opdracht in Synology Taakplanner:
+
+```sh
+/bin/bash /volume1/docker/_BACKUPS/Restore_Scripts/GLPI/GLPI_backup.sh
+```
+
+Het script leest uitsluitend
+`/volume1/docker/_BACKUPS/Restore_Scripts/GLPI/GLPI_backup.env`. Selecteer in
+de Builder bij een bestaand project **Use for scheduled backups**, of laat bij
+een nieuwe restore **Use this project for scheduled backups** aangevinkt. De
+Builder schrijft dan automatisch de actuele projectmap, databasecontainer en
+databasenaam. Het bestaande `GLPI_mysql_backup.cnf` blijft ongewijzigd.
+
+Een bestaand onbeheerd `GLPI_backup.sh` wordt bij de eerste installatie bewaard
+als `GLPI_backup.pre-builder.sh`.
 
 ## Tests
 

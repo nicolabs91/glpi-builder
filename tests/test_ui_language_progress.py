@@ -41,6 +41,8 @@ class UiLanguageAndProgressTest(unittest.TestCase):
         self.assertNotIn(b"Fresh installation (rare)", response.data)
         self.assertIn(b"Restore without plugins", response.data)
         self.assertIn(b"Overwrite existing project", response.data)
+        self.assertIn(b'name="update_backup_source" value="yes" checked', response.data)
+        self.assertIn(b"Use this project for scheduled backups", response.data)
         self.assertIn(b'class="overwrite-confirmation"', response.data)
         self.assertIn(b".overwrite-confirmation{display:none}", response.data)
         self.assertIn(b"#overwrite-existing:checked", response.data)

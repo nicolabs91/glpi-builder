@@ -14,6 +14,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
 COPY docker-compose.app.yml .
+COPY backup ./backup
 COPY tests ./tests
 
 EXPOSE 8080

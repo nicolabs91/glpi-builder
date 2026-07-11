@@ -29,7 +29,7 @@ docker build --pull -t "$IMAGE" .
 
 echo "[5/6] Regressie-, security- en exacte YAML-tests draaien"
 docker run --rm --entrypoint sh "$IMAGE" -c \
-    'python tests/test_yaml_contract.py && python tests/test_locked_yaml_output.py && python tests/test_static_security.py && python tests/test_preview_flow.py && python tests/test_restore_modes.py && python tests/test_ui_language_progress.py'
+    'python tests/test_yaml_contract.py && python tests/test_locked_yaml_output.py && python tests/test_static_security.py && python tests/test_preview_flow.py && python tests/test_restore_modes.py && python tests/test_ui_language_progress.py && python tests/test_backup_configuration.py'
 
 echo "[6/6] Echte container starten en healthcheck afwachten"
 docker run -d \

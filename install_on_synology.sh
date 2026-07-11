@@ -5,6 +5,8 @@ APP_DIR="${1:-/volume1/docker/glpi-project-builder-v11}"
 IMAGE="glpi-project-builder-v11:latest"
 CONTAINER="glpi-project-builder-full-restore"
 STATE_FILE="$APP_DIR/.last-install-state"
+BACKUP_TASK_DIR="/volume1/docker/_BACKUPS/Restore_Scripts/GLPI"
+BACKUP_SCRIPT="$BACKUP_TASK_DIR/GLPI_backup.sh"
 
 cd "$APP_DIR"
 
@@ -14,6 +16,18 @@ if [ ! -f .env ]; then
   sed -i "s|CHANGE_ME_RANDOM_64_HEX|$SECRET|" .env
   echo "Configuratie aangemaakt: $APP_DIR/.env"
 fi
+
+sudo mkdir -p "$BACKUP_TASK_DIR"
+if [ -f "$BACKUP_SCRIPT" ] && ! sudo grep -q "Managed by GLPI Project Builder" "$BACKUP_SCRIPT"; then
+  if [ ! -f "$BACKUP_TASK_DIR/GLPI_backup.pre-builder.sh" ]; then
+    sudo cp -p "$BACKUP_SCRIPT" "$BACKUP_TASK_DIR/GLPI_backup.pre-builder.sh"
+    sudo chmod 700 "$BACKUP_TASK_DIR/GLPI_backup.pre-builder.sh"
+  fi
+fi
+sudo cp "$APP_DIR/backup/GLPI_backup.sh" "$BACKUP_SCRIPT"
+sudo chmod 750 "$BACKUP_SCRIPT"
+echo "Backupscript geïnstalleerd: $BACKUP_SCRIPT"
+echo "Vaste Taakplanner-opdracht: /bin/bash $BACKUP_SCRIPT"
 
 sudo docker build -t "$IMAGE" .
 sudo docker run --rm "$IMAGE" python tests/test_yaml_contract.py

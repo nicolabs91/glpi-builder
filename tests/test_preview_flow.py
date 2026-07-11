@@ -41,6 +41,7 @@ class PreviewFlowTest(unittest.TestCase):
             "cookie_samesite": "Lax",
             "cookie_secure": "Off",
             "operation_mode": "fresh",
+            "update_backup_source": "yes",
         }
 
     def validation_patches(self):
@@ -89,6 +90,7 @@ class PreviewFlowTest(unittest.TestCase):
              patch.object(module, "write_env"), \
              patch.object(module, "write_compose"), \
              patch.object(module, "create_or_restore", return_value=["completed"]) as execute, \
+             patch.object(module, "configure_scheduled_backup", return_value=["backup configured"]) as configure_backup, \
              patch.object(module, "write_action_log", return_value="test-create-restore.log"), \
              patch.object(module.threading, "Thread", ImmediateThread):
             response = self.client.post(
@@ -99,6 +101,7 @@ class PreviewFlowTest(unittest.TestCase):
         self.assertEqual(response.status_code, 302)
         self.assertIn("/progress/", response.headers["Location"])
         execute.assert_called_once()
+        configure_backup.assert_called_once()
         self.assertTrue(execute.call_args.kwargs["fresh_install"])
         self.assertTrue(execute.call_args.kwargs["skip_plugins"])
         progress_response = self.client.get(response.headers["Location"])

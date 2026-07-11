@@ -23,6 +23,11 @@ UI_PREVIEW_MODE = os.environ.get("UI_PREVIEW_MODE", "0").strip().lower() in {"1"
 APP_PORT = int(os.environ.get("APP_PORT", "8080"))
 BASE_PATH = Path(os.environ.get("BASE_PATH", "/volume1/docker"))
 BACKUP_ROOT = Path(os.environ.get("BACKUP_ROOT", "/volume1/docker/_BACKUPS"))
+BACKUP_TASK_DIR = Path(os.environ.get("BACKUP_TASK_DIR", str(BACKUP_ROOT / "Restore_Scripts" / "GLPI")))
+BACKUP_SCRIPT_SOURCE = Path(__file__).resolve().parent / "backup" / "GLPI_backup.sh"
+BACKUP_SCRIPT_PATH = BACKUP_TASK_DIR / "GLPI_backup.sh"
+BACKUP_ENV_PATH = BACKUP_TASK_DIR / "GLPI_backup.env"
+BACKUP_CNF_PATH = BACKUP_TASK_DIR / "GLPI_mysql_backup.cnf"
 TZ_DEFAULT = os.environ.get("TZ", "Europe/Brussels")
 MAX_SCAN_ENTRIES = int(os.environ.get("MAX_SCAN_ENTRIES", "500"))
 ALLOWED_GLPI_IMAGES = tuple(filter(None, os.environ.get("ALLOWED_GLPI_IMAGES", "glpi/glpi:,diouxx/glpi:").split(",")))
@@ -39,6 +44,7 @@ PROGRESS_JOB_TTL_SECONDS = 6 * 60 * 60
 OPERATION_MODES = ("restore", "fresh")
 
 PROJECT_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{2,50}$")
+CONTAINER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{1,127}$")
 LOG_FILE_RE = re.compile(r"^[0-9]{8}-[0-9]{6}-[a-z0-9_-]+\.log$")
 SAFE_ACTION_RE = re.compile(r"[^a-z0-9_-]+")
 SAFE_CHARS = string.ascii_letters + string.digits
@@ -327,6 +333,161 @@ def write_env(project, env):
         if key in env:
             lines.append(f"{key}={env[key]}")
     env_file(project).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def read_simple_env_file(path):
+    data = {}
+    path = Path(path)
+    if not path.exists() or not path.is_file():
+        return data
+    for raw_line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if re.fullmatch(r"[A-Z][A-Z0-9_]*", key):
+            data[key] = value
+    return data
+
+
+def current_backup_source_project():
+    value = read_simple_env_file(BACKUP_ENV_PATH).get("PROJECT_NAME", "")
+    return value if PROJECT_RE.fullmatch(value) else ""
+
+
+def database_container_for_project(project):
+    project = validate_project(project)
+    expected = f"{project}-db"
+    if get_container(expected):
+        return expected
+
+    env = read_env(project)
+    for key in ("DB_CONTAINER", "DB_CONTAINER_NAME", "MARIADB_CONTAINER"):
+        candidate = str(env.get(key) or "").strip()
+        if CONTAINER_RE.fullmatch(candidate) and get_container(candidate):
+            return candidate
+
+    db_path = (project_dir(project) / "db").resolve()
+    glpi_path = (project_dir(project) / "glpi").resolve()
+    containers = []
+    try:
+        containers = docker_client().containers.list(all=True)
+        for container in containers:
+            for mount in container.attrs.get("Mounts", []):
+                source = mount.get("Source")
+                destination = mount.get("Destination")
+                if source and destination == "/var/lib/mysql" and Path(source).resolve() == db_path:
+                    if CONTAINER_RE.fullmatch(container.name):
+                        return container.name
+    except Exception:
+        pass
+
+    for container in containers:
+        try:
+            mounts_glpi = any(
+                mount.get("Source")
+                and mount.get("Destination") == "/var/glpi"
+                and Path(mount["Source"]).resolve() == glpi_path
+                for mount in container.attrs.get("Mounts", [])
+            )
+            if not mounts_glpi:
+                continue
+            container_env = {}
+            for item in container.attrs.get("Config", {}).get("Env", []) or []:
+                if "=" in item:
+                    key, value = item.split("=", 1)
+                    container_env[key] = value
+            candidate = container_env.get("GLPI_DB_HOST", "")
+            if CONTAINER_RE.fullmatch(candidate) and get_container(candidate):
+                return candidate
+        except Exception:
+            continue
+
+    if compose_file(project).is_file():
+        compose_text = compose_file(project).read_text(encoding="utf-8", errors="replace")
+        candidates = re.findall(r"(?m)^\s+container_name:\s*([A-Za-z0-9_.-]+)\s*$", compose_text)
+        for candidate in candidates:
+            if CONTAINER_RE.fullmatch(candidate) and (candidate.endswith("-db") or "mdb" in candidate.lower()):
+                return candidate
+    return expected
+
+
+def atomic_write_text(path, text, mode):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        temporary_path.chmod(mode)
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path.exists():
+            temporary_path.unlink()
+
+
+def configure_scheduled_backup(project, env=None):
+    project = validate_project(project)
+    env = dict(env or read_env(project))
+    if not env:
+        raise ValueError(f"No .env file was found for {project}.")
+    db_name = validate_db_identifier(env.get("GLPI_DB_NAME") or "glpi")
+    db_container = database_container_for_project(project)
+    if not CONTAINER_RE.fullmatch(db_container):
+        raise ValueError(f"Invalid database container name: {db_container}")
+
+    try:
+        BACKUP_TASK_DIR.resolve().relative_to(BACKUP_ROOT.resolve())
+    except Exception:
+        raise ValueError(f"Backup task folder must be located below {BACKUP_ROOT}.")
+    if not BACKUP_SCRIPT_SOURCE.is_file():
+        raise ValueError(f"Bundled backup script is missing: {BACKUP_SCRIPT_SOURCE}")
+
+    BACKUP_TASK_DIR.mkdir(parents=True, exist_ok=True)
+    if BACKUP_SCRIPT_PATH.exists():
+        existing_header = BACKUP_SCRIPT_PATH.read_text(encoding="utf-8", errors="replace")[:200]
+        legacy_path = BACKUP_TASK_DIR / "GLPI_backup.pre-builder.sh"
+        if "Managed by GLPI Project Builder" not in existing_header and not legacy_path.exists():
+            shutil.copy2(BACKUP_SCRIPT_PATH, legacy_path)
+            legacy_path.chmod(0o700)
+
+    script_text = BACKUP_SCRIPT_SOURCE.read_text(encoding="utf-8")
+    atomic_write_text(BACKUP_SCRIPT_PATH, script_text, 0o750)
+
+    previous = read_simple_env_file(BACKUP_ENV_PATH)
+    retention = previous.get("RETENTION_DAYS", "60")
+    if not retention.isdigit():
+        retention = "60"
+    mysql_cnf = previous.get("MYSQL_CNF") or str(BACKUP_CNF_PATH)
+    container_cnf = previous.get("CONTAINER_CNF") or "/tmp/GLPI_mysql_backup.cnf"
+    values = {
+        "PROJECT_NAME": project,
+        "PROJECT_DIR": str(project_dir(project)),
+        "DB_CONTAINER": db_container,
+        "DB_NAME": db_name,
+        "BACKUP_ROOT": str(BACKUP_ROOT),
+        "MYSQL_CNF": mysql_cnf,
+        "CONTAINER_CNF": container_cnf,
+        "RETENTION_DAYS": retention,
+    }
+    if any(not re.fullmatch(r"[A-Za-z0-9_./-]+", value) for value in values.values()):
+        raise ValueError("Backup configuration contains unsupported characters.")
+    config_text = "# Generated and maintained by GLPI Project Builder.\n" + "".join(
+        f"{key}={value}\n" for key, value in values.items()
+    )
+    atomic_write_text(BACKUP_ENV_PATH, config_text, 0o600)
+
+    messages = [
+        f"Scheduled backup source: {project}",
+        f"Backup environment: {BACKUP_ENV_PATH}",
+        f"Task Scheduler command: /bin/bash {BACKUP_SCRIPT_PATH}",
+    ]
+    if not Path(mysql_cnf).is_file():
+        messages.append(f"Warning: MariaDB credential file is not present yet: {mysql_cnf}")
+    return messages
 
 
 def build_env(project, glpi_image, mariadb_image, host_port, container_port, tz, clean_db, cookie_samesite=None, cookie_secure=None):
@@ -690,6 +851,7 @@ def validate_create_request(source):
     force_recreate = True
     restore_everything = not fresh_install
     skip_plugins = fresh_install or form_flag(source, "skip_plugins")
+    update_backup_source = form_flag(source, "update_backup_source")
     db_backup = (
         source.get("db_backup")
         or source.get("db_backup_manual")
@@ -746,6 +908,7 @@ def validate_create_request(source):
         "force_recreate": force_recreate,
         "restore_everything": restore_everything,
         "skip_plugins": skip_plugins,
+        "update_backup_source": update_backup_source,
         "db_backup": db_backup,
         "file_backup": file_backup,
         "existing_state": existing_state,
@@ -762,6 +925,7 @@ def build_create_plan(data):
     database_action = "delete all database storage and install an empty GLPI database" if fresh_install else "replace the GLPI database from the selected backup"
     files_action = "use only the original files from the GLPI image" if fresh_install else "restore GLPI config and files from backup"
     plugin_action = "start without plugins" if data["skip_plugins"] else "restore plugins from backup"
+    backup_action = "set this project as the scheduled backup source" if data.get("update_backup_source") else "keep the current scheduled backup source"
     steps = [
         "Repeat the preflight checks (images, backups and free port)",
         "Write project folders, .env and the locked compose configuration",
@@ -779,6 +943,8 @@ def build_create_plan(data):
             "Remove plugin data when Restore without plugins is selected",
             "Reapply the GLPI container and save the complete action log",
         ])
+    if data.get("update_backup_source"):
+        steps.append("Update the scheduled backup script and backup.env for this project")
     return {
         "title": mode_title,
         "risk": "High - all existing project data will be deleted" if fresh_install else ("High - existing project data will be replaced" if destructive else "Normal - required backups will be restored"),
@@ -792,6 +958,7 @@ def build_create_plan(data):
             ("Database", database_action),
             ("GLPI files/config", files_action),
             ("Plugins", plugin_action),
+            ("Scheduled backups", backup_action),
             ("Database backup", data["db_backup"] or "none"),
             ("GLPI files backup", data["file_backup"] or "none"),
             ("Cookie policy", f"SameSite={data['cookie_samesite']}, Secure={data['cookie_secure']}"),
@@ -1634,6 +1801,9 @@ def run_create_job(job_token, data):
             fresh_install=data["fresh_install"],
             skip_plugins=data["skip_plugins"],
         )
+        if data.get("update_backup_source"):
+            report(96, "Updating scheduled backups", "Writing the backup script and backup.env for this project.")
+            messages.extend(configure_scheduled_backup(project, env))
         messages.append(f"Project folder: {project_dir(project)}")
         messages.append(f"GLPI port: {data['host_port']}:8080")
         messages.append(f"Cookie SameSite: {env['GLPI_SESSION_COOKIE_SAMESITE']}")
@@ -1916,6 +2086,7 @@ def discover_projects():
     except Exception:
         pass
 
+    backup_source = current_backup_source_project()
     projects = []
     for name in sorted(names):
         env = read_env(name)
@@ -1943,6 +2114,7 @@ def discover_projects():
             "mappings": ", ".join(mappings) if mappings else "-",
             "latest_log": latest_log(name),
             "logs": list_logs(name, limit=5),
+            "backup_source": name == backup_source,
         })
     return projects
 
@@ -2429,6 +2601,21 @@ def change_cookie_route():
     return redirect(url_for("index"))
 
 
+@app.route("/set-backup-source", methods=["POST"])
+def set_backup_source_route():
+    project_for_log = None
+    try:
+        require_csrf()
+        project = validate_project(request.form.get("project"))
+        project_for_log = project
+        messages = configure_scheduled_backup(project)
+        flash_action_success(project, "set-backup-source", messages)
+    except Exception as exc:
+        flash_error(str(exc), project_for_log, "set-backup-source-error")
+    anchor = f"manage-{project_for_log}" if project_for_log else "projects"
+    return redirect(url_for("index") + f"#{anchor}")
+
+
 @app.route("/rebuild-glpi", methods=["POST"])
 def rebuild_glpi_route():
     project_for_log = None
@@ -2557,12 +2744,13 @@ label{display:block;font-size:14px;line-height:1.35;font-weight:600;margin:14px 
 {% with messages=get_flashed_messages(with_categories=true) %}{% for category,message in messages %}<div class="notice {{ category }}">{{ message|safe }}</div>{% endfor %}{% endwith %}
 <div id="projects"><h2>Projects</h2></div>
 <div class="grid">
-{% for p in projects %}<article class="card project"><div><h3>{{ p.name }}</h3><span class="status {{ 'running' if p.glpi_status=='running' else '' }}">GLPI {{ p.glpi_status }}</span> <span class="status {{ 'running' if p.db_status=='running' else '' }}">DB {{ p.db_status }}</span></div>
+{% for p in projects %}<article class="card project"><div><h3>{{ p.name }}</h3><span class="status {{ 'running' if p.glpi_status=='running' else '' }}">GLPI {{ p.glpi_status }}</span> <span class="status {{ 'running' if p.db_status=='running' else '' }}">DB {{ p.db_status }}</span>{% if p.backup_source %} <span class="status running">Backup source</span>{% endif %}</div>
 <div><strong>Web port:</strong> {{ p.active_port or 'not configured' }}</div><div class="meta">{{ p.glpi_image }}<br>{{ p.mariadb_image }}</div>
 <div class="actions">{% if p.glpi_status=='running' and p.active_port %}<a class="button" href="http://{{ request.host.split(':')[0] }}:{{ p.active_port }}" target="_blank">Open GLPI</a>{% endif %}<a class="button secondary" href="#manage-{{ p.name }}">Manage</a></div>
 <details id="manage-{{ p.name }}"><summary>Project management</summary>
 <form method="post" action="{{ url_for('change_port_route') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="project" value="{{ p.name }}"><label>New web port</label><input class="compact-control" type="number" name="host_port" min="1" max="65535" value="{{ p.active_port }}" required><button>Apply port</button></form>
 <form method="post" action="{{ url_for('rebuild_glpi_route') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="project" value="{{ p.name }}"><button class="secondary">Reapply GLPI container</button></form>
+{% if not p.backup_source %}<form method="post" action="{{ url_for('set_backup_source_route') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="project" value="{{ p.name }}"><button class="secondary">Use for scheduled backups</button></form>{% endif %}
 <details><summary>SSO and cookie settings</summary><form method="post" action="{{ url_for('change_cookie_route') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="project" value="{{ p.name }}"><div class="row"><div><label>SameSite</label><select name="cookie_samesite"><option {{ 'selected' if p.cookie_samesite=='Lax' }}>Lax</option><option {{ 'selected' if p.cookie_samesite=='Strict' }}>Strict</option><option {{ 'selected' if p.cookie_samesite=='None' }}>None</option></select></div><div><label>Secure</label><select name="cookie_secure"><option {{ 'selected' if p.cookie_secure=='Off' }}>Off</option><option {{ 'selected' if p.cookie_secure=='On' }}>On</option></select></div></div><button>Apply settings</button></form></details>
 <details><summary>Diagnostics and logs</summary><div class="actions"><form method="post" action="{{ url_for('diagnose') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="project" value="{{ p.name }}"><button class="secondary">Diagnostics</button></form><form method="post" action="{{ url_for('testdb_route') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="project" value="{{ p.name }}"><button class="secondary">Test database</button></form></div>{% for log in p.logs %}<div><a href="{{ url_for('view_log',project=p.name,filename=log) }}">{{ log }}</a></div>{% endfor %}</details>
 </details></article>{% else %}<div class="card empty">No managed GLPI projects found yet.</div>{% endfor %}
@@ -2573,7 +2761,7 @@ label{display:block;font-size:14px;line-height:1.35;font-weight:600;margin:14px 
 <div class="step"><h3>1. Project</h3><div class="row row-project"><div><label>Project name</label><input name="project" pattern="[a-z0-9][a-z0-9_-]{2,50}" placeholder="glpi-production" required></div><div><label>Web port</label><input type="number" name="host_port" min="1" max="65535" value="8775" required></div></div></div>
 <div class="step"><h3>2. Versions</h3><div class="row"><div><label>GLPI image</label><select name="glpi_image" required>{% for image in glpi_images %}<option>{{ image }}</option>{% else %}<option value="">No allowed local GLPI image</option>{% endfor %}</select></div><div><label>Database image</label><select name="mariadb_image" required>{% for image in db_images %}<option>{{ image }}</option>{% else %}<option value="">No allowed local database image</option>{% endfor %}</select></div></div></div>
 <div class="step"><h3>3. Mode and required backups</h3><div class="mode-grid"><label class="mode-option"><input type="radio" name="operation_mode" value="restore" checked><span><strong>Full restore</strong></span></label><label class="mode-option rare"><input type="radio" name="operation_mode" value="fresh"><span><strong>Fresh installation</strong></span></label></div><div class="row"><div><label>Database backup</label><select name="db_backup_select"><option value="">Select required database backup</option>{% for value,label in db_backups %}<option value="{{ value }}">{{ label }}</option>{% endfor %}</select></div><div><label>GLPI files/config backup</label><select name="file_backup_select"><option value="">Select required GLPI files/config backup</option>{% for value,label in file_backups %}<option value="{{ value }}">{{ label }}</option>{% endfor %}</select></div></div><input type="hidden" name="db_backup_manual"><input type="hidden" name="file_backup_manual"><label class="check"><input type="checkbox" name="skip_plugins" value="yes">Restore without plugins</label></div>
-<div class="step"><h3>4. Review and execute</h3><details><summary>Advanced settings</summary><div class="row row-settings"><div><label>Time zone</label><input name="tz" value="{{ tz_default }}"></div><div><label>Cookie SameSite</label><select name="cookie_samesite"><option>Lax</option><option>Strict</option><option>None</option></select></div><div><label>Cookie Secure</label><select name="cookie_secure"><option>Off</option><option>On</option></select></div></div><div class="overwrite-option"><label class="check"><input id="overwrite-existing" type="checkbox" name="confirm_destructive" value="yes">Overwrite existing project</label><div id="overwrite-confirmation" class="overwrite-confirmation"><label for="confirm-project">Type the project name to confirm overwrite</label><input id="confirm-project" class="confirm-field" name="confirm_project" autocomplete="off"></div></div>{% if ui_preview_mode %}<a class="button secondary preview-button" href="{{ url_for('ui_preview') }}">Preview review screen</a>{% endif %}</details>
+<div class="step"><h3>4. Review and execute</h3><details><summary>Advanced settings</summary><div class="row row-settings"><div><label>Time zone</label><input name="tz" value="{{ tz_default }}"></div><div><label>Cookie SameSite</label><select name="cookie_samesite"><option>Lax</option><option>Strict</option><option>None</option></select></div><div><label>Cookie Secure</label><select name="cookie_secure"><option>Off</option><option>On</option></select></div></div><div class="overwrite-option"><label class="check"><input id="overwrite-existing" type="checkbox" name="confirm_destructive" value="yes">Overwrite existing project</label><div id="overwrite-confirmation" class="overwrite-confirmation"><label for="confirm-project">Type the project name to confirm overwrite</label><input id="confirm-project" class="confirm-field" name="confirm_project" autocomplete="off"></div></div><label class="check"><input type="checkbox" name="update_backup_source" value="yes" checked>Use this project for scheduled backups</label>{% if ui_preview_mode %}<a class="button secondary preview-button" href="{{ url_for('ui_preview') }}">Preview review screen</a>{% endif %}</details>
 <button class="review-button">Review plan</button></div></form></section>
 </main></body></html>"""
 
