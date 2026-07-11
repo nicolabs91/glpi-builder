@@ -82,6 +82,28 @@ class RestoreModesTest(unittest.TestCase):
             finally:
                 module.BASE_PATH = old_base
 
+    def test_existing_project_requires_explicit_overwrite(self):
+        payload = self.base_payload()
+        payload.update({
+            "operation_mode": "restore",
+            "db_backup": "/backups/database.sql.gz",
+            "file_backup": "/backups/glpi-files.tar.gz",
+        })
+        with patch.object(module, "validate_local_image", side_effect=lambda image, _kind: image), \
+             patch.object(module, "validate_backup_choice", side_effect=lambda value, *_args, **_kwargs: value), \
+             patch.object(module, "project_has_existing_state", return_value=True), \
+             patch.object(module, "get_container", return_value=None), \
+             patch.object(module, "assert_docker_port_free"):
+            with self.assertRaisesRegex(ValueError, "Enable Overwrite existing project"):
+                module.validate_create_request(payload)
+
+            payload["confirm_destructive"] = "yes"
+            payload["confirm_project"] = "glpi-mode-test"
+            data = module.validate_create_request(payload)
+
+        self.assertTrue(data["existing_state"])
+        self.assertTrue(data["confirm_destructive"])
+
 
 if __name__ == "__main__":
     unittest.main()
