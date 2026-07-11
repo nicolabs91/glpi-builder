@@ -744,6 +744,28 @@ def docker_port_usage(host_port, exclude_containers=None):
     return None
 
 
+def suggest_free_host_port(start=8775, end=65535):
+    start = validate_port(start, "Port search start")
+    end = validate_port(end, "Port search end")
+    if end < start:
+        raise ValueError("Port search end must be greater than or equal to the start.")
+    used_ports = set()
+    try:
+        containers = docker_client().containers.list(all=True)
+    except Exception:
+        return start
+    for container in containers:
+        for mapping in container_port_mappings(container):
+            try:
+                used_ports.add(int(mapping["host_port"]))
+            except Exception:
+                continue
+    for candidate in range(start, end + 1):
+        if candidate not in used_ports:
+            return candidate
+    raise ValueError(f"No free Docker host port is available between {start} and {end}.")
+
+
 def assert_docker_port_free(host_port, exclude_containers=None):
     usage = docker_port_usage(host_port, exclude_containers=exclude_containers)
     if usage:
@@ -2756,7 +2778,7 @@ label{display:block;font-size:14px;line-height:1.35;font-weight:600;margin:14px 
 
 <section class="card" id="new-project"><h2>New project or restore</h2>
 <form method="post" action="{{ url_for('create') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="backup_root" value="{{ backup_root }}"><input type="hidden" name="container_port" value="8080">
-<div class="step"><h3>1. Project</h3><div class="row row-project"><div><label>Project name</label><input name="project" pattern="[a-z0-9][a-z0-9_-]{2,50}" placeholder="glpi-production" required></div><div><label>Web port</label><input type="number" name="host_port" min="1" max="65535" value="8775" required></div></div></div>
+<div class="step"><h3>1. Project</h3><div class="row row-project"><div><label>Project name</label><input name="project" pattern="[a-z0-9][a-z0-9_-]{2,50}" placeholder="glpi-production" required></div><div><label>Web port</label><input type="number" name="host_port" min="1" max="65535" value="{{ suggested_host_port }}" required></div></div></div>
 <div class="step"><h3>2. Versions</h3><div class="row"><div><label>GLPI image</label><select name="glpi_image" required>{% for image in glpi_images %}<option>{{ image }}</option>{% else %}<option value="">No allowed local GLPI image</option>{% endfor %}</select></div><div><label>Database image</label><select name="mariadb_image" required>{% for image in db_images %}<option>{{ image }}</option>{% else %}<option value="">No allowed local database image</option>{% endfor %}</select></div></div></div>
 <div class="step"><h3>3. Mode and required backups</h3><div class="mode-grid"><label class="mode-option"><input type="radio" name="operation_mode" value="restore" checked><span><strong>Full restore</strong></span></label><label class="mode-option rare"><input type="radio" name="operation_mode" value="fresh"><span><strong>Fresh installation</strong></span></label></div><div class="row"><div><label>Database backup</label><select name="db_backup_select"><option value="">Select required database backup</option>{% for value,label in db_backups %}<option value="{{ value }}">{{ label }}</option>{% endfor %}</select></div><div><label>GLPI files/config backup</label><select name="file_backup_select"><option value="">Select required GLPI files/config backup</option>{% for value,label in file_backups %}<option value="{{ value }}">{{ label }}</option>{% endfor %}</select></div></div><input type="hidden" name="db_backup_manual"><input type="hidden" name="file_backup_manual"><label class="check"><input type="checkbox" name="skip_plugins" value="yes">Restore without plugins</label></div>
 <div class="step"><h3>4. Review and execute</h3><details><summary>Advanced settings</summary><div class="row row-settings"><div><label>Time zone</label><input name="tz" value="{{ tz_default }}"></div><div><label>Cookie SameSite</label><select name="cookie_samesite"><option>Lax</option><option>Strict</option><option>None</option></select></div><div><label>Cookie Secure</label><select name="cookie_secure"><option>Off</option><option>On</option></select></div></div><div class="overwrite-option"><label class="check"><input id="overwrite-existing" type="checkbox" name="confirm_destructive" value="yes">Overwrite existing project</label><div id="overwrite-confirmation" class="overwrite-confirmation"><label for="confirm-project">Type the project name to confirm overwrite</label><input id="confirm-project" class="confirm-field" name="confirm_project" autocomplete="off"></div></div><label class="check"><input type="checkbox" name="update_backup_source" value="yes" checked>Use this project for scheduled backups</label>{% if ui_preview_mode %}<a class="button secondary preview-button" href="{{ url_for('ui_preview') }}">Preview review screen</a>{% endif %}</details>
@@ -2802,6 +2824,7 @@ def v11_index():
         file_backups=scan_files(backup_root, FILE_EXTENSIONS, include_dirs=True),
         glpi_images=local_image_tags("glpi"),
         db_images=local_image_tags("database"),
+        suggested_host_port=suggest_free_host_port(),
         tz_default=TZ_DEFAULT,
         ui_preview_mode=UI_PREVIEW_MODE,
     )

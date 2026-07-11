@@ -19,6 +19,7 @@ class UiLanguageAndProgressTest(unittest.TestCase):
         self.assertEqual(module.APP_VERSION, "0.1")
         with patch.object(module, "discover_projects", return_value=[]), \
              patch.object(module, "scan_files", return_value=[]), \
+             patch.object(module, "suggest_free_host_port", return_value=18888), \
              patch.object(module, "local_image_tags", side_effect=lambda kind: ["glpi/glpi:test"] if kind == "glpi" else ["mariadb:test"]):
             response = self.client.get("/")
 
@@ -32,6 +33,7 @@ class UiLanguageAndProgressTest(unittest.TestCase):
         self.assertIn(b".review-button{margin-top:16px}", response.data)
         self.assertIn(b"row row-project", response.data)
         self.assertIn(b"row row-settings", response.data)
+        self.assertIn(b'name="host_port" min="1" max="65535" value="18888"', response.data)
         self.assertIn(b"compact-control", response.data)
         self.assertIn(b"font:inherit", response.data)
         self.assertIn(b'value="restore" checked', response.data)
@@ -89,6 +91,23 @@ class UiLanguageAndProgressTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn(b'href="/ui-preview"', response.data)
         self.assertIn(b"Preview review screen", response.data)
+
+    def test_first_free_docker_port_is_suggested(self):
+        class Containers:
+            @staticmethod
+            def list(all=True):
+                return [type("Container", (), {"name": "one"})(), type("Container", (), {"name": "two"})()]
+
+        client = type("Client", (), {"containers": Containers()})()
+        mappings = {
+            "one": [{"host_port": "8775"}],
+            "two": [{"host_port": "8776"}, {"host_port": "5055"}],
+        }
+        with patch.object(module, "docker_client", return_value=client), \
+             patch.object(module, "container_port_mappings", side_effect=lambda container: mappings[container.name]):
+            suggested = module.suggest_free_host_port()
+
+        self.assertEqual(suggested, 8777)
 
     def test_completed_progress_page_stops_refreshing(self):
         token = module.create_progress_job("glpi-progress-test", module.BACKUP_ROOT)
