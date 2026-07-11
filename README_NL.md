@@ -15,6 +15,7 @@ rechten. Start hem alleen voor beheer en stop hem daarna.
 ## Verbeteringen
 
 - volledig Engelstalige gebruikersinterface en operationele meldingen;
+- inhoudsafhankelijke, evenwichtige formulierbreedtes voor desktop en mobiel;
 - echte restorevoortgang met actuele fase, percentage, verstreken tijd en activiteitenlog;
 - restore-uitvoering in één bewaakte achtergrondtaak, zodat de voortgangspagina beschikbaar blijft;
 - rustig projectdashboard en begeleide create/restore-wizard;

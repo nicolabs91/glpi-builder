@@ -25,6 +25,10 @@ class UiLanguageAndProgressTest(unittest.TestCase):
         self.assertIn(b"Projects", response.data)
         self.assertIn(b"New project or restore", response.data)
         self.assertIn(b"Review plan", response.data)
+        self.assertIn(b"row row-project", response.data)
+        self.assertIn(b"row row-settings", response.data)
+        self.assertIn(b"compact-control", response.data)
+        self.assertIn(b"font:inherit", response.data)
         self.assertNotIn(b"Projecten", response.data)
         self.assertNotIn(b"Nieuw project", response.data)
 
