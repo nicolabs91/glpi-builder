@@ -28,6 +28,8 @@ class UiLanguageAndProgressTest(unittest.TestCase):
         self.assertEqual(response.data.count(b"New project or restore"), 1)
         self.assertNotIn(b'href="#new-project"', response.data)
         self.assertIn(b"Review plan", response.data)
+        self.assertIn(b'class="review-button">Review plan', response.data)
+        self.assertIn(b".review-button{margin-top:16px}", response.data)
         self.assertIn(b"row row-project", response.data)
         self.assertIn(b"row row-settings", response.data)
         self.assertIn(b"compact-control", response.data)
