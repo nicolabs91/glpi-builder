@@ -65,6 +65,8 @@ class PreviewFlowTest(unittest.TestCase):
         self.assertIn(b"glpi-preview-test", response.data)
         self.assertIn(b"Fresh installation", response.data)
         self.assertNotIn(b"Fresh installation (rare)", response.data)
+        self.assertNotIn(b"Execution order", response.data)
+        self.assertNotIn(b"The preflight checks run again", response.data)
         ensure_dirs.assert_not_called()
         with self.client.session_transaction() as flask_session:
             self.assertIn("pending_create_preview", flask_session)
@@ -135,6 +137,8 @@ class PreviewFlowTest(unittest.TestCase):
         self.assertIn(b"Preview only", response.data)
         self.assertIn(b"glpi-ui-preview", response.data)
         self.assertIn(b"example-database.sql.gz", response.data)
+        self.assertNotIn(b"Execution order", response.data)
+        self.assertNotIn(b"The preflight checks run again", response.data)
         self.assertNotIn(b"Confirm plan and start", response.data)
         self.assertNotIn(b'action="/create/execute"', response.data)
         with self.client.session_transaction() as flask_session:

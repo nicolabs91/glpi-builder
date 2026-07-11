@@ -2430,17 +2430,15 @@ CREATE_PREVIEW_HTML = r"""<!doctype html>
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px system-ui,-apple-system,"Segoe UI",sans-serif}
 header{background:#102a43;color:#fff;padding:20px}header div,main{max-width:900px;margin:auto}main{padding:28px 18px 50px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:20px;box-shadow:0 1px 2px #102a4310;margin-bottom:18px}
-h1,h2{margin-top:0}.meta{color:var(--muted)}.risk{border-left:5px solid var(--brand);padding:12px 14px;background:#edf8f3;border-radius:8px}.risk.danger{border-color:var(--danger);background:#fff0ef}
+h1,h2{margin-top:0}.risk{border-left:5px solid var(--brand);padding:12px 14px;background:#edf8f3;border-radius:8px}.risk.danger{border-color:var(--danger);background:#fff0ef}
 dl{display:grid;grid-template-columns:minmax(170px,240px) 1fr;gap:0;border-top:1px solid var(--line)}dt,dd{margin:0;padding:10px 0;border-bottom:1px solid var(--line)}dt{font-weight:700;padding-right:15px}dd{overflow-wrap:anywhere}
-ol{padding-left:22px}li{margin:9px 0}.actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center}button,.button{border:0;border-radius:8px;padding:11px 15px;background:var(--brand);color:#fff;font-weight:750;text-decoration:none;cursor:pointer}.secondary{background:#425466}
+.actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center}button,.button{border:0;border-radius:8px;padding:11px 15px;background:var(--brand);color:#fff;font-weight:750;text-decoration:none;cursor:pointer}.secondary{background:#425466}
 @media(max-width:640px){dl{grid-template-columns:1fr}dt{border-bottom:0;padding-bottom:0}dd{padding-top:4px}}
 </style></head><body>
 <header><div><h1>Review the execution plan</h1><div>{{ app_version }}</div></div></header>
 <main>
 <section class="card"><h2>{{ plan.title }}</h2><p class="risk {{ 'danger' if plan.destructive else '' }}"><strong>Risk:</strong> {{ plan.risk }}</p>
 <dl>{% for label,value in plan.rows %}<dt>{{ label }}</dt><dd>{{ value }}</dd>{% endfor %}</dl></section>
-<section class="card"><h2>Execution order</h2><ol>{% for step in plan.steps %}<li>{{ step }}</li>{% endfor %}</ol>
-<p class="meta">The preflight checks run again immediately before execution. The action stops safely if a port, image or backup changed in the meantime.</p></section>
 <section class="card"><div class="actions">{% if preview_only %}<strong>Preview only</strong>{% else %}<form method="post" action="{{ url_for('execute_create') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="preview_token" value="{{ preview_token }}"><button type="submit">Confirm plan and start</button></form>{% endif %}<a class="button secondary" href="{{ url_for('index') }}#new-project">{{ 'Back' if preview_only else 'Back and edit' }}</a></div></section>
 </main></body></html>"""
 
