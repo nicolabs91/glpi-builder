@@ -1,45 +1,43 @@
-# Ontwikkelloop voor de GLPI Project Builder
+# Development loop for GLPI Builder
 
-## Niet-onderhandelbaar YAML-contract
+## Non-negotiable YAML contract
 
-De huidige YAML-opbouw is de bewezen basis voor de Synology RS822RP+. De
-generator `write_compose`, het GLPI-entrypoint, de service- en containernamen,
-volumes, poort `8080`, netwerken en `docker-compose.app.yml` worden niet
-gewijzigd tijdens gewone app-ontwikkeling.
+The current YAML structure is the proven baseline for the Synology RS822RP+.
+Normal application development must not change the `write_compose` generator,
+the GLPI entrypoint, service or container names, volumes, internal port `8080`,
+networks, or `docker-compose.app.yml`.
 
-Het contract wordt op drie niveaus bewaakt:
+The contract is protected at three levels:
 
-1. een versie-onafhankelijke bronhash detecteert iedere wijziging aan
-   `write_compose`;
-2. de golden fixture vergelijkt de werkelijk gegenereerde project-YAML exact,
-   byte voor byte;
-3. een SHA-256-hash vergrendelt de compose van de Builder zelf.
+1. a version-independent source hash detects every change to `write_compose`;
+2. a golden fixture compares the generated project YAML byte for byte;
+3. a SHA-256 hash locks the Builder Compose file.
 
-Een noodzakelijke YAML-wijziging krijgt een afzonderlijke kandidaat-build en
-vereist vooraf expliciete toestemming. De bestaande build blijft beschikbaar.
-De kandidaat vervangt hem pas na een geslaagde create-, start-, herstart-,
-restore- en rollbacktest op de RS822RP+.
+A necessary YAML change requires a separate candidate build and explicit prior
+approval. The existing build remains available. A candidate may replace it only
+after successful create, start, restart, restore, and rollback tests on the
+RS822RP+.
 
-## De vaste cyclus
+## Required cycle
 
-1. Begin met een schone Git-status en beschrijf één kleine verbetering met
-   concrete acceptatiecriteria.
-2. Voeg eerst de passende regressietest toe. Raak de vergrendelde YAML niet aan.
-3. Implementeer de kleinst mogelijke wijziging.
-4. Draai `sh scripts/dev_loop.sh`. Dit controleert syntax, beide composevormen,
-   bouwt schoon in Docker, voert alle tests uit en wacht op een echte healthy
-   Builder-container.
-5. Controleer de diff expliciet. Een onverwachte wijziging aan de YAML, de
-   generator of het entrypoint stopt de ronde.
-6. Test de gewijzigde gebruikersflow, inclusief foutpad en herhaalde actie.
-7. Maak pas daarna een release-zip en SHA-256-checksum. Bewaar de vorige zip als
-   rollbackversie.
-8. Installeer eerst als kandidaat, voer de NAS-smoketest uit en promoveer alleen
-   een volledig geslaagde kandidaat.
+1. Start with a clean Git status and define one small improvement with concrete
+   acceptance criteria.
+2. Add the appropriate regression test first. Do not touch locked YAML.
+3. Implement the smallest possible change.
+4. Run `sh scripts/dev_loop.sh`. It checks syntax and both Compose forms, builds
+   a clean Docker image, automatically discovers every `test_*.py` test, checks
+   installed dependencies, and waits for a healthy Builder container.
+5. Review the diff explicitly. Any unexpected change to YAML, the generator, or
+   the entrypoint stops the cycle.
+6. Test the changed user flow, including its failure path and repeated use.
+7. Only then create a release zip and SHA-256 checksum. Keep the previous zip as
+   the rollback release.
+8. Install the new build as a candidate first, run the NAS smoke test, and
+   promote only a fully successful candidate.
 
-## Definitie van klaar
+## Definition of done
 
-Een wijziging is alleen klaar als alle automatische controles groen zijn, de
-container `healthy` wordt, de UI-flow en het foutpad werken, de diff geen
-onbedoelde YAML-wijziging bevat, de release reproduceerbaar is en rollback
-beschikbaar blijft.
+A change is complete only when every automated check passes, the container
+becomes `healthy`, the UI flow and failure path work, the diff contains no
+unintended YAML changes, the release is reproducible, and rollback remains
+available.

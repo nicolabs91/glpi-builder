@@ -1,5 +1,5 @@
 #!/bin/bash
-# Managed by GLPI Project Builder. Project-specific values live in GLPI_backup.env.
+# Managed by GLPI Builder. Project-specific values live in GLPI_backup.env.
 set -Eeuo pipefail
 umask 077
 
@@ -65,6 +65,9 @@ trap cleanup EXIT INT TERM
 
 mkdir "$TEMP_BACKUP_DIR"
 echo "Starting GLPI backup for $PROJECT_NAME: $STAMP"
+printf 'PROJECT_NAME=%s\nCREATED_AT=%s\n' \
+  "$PROJECT_NAME" "$(date '+%Y-%m-%dT%H:%M:%S%z')" \
+  > "$TEMP_BACKUP_DIR/BACKUP_INFO"
 
 echo "Copying the credential file temporarily to $DB_CONTAINER..."
 "${DOCKER[@]}" cp "$MYSQL_CNF" "$DB_CONTAINER:$CONTAINER_CNF"
@@ -89,9 +92,9 @@ tar -C "$PROJECT_DIR" -czf "$TEMP_BACKUP_DIR/glpi-files.tar.gz" \
 [ -s "$TEMP_BACKUP_DIR/glpi-files.tar.gz" ] || fail "GLPI files archive is empty"
 
 if command -v sha256sum >/dev/null 2>&1; then
-  (cd "$TEMP_BACKUP_DIR" && sha256sum glpi-database.sql glpi-files.tar.gz > SHA256SUMS)
+  (cd "$TEMP_BACKUP_DIR" && sha256sum glpi-database.sql glpi-files.tar.gz BACKUP_INFO > SHA256SUMS)
 elif command -v shasum >/dev/null 2>&1; then
-  (cd "$TEMP_BACKUP_DIR" && shasum -a 256 glpi-database.sql glpi-files.tar.gz > SHA256SUMS)
+  (cd "$TEMP_BACKUP_DIR" && shasum -a 256 glpi-database.sql glpi-files.tar.gz BACKUP_INFO > SHA256SUMS)
 fi
 
 mv "$TEMP_BACKUP_DIR" "$BACKUP_DIR"

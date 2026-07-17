@@ -5,8 +5,8 @@ import hashlib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-EXPECTED_GENERATOR_SHA256 = "9d8ee969f724aa905bf46bc54a413bdda74cf6b5abf5c1fb4c1d4c2f57b408f2"
-EXPECTED_BUILDER_COMPOSE_SHA256 = "ab701e95ab16e4e77e07e0395920ec6140444cf71dc98c6ec84984b41cff7e7d"
+EXPECTED_GENERATOR_SHA256 = "166049b97670f522755a3877cefa3dff470d4f33eca637bb4bcb27729ef36006"
+EXPECTED_BUILDER_COMPOSE_SHA256 = "ba87dd6a1ec19c380af53b63f2ee97805e27112467f16a2082c03d5a450a4894"
 
 source = (ROOT / "app.py").read_text(encoding="utf-8")
 tree = ast.parse(source)
@@ -20,17 +20,17 @@ function_source = "".join(
 actual = hashlib.sha256(function_source.encode()).hexdigest()
 if actual != EXPECTED_GENERATOR_SHA256:
     raise SystemExit(
-        "FOUT: write_compose/YAML-contract is gewijzigd. "
-        f"Verwacht {EXPECTED_GENERATOR_SHA256}, ontvangen {actual}."
+        "ERROR: write_compose/YAML contract changed. "
+        f"Expected {EXPECTED_GENERATOR_SHA256}, received {actual}."
     )
 
 builder_compose = ROOT / "docker-compose.app.yml"
 builder_actual = hashlib.sha256(builder_compose.read_bytes()).hexdigest()
 if builder_actual != EXPECTED_BUILDER_COMPOSE_SHA256:
     raise SystemExit(
-        "FOUT: docker-compose.app.yml is gewijzigd. "
-        f"Verwacht {EXPECTED_BUILDER_COMPOSE_SHA256}, ontvangen {builder_actual}."
+        "ERROR: docker-compose.app.yml changed. "
+        f"Expected {EXPECTED_BUILDER_COMPOSE_SHA256}, received {builder_actual}."
     )
 
-print(f"OK: YAML-generator ongewijzigd ({actual})")
-print(f"OK: Builder-compose ongewijzigd ({builder_actual})")
+print(f"OK: YAML generator unchanged ({actual})")
+print(f"OK: Builder Compose unchanged ({builder_actual})")

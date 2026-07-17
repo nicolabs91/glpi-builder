@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Vergelijk de werkelijk gegenereerde Synology-compose byte voor byte."""
+"""Compare the generated Synology Compose file byte for byte."""
 import sys
 import tempfile
 from pathlib import Path
@@ -40,8 +40,8 @@ expected_path = ROOT / "tests" / "fixtures" / "locked-project-compose.yml"
 expected = expected_path.read_bytes()
 if actual != expected:
     raise SystemExit(
-        "FOUT: de gegenereerde GLPI-compose wijkt af van de bewezen Synology-YAML. "
-        "Herstel de generator of voer een expliciet goedgekeurde NAS-herkwalificatie uit."
+        "ERROR: generated GLPI Compose differs from the proven Synology YAML. "
+        "Restore the generator or perform an explicitly approved NAS requalification."
     )
 
-print("OK: gegenereerde Synology-compose is byte-voor-byte ongewijzigd")
+print("OK: generated Synology Compose is unchanged byte for byte")

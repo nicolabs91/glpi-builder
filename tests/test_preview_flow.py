@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import app as module
+from tests.auth_test_support import authenticate
 
 
 class ImmediateThread:
@@ -25,6 +26,7 @@ class PreviewFlowTest(unittest.TestCase):
             module.PROGRESS_JOBS.clear()
         module.app.config.update(TESTING=True, SECRET_KEY="preview-test-secret")
         self.client = module.app.test_client()
+        authenticate(self.client, module)
         with self.client.session_transaction() as flask_session:
             flask_session["csrf_token"] = "csrf-test"
 
@@ -60,7 +62,7 @@ class PreviewFlowTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertIn(b"Review the execution plan", response.data)
-        self.assertIn(b"<div>0.1</div>", response.data)
+        self.assertIn(b"<div>0.1.0</div>", response.data)
         self.assertNotIn(b"nothing has been changed yet", response.data)
         self.assertIn(b"glpi-preview-test", response.data)
         self.assertIn(b"Fresh installation", response.data)
@@ -117,7 +119,17 @@ class PreviewFlowTest(unittest.TestCase):
         payload = self.payload()
         payload["operation_mode"] = "restore"
         patches = self.validation_patches()
-        with patches[0], patches[1], patches[2], patches[3]:
+        with patches[0], patches[1], patches[2], patches[3], \
+             patch.object(
+                 module,
+                 "dashboard_docker_snapshot",
+                 return_value={"containers": [], "image_tags": ()},
+             ), \
+             patch.object(
+                 module,
+                 "scan_backup_choices",
+                 return_value={"database": [], "files": []},
+             ):
             response = self.client.post("/create", data=payload, follow_redirects=True)
 
         self.assertEqual(response.status_code, 200)

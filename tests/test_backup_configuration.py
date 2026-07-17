@@ -11,6 +11,16 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import app as module
+from tests.auth_test_support import authenticate
+
+
+class ImmediateThread:
+    def __init__(self, target, args=(), **_kwargs):
+        self.target = target
+        self.args = args
+
+    def start(self):
+        self.target(*self.args)
 
 
 class BackupConfigurationTest(unittest.TestCase):
@@ -44,6 +54,8 @@ class BackupConfigurationTest(unittest.TestCase):
             context.start()
 
     def tearDown(self):
+        if module.MUTATION_LOCK.locked():
+            module.MUTATION_LOCK.release()
         for context in reversed(self.patches):
             context.stop()
         self.temporary_directory.cleanup()
@@ -70,7 +82,68 @@ class BackupConfigurationTest(unittest.TestCase):
         legacy = self.task_dir / "GLPI_backup.pre-builder.sh"
 
         self.assertIn("echo legacy", legacy.read_text(encoding="utf-8"))
-        self.assertIn("Managed by GLPI Project Builder", module.BACKUP_SCRIPT_PATH.read_text(encoding="utf-8"))
+        self.assertIn("Managed by GLPI Builder", module.BACKUP_SCRIPT_PATH.read_text(encoding="utf-8"))
+
+    def test_backup_status_reports_readiness_and_latest_verified_backup(self):
+        module.configure_scheduled_backup(self.project)
+        module.BACKUP_CNF_PATH.write_text("[client]\nuser=root\n", encoding="utf-8")
+        backup = self.backup_root / "GLPI_Backup_20260711-120000"
+        backup.mkdir()
+        (backup / "BACKUP_INFO").write_text(
+            "PROJECT_NAME=glpi-production\nCREATED_AT=2026-07-11T12:00:00+0200\n",
+            encoding="utf-8",
+        )
+        (backup / "glpi-database.sql").write_bytes(b"database")
+        (backup / "glpi-files.tar.gz").write_bytes(b"files")
+        (backup / "SHA256SUMS").write_text("checksums\n", encoding="utf-8")
+
+        database = type("Database", (), {"status": "running", "reload": lambda self: None})()
+        with patch.object(module, "get_container", return_value=database):
+            status = module.scheduled_backup_status(self.project)
+
+        self.assertTrue(status["selected"])
+        self.assertTrue(status["ready"])
+        self.assertEqual(status["issues"], [])
+        self.assertEqual(status["latest"]["name"], backup.name)
+        self.assertEqual(status["latest"]["created_at"], "2026-07-11T12:00:00+0200")
+        self.assertEqual(status["latest"]["size_bytes"], 13)
+        self.assertTrue(status["latest"]["checksum_manifest"])
+
+    def test_backup_status_explains_missing_credentials(self):
+        module.configure_scheduled_backup(self.project)
+        database = type("Database", (), {"status": "running", "reload": lambda self: None})()
+        with patch.object(module, "get_container", return_value=database):
+            status = module.scheduled_backup_status(self.project)
+
+        self.assertTrue(status["selected"])
+        self.assertFalse(status["ready"])
+        self.assertTrue(any("credential file" in issue.lower() for issue in status["issues"]))
+
+    def test_manual_backup_route_starts_a_backup_progress_job(self):
+        module.app.config.update(TESTING=True, SECRET_KEY="backup-route-test-secret")
+        client = module.app.test_client()
+        authenticate(client, module)
+        with client.session_transaction() as flask_session:
+            flask_session["csrf_token"] = "backup-csrf"
+
+        def complete_job(job_token, _project):
+            module.update_progress_job(job_token, 100, "Backup completed", status="completed")
+            module.MUTATION_LOCK.release()
+
+        with patch.object(module, "scheduled_backup_status", return_value={"ready": True, "issues": []}), \
+             patch.object(module, "run_backup_job", side_effect=complete_job), \
+             patch.object(module.threading, "Thread", ImmediateThread):
+            response = client.post(
+                "/run-backup",
+                data={"csrf_token": "backup-csrf", "project": self.project},
+            )
+
+        self.assertEqual(response.status_code, 302)
+        self.assertIn("/progress/", response.headers["Location"])
+        progress = client.get(response.headers["Location"])
+        self.assertEqual(progress.status_code, 200)
+        self.assertIn(b"Backup progress", progress.data)
+        self.assertIn(b"Backup completed", progress.data)
 
     def test_bundled_script_has_valid_bash_syntax_and_safety_guards(self):
         script = Path(module.__file__).resolve().parent / "backup" / "GLPI_backup.sh"
@@ -146,6 +219,11 @@ class BackupConfigurationTest(unittest.TestCase):
                 backup = backup_directories[0]
                 self.assertGreater((backup / "glpi-database.sql").stat().st_size, 0)
                 self.assertTrue((backup / "SHA256SUMS").is_file())
+                self.assertEqual(
+                    module.read_simple_env_file(backup / "BACKUP_INFO")["PROJECT_NAME"],
+                    "glpi-backup-script-test",
+                )
+                self.assertIn("BACKUP_INFO", (backup / "SHA256SUMS").read_text(encoding="utf-8"))
                 with tarfile.open(backup / "glpi-files.tar.gz", "r:gz") as archive:
                     members = set(archive.getnames())
                 self.assertIn("glpi/config/config_db.php", members)
