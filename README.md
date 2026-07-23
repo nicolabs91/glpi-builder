@@ -47,6 +47,8 @@ rate limited per source address and globally.
   execution;
 - live progress, elapsed time, activity timeline, and a complete project log;
 - GLPI web-port and cookie-setting management;
+- a managed 32 KiB Apache request-URL limit that is reapplied whenever a GLPI
+  project is created or rebuilt;
 - GLPI container reapplication, database check, and diagnostics;
 - only one mutating administration action at a time;
 - central Synology backup script with locking, atomic publication, checksums,
