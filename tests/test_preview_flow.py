@@ -62,7 +62,7 @@ class PreviewFlowTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertIn(b"Review the execution plan", response.data)
-        self.assertIn(b"<div>0.1.2-rc.2</div>", response.data)
+        self.assertIn(b"<div>0.3.0</div>", response.data)
         self.assertNotIn(b"nothing has been changed yet", response.data)
         self.assertIn(b"glpi-preview-test", response.data)
         self.assertIn(b"Fresh installation", response.data)
@@ -135,26 +135,9 @@ class PreviewFlowTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIn(b"Full restore requires a database backup", response.data)
 
-    def test_ui_preview_is_disabled_by_default(self):
-        with patch.object(module, "UI_PREVIEW_MODE", False):
-            response = self.client.get("/ui-preview")
-
+    def test_obsolete_ui_preview_route_is_removed(self):
+        response = self.client.get("/ui-preview")
         self.assertEqual(response.status_code, 404)
-
-    def test_ui_preview_has_no_execution_action_or_session_data(self):
-        with patch.object(module, "UI_PREVIEW_MODE", True):
-            response = self.client.get("/ui-preview")
-
-        self.assertEqual(response.status_code, 200)
-        self.assertIn(b"Preview only", response.data)
-        self.assertIn(b"glpi-ui-preview", response.data)
-        self.assertIn(b"example-database.sql.gz", response.data)
-        self.assertNotIn(b"Execution order", response.data)
-        self.assertNotIn(b"The preflight checks run again", response.data)
-        self.assertNotIn(b"Confirm plan and start", response.data)
-        self.assertNotIn(b'action="/create/execute"', response.data)
-        with self.client.session_transaction() as flask_session:
-            self.assertNotIn("pending_create_preview", flask_session)
 
 
 if __name__ == "__main__":

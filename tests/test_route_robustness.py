@@ -79,6 +79,38 @@ class RouteRobustnessTest(unittest.TestCase):
         self.assertEqual(response.status_code, 409)
         self.assertIn(b"Another administration action is already running", response.data)
 
+    def test_rebuild_requires_exact_typed_project_confirmation(self):
+        with patch.object(module, "rebuild_glpi") as rebuild:
+            self.client.post("/rebuild-glpi", data={
+                "csrf_token": "test-csrf-token",
+                "project": "glpi-test",
+                "confirm_rebuild": "wrong",
+            })
+            rebuild.assert_not_called()
+            self.client.post("/rebuild-glpi", data={
+                "csrf_token": "test-csrf-token",
+                "project": "glpi-test",
+                "confirm_rebuild": "glpi-test",
+            })
+            rebuild.assert_called_once_with("glpi-test")
+
+    def test_database_recovery_requires_checkbox_and_typed_name(self):
+        with patch.object(module, "reset_db_user", return_value=(True, "ok")) as reset:
+            self.client.post("/resetdb", data={
+                "csrf_token": "test-csrf-token",
+                "project": "glpi-test",
+                "confirm_resetdb": "yes",
+                "confirm_project": "wrong",
+            })
+            reset.assert_not_called()
+            self.client.post("/resetdb", data={
+                "csrf_token": "test-csrf-token",
+                "project": "glpi-test",
+                "confirm_resetdb": "yes",
+                "confirm_project": "glpi-test",
+            })
+            reset.assert_called_once_with("glpi-test")
+
     def test_dashboard_dependency_failure_degrades_without_500(self):
         with patch.object(
             module,
@@ -92,7 +124,8 @@ class RouteRobustnessTest(unittest.TestCase):
             response = self.client.get("/")
 
         self.assertEqual(response.status_code, 200)
-        self.assertIn(b"No allowed local GLPI image", response.data)
+        self.assertIn(b"No managed projects yet", response.data)
+        self.assertIn(b"Available images", response.data)
         self.assertNotIn(b"Internal Server Error", response.data)
 
 

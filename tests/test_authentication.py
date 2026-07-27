@@ -213,13 +213,25 @@ class AuthenticationTest(unittest.TestCase):
         response = self.client.post("/logout", data={"csrf_token": "logout-csrf"})
         self.assertEqual(response.status_code, 302)
 
+    def test_login_head_request_is_read_only(self):
+        response = self.client.head("/login")
+        self.assertEqual(response.status_code, 200)
+
+    def test_login_uses_concise_button_label(self):
+        response = self.client.get("/login")
+        self.assertIn(b'<button type="submit">Sign in</button>', response.data)
+        self.assertNotIn(b"Sign in securely", response.data)
+
     def test_route_inventory_has_no_unexpected_public_management_route(self):
-        public = {"login", "healthz", "favicon", "setup"}
+        public = {"login", "healthz", "favicon", "setup", "ui_javascript"}
         management = {rule.endpoint for rule in module.app.url_map.iter_rules()} - {"static"} - public
         expected = {
-            "index", "create", "execute_create", "restore_progress", "ui_preview", "change_port_route",
+            "index", "create", "execute_create", "restore_progress", "change_port_route",
             "change_cookie_route", "set_backup_source_route", "run_backup_now_route", "rebuild_glpi_route",
             "diagnose", "testdb_route", "resetdb_route", "view_log", "logout",
+            "projects_page", "new_project_page", "project_detail_page", "backups_page",
+            "project_compose_page", "activity_page", "settings_page", "test_preview_enter",
+            "test_preview_setup", "test_preview_exit", "status_snapshot",
         }
         self.assertEqual(management, expected)
 

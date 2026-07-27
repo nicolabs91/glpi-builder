@@ -12,14 +12,14 @@ import hmac
 import json
 import threading
 import subprocess
-from datetime import datetime
+from datetime import datetime, timedelta
 from html import escape as html_escape
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
 import docker
 from docker.errors import NotFound, ContainerError
-from flask import Flask, request, redirect, url_for, render_template_string, flash, session, g, jsonify, abort, make_response
+from flask import Flask, request, redirect, url_for, render_template_string, flash, session, g, jsonify, abort, make_response, has_request_context
 
 from auth_security import (
     generate_totp_secret,
@@ -28,16 +28,33 @@ from auth_security import (
     matching_totp_counter,
     verify_password,
 )
+from app_ui import (
+    ACTIVITY,
+    BACKUPS,
+    COMPOSE_VIEW,
+    OVERVIEW,
+    PROJECT_DETAIL,
+    PROJECTS,
+    SETTINGS,
+    WIZARD,
+    page_template,
+)
 
-APP_VERSION = "0.1.2-rc.2"
-UI_PREVIEW_MODE = os.environ.get("UI_PREVIEW_MODE", "0").strip().lower() in {"1", "true", "yes", "on"}
+APP_VERSION = "0.3.0"
+BUILDER_TEST_PREVIEW_MODE = os.environ.get(
+    "BUILDER_TEST_PREVIEW_MODE", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
 APP_PORT = int(os.environ.get("APP_PORT", "8080"))
 BASE_PATH = Path(os.environ.get("BASE_PATH", "/volume1/docker"))
 BACKUP_ROOT = Path(os.environ.get("BACKUP_ROOT", "/volume1/docker/_BACKUPS"))
 BACKUP_TASK_DIR = Path(os.environ.get("BACKUP_TASK_DIR", str(BACKUP_ROOT / "Restore_Scripts" / "GLPI")))
 BACKUP_SCRIPT_SOURCE = Path(__file__).resolve().parent / "backup" / "GLPI_backup.sh"
+BACKUP_DISPATCHER_SOURCE = Path(__file__).resolve().parent / "backup" / "GLPI_backup_dispatcher.sh"
 BACKUP_SCRIPT_PATH = BACKUP_TASK_DIR / "GLPI_backup.sh"
+BACKUP_DISPATCHER_PATH = BACKUP_TASK_DIR / "GLPI_backup_dispatcher.sh"
 BACKUP_ENV_PATH = BACKUP_TASK_DIR / "GLPI_backup.env"
+BACKUP_PROJECTS_DIR = BACKUP_TASK_DIR / "projects"
+BACKUP_STATE_DIR = BACKUP_TASK_DIR / "state"
 BACKUP_CNF_PATH = BACKUP_TASK_DIR / "GLPI_mysql_backup.cnf"
 TZ_DEFAULT = os.environ.get("TZ", "Europe/Brussels")
 MAX_SCAN_ENTRIES = int(os.environ.get("MAX_SCAN_ENTRIES", "500"))
@@ -56,6 +73,7 @@ COOKIE_SECURE_CHOICES = ("Off", "On")
 CREATE_PREVIEW_TTL_SECONDS = 10 * 60
 PROGRESS_JOB_TTL_SECONDS = 6 * 60 * 60
 OPERATION_MODES = ("restore", "fresh")
+BACKUP_STALE_DAYS = 30
 
 PROJECT_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{2,50}$")
 CONTAINER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{1,127}$")
@@ -65,6 +83,70 @@ SAFE_CHARS = string.ascii_letters + string.digits
 DB_EXTENSIONS = (".sql", ".sql.gz", ".dump", ".dump.gz")
 FILE_EXTENSIONS = (".zip", ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tar.xz", ".txz")
 FILE_CHOICE_EXTENSIONS = (".tar.gz",)
+APACHE_REQUEST_LINE_LIMIT = 32768
+GLPI_INTERNAL_PORT = 8080
+UI_JAVASCRIPT = r"""
+(() => {
+  const checked = document.querySelector('[data-last-checked]');
+  const refresh = async () => {
+    try {
+      const response = await fetch('/api/status', {headers: {'Accept': 'application/json'}});
+      if (!response.ok) return;
+      const payload = await response.json();
+      for (const project of payload.projects || []) {
+        for (const element of document.querySelectorAll(`[data-project-status="${CSS.escape(project.name)}"]`)) {
+          element.textContent = `${project.glpi} / ${project.database}`;
+          element.classList.toggle('ready', project.glpi === 'running' && project.database === 'running');
+          element.classList.toggle('warning', project.glpi !== 'running' || project.database !== 'running');
+        }
+      }
+      if (checked) checked.textContent = `Last checked ${payload.checked_at}`;
+    } catch (_) {}
+  };
+  document.querySelectorAll('[data-refresh-status]').forEach((button) => {
+    button.addEventListener('click', refresh);
+  });
+  document.querySelectorAll('[data-dialog-open]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const dialog = document.getElementById(button.dataset.dialogOpen);
+      if (dialog && dialog.showModal) dialog.showModal();
+    });
+  });
+  document.querySelectorAll('[data-dialog-close]').forEach((button) => {
+    button.addEventListener('click', () => button.closest('dialog')?.close());
+  });
+  document.querySelectorAll('[data-schedule-editor]').forEach((editor) => {
+    const frequency = editor.querySelector('[name="schedule_kind"]');
+    const update = () => {
+      const kind = frequency?.value || 'daily';
+      editor.querySelectorAll('[data-for-frequency]').forEach((field) => {
+        field.hidden = !field.dataset.forFrequency.split(' ').includes(kind);
+      });
+    };
+    frequency?.addEventListener('change', update);
+    update();
+  });
+  document.querySelectorAll('[data-copy-command]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      const command = document.getElementById('dispatcher-command')?.textContent.trim();
+      if (!command) return;
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(command);
+        button.textContent = 'Copied';
+      } else {
+        const range = document.createRange();
+        range.selectNodeContents(document.getElementById('dispatcher-command'));
+        const selection = window.getSelection();
+        selection.removeAllRanges();
+        selection.addRange(range);
+        button.textContent = 'Selected';
+      }
+      window.setTimeout(() => { button.textContent = 'Copy command'; }, 1800);
+    });
+  });
+  if (checked) window.setInterval(refresh, 20000);
+})();
+"""
 
 GLPI_WRITABLE_SUBDIRS = [
     "files/_cache",
@@ -113,14 +195,17 @@ chown -R 33:33 /var/glpi /var/www/glpi/plugins /var/log/apache2 /var/run/apache2
 chmod -R 775 /var/glpi /var/www/glpi/plugins &&
 chmod -R 777 /var/log/apache2 /var/run/apache2 /run/apache2 &&
 mkdir -p /etc/apache2/conf-enabled &&
-printf '%s\\n' '# Generated by GLPI Builder' 'LimitRequestLine 32768' > /etc/apache2/conf-enabled/99-glpi-builder-request-limits.conf &&
-sed -i 's/^Listen .*/Listen 8080/' /etc/apache2/ports.conf &&
-sed -i -E 's|<VirtualHost \\*:80>|<VirtualHost *:8080>|g' /etc/apache2/sites-available/*.conf &&
+printf '%s\\n' '# Generated by GLPI Builder' 'LimitRequestLine __REQUEST_LINE_LIMIT__' > /etc/apache2/conf-enabled/99-glpi-builder-request-limits.conf &&
+sed -i 's/^Listen .*/Listen __GLPI_INTERNAL_PORT__/' /etc/apache2/ports.conf &&
+sed -i -E 's|<VirtualHost \\*:80>|<VirtualHost *:__GLPI_INTERNAL_PORT__>|g' /etc/apache2/sites-available/*.conf &&
 sed -i 's|/dev/stdout|/tmp/stdout.log|g' /etc/supervisor/supervisord.conf &&
 sed -i 's|/dev/stderr|/tmp/stderr.log|g' /etc/supervisor/supervisord.conf &&
 touch /tmp/supervisord.log /tmp/stdout.log /tmp/stderr.log &&
 chmod 666 /tmp/supervisord.log /tmp/stdout.log /tmp/stderr.log &&
 exec /opt/glpi/entrypoint.sh /usr/bin/supervisord -c /etc/supervisor/supervisord.conf"""
+GLPI_ENTRY_COMMAND = GLPI_ENTRY_COMMAND.replace(
+    "__REQUEST_LINE_LIMIT__", str(APACHE_REQUEST_LINE_LIMIT)
+).replace("__GLPI_INTERNAL_PORT__", str(GLPI_INTERNAL_PORT))
 
 AUTH_CONFIG_PATH = Path(os.environ.get("BUILDER_CONFIG_PATH", "/config/builder-auth.json"))
 
@@ -500,6 +585,48 @@ def compose_file(project):
     return project_dir(project) / "docker-compose.yml"
 
 
+SENSITIVE_YAML_KEY_RE = re.compile(
+    r"^(\s*(?:-\s*)?[A-Za-z0-9_.-]*"
+    r"(?:password|secret|token|api[_-]?key|private[_-]?key)"
+    r"[A-Za-z0-9_.-]*\s*:\s*)(.*)$",
+    re.IGNORECASE,
+)
+SENSITIVE_YAML_ENV_ASSIGNMENT_RE = re.compile(
+    r"^(\s*-\s*[A-Za-z0-9_.-]*"
+    r"(?:password|secret|token|api[_-]?key|private[_-]?key)"
+    r"[A-Za-z0-9_.-]*\s*=\s*)(.*)$",
+    re.IGNORECASE,
+)
+EMBEDDED_URL_CREDENTIAL_RE = re.compile(
+    r"(?i)([a-z][a-z0-9+.-]*://)[^/@\s:]+:[^/@\s]+@"
+)
+
+
+def sanitized_compose_yaml(value):
+    """Return Compose text suitable for authenticated display or download."""
+    sanitized_lines = []
+    redacted_block_indent = None
+    for line in str(value).splitlines():
+        indentation = len(line) - len(line.lstrip())
+        if redacted_block_indent is not None:
+            if not line.strip() or indentation > redacted_block_indent:
+                continue
+            redacted_block_indent = None
+        match = (
+            SENSITIVE_YAML_KEY_RE.match(line)
+            or SENSITIVE_YAML_ENV_ASSIGNMENT_RE.match(line)
+        )
+        if match:
+            candidate = match.group(2).strip().strip("\"'")
+            if not (candidate.startswith("${") and candidate.endswith("}")):
+                line = match.group(1) + '"[REDACTED]"'
+                if re.fullmatch(r"[|>][+-]?[0-9]*", candidate):
+                    redacted_block_indent = indentation
+        line = EMBEDDED_URL_CREDENTIAL_RE.sub(r"\1[REDACTED]@", line)
+        sanitized_lines.append(line)
+    return "\n".join(sanitized_lines) + ("\n" if str(value).endswith("\n") else "")
+
+
 def log_dir(project):
     return project_dir(project) / "_builder_logs"
 
@@ -837,8 +964,150 @@ def compose_project_for_container(container):
 
 
 def current_backup_source_project():
-    value = read_simple_env_file(BACKUP_ENV_PATH).get("PROJECT_NAME", "")
-    return value if PROJECT_RE.fullmatch(value) else ""
+    projects = scheduled_backup_projects()
+    return projects[0] if projects else ""
+
+
+def backup_schedule_path(project):
+    return BACKUP_PROJECTS_DIR / f"{validate_project(project)}.env"
+
+
+def backup_state_path(project):
+    return BACKUP_STATE_DIR / f"{validate_project(project)}.env"
+
+
+def safe_int(value, default=0, minimum=None, maximum=None):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    if minimum is not None and parsed < minimum:
+        return default
+    if maximum is not None and parsed > maximum:
+        return default
+    return parsed
+
+
+def migrate_legacy_backup_config():
+    legacy = read_simple_env_file(BACKUP_ENV_PATH)
+    project = legacy.get("PROJECT_NAME", "")
+    if not PROJECT_RE.fullmatch(project):
+        return ""
+    target = backup_schedule_path(project)
+    if not target.is_file():
+        values = dict(legacy)
+        values.update({
+            "SCHEDULE_ENABLED": "yes",
+            "SCHEDULE_KIND": "daily",
+            "SCHEDULE_TIME": "02:00",
+            "SCHEDULE_WEEKDAYS": "7",
+            "INTERVAL_HOURS": "24",
+            "RETENTION_DAYS": values.get("RETENTION_DAYS", "60"),
+        })
+        text = "# Migrated and maintained by GLPI Builder.\n" + "".join(
+            f"{key}={value}\n" for key, value in values.items()
+            if re.fullmatch(r"[A-Z0-9_]+", key)
+            and re.fullmatch(r"[A-Za-z0-9_./,:-]+", str(value))
+        )
+        atomic_write_text(target, text, 0o600)
+    return project
+
+
+def scheduled_backup_projects():
+    migrate_legacy_backup_config()
+    names = []
+    if BACKUP_PROJECTS_DIR.is_dir():
+        for path in sorted(BACKUP_PROJECTS_DIR.glob("*.env")):
+            data = read_simple_env_file(path)
+            name = data.get("PROJECT_NAME", "")
+            if PROJECT_RE.fullmatch(name) and data.get("SCHEDULE_ENABLED", "yes") == "yes":
+                names.append(name)
+    if not names:
+        legacy = read_simple_env_file(BACKUP_ENV_PATH).get("PROJECT_NAME", "")
+        if PROJECT_RE.fullmatch(legacy):
+            names.append(legacy)
+    return names
+
+
+def validate_backup_schedule(kind="daily", schedule_time="02:00", weekdays="7", interval_hours="24", retention_days="60"):
+    kind = str(kind or "daily").strip().lower()
+    if kind not in {"daily", "weekly", "interval"}:
+        raise ValueError("Backup frequency must be daily, weekly or interval.")
+    schedule_time = str(schedule_time or "02:00").strip()
+    if not re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", schedule_time):
+        raise ValueError("Backup start time must use HH:MM in 24-hour format.")
+    weekday_values = sorted(set(filter(None, re.split(r"[, ]+", str(weekdays or "7")))))
+    if any(value not in {"1", "2", "3", "4", "5", "6", "7"} for value in weekday_values):
+        raise ValueError("Backup weekdays must be numbers 1 through 7.")
+    interval = int(interval_hours)
+    retention = int(retention_days)
+    if interval not in {6, 12, 24, 48, 72, 168}:
+        raise ValueError("Backup interval must be 6, 12, 24, 48, 72 or 168 hours.")
+    if retention < 1 or retention > 3650:
+        raise ValueError("Backup retention must be between 1 and 3650 days.")
+    return {
+        "kind": kind,
+        "time": schedule_time,
+        "weekdays": ",".join(weekday_values) or "7",
+        "interval_hours": str(interval),
+        "retention_days": str(retention),
+    }
+
+
+def backup_schedule_status(project):
+    project = validate_project(project)
+    config = read_simple_env_file(backup_schedule_path(project))
+    if not config and read_simple_env_file(BACKUP_ENV_PATH).get("PROJECT_NAME") == project:
+        config = read_simple_env_file(BACKUP_ENV_PATH)
+        config.update({"SCHEDULE_ENABLED": "yes", "SCHEDULE_KIND": "daily", "SCHEDULE_TIME": "02:00", "SCHEDULE_WEEKDAYS": "7", "INTERVAL_HOURS": "24"})
+    state = read_simple_env_file(backup_state_path(project))
+    enabled = config.get("SCHEDULE_ENABLED") == "yes"
+    try:
+        schedule = validate_backup_schedule(
+            config.get("SCHEDULE_KIND", "daily"),
+            config.get("SCHEDULE_TIME", "02:00"),
+            config.get("SCHEDULE_WEEKDAYS", "7"),
+            config.get("INTERVAL_HOURS", "24"),
+            config.get("RETENTION_DAYS", "60"),
+        )
+    except (TypeError, ValueError):
+        schedule = validate_backup_schedule()
+    kind = schedule["kind"]
+    schedule_time = schedule["time"]
+    weekdays = schedule["weekdays"]
+    interval_hours = safe_int(schedule["interval_hours"], 24, 1)
+    now = datetime.now()
+    next_run = None
+    if enabled:
+        hour, minute = (int(part) for part in schedule_time.split(":"))
+        if kind == "daily":
+            candidate = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            next_run = candidate if candidate > now else candidate + timedelta(days=1)
+        elif kind == "weekly":
+            allowed = {int(value) for value in weekdays.split(",") if value.isdigit()}
+            for offset in range(8):
+                candidate = (now + timedelta(days=offset)).replace(hour=hour, minute=minute, second=0, microsecond=0)
+                if candidate > now and candidate.isoweekday() in allowed:
+                    next_run = candidate
+                    break
+        else:
+            last = safe_int(state.get("LAST_ATTEMPT"), 0, 0)
+            next_run = datetime.fromtimestamp(last) + timedelta(hours=interval_hours) if last else now
+    heartbeat = read_simple_env_file(BACKUP_STATE_DIR / "dispatcher.env")
+    heartbeat_epoch = safe_int(heartbeat.get("LAST_HEARTBEAT"), 0, 0)
+    return {
+        "enabled": enabled,
+        "kind": kind,
+        "time": schedule_time,
+        "weekdays": weekdays,
+        "interval_hours": interval_hours,
+        "retention_days": safe_int(schedule["retention_days"], 60, 1, 3650),
+        "next_run": next_run.strftime("%Y-%m-%d %H:%M") if next_run else "",
+        "last_status": state.get("LAST_STATUS", "Not run"),
+        "last_attempt": datetime.fromtimestamp(int(state["LAST_ATTEMPT"])).strftime("%Y-%m-%d %H:%M") if state.get("LAST_ATTEMPT", "").isdigit() else "",
+        "last_success": datetime.fromtimestamp(int(state["LAST_SUCCESS"])).strftime("%Y-%m-%d %H:%M") if state.get("LAST_SUCCESS", "").isdigit() else "",
+        "dispatcher_healthy": bool(heartbeat_epoch and time.time() - heartbeat_epoch < 1200),
+    }
 
 
 def database_container_for_project(project):
@@ -915,8 +1184,9 @@ def atomic_write_text(path, text, mode):
             temporary_path.unlink()
 
 
-def configure_scheduled_backup(project, env=None):
+def configure_scheduled_backup(project, env=None, *, enabled=True, kind="daily", schedule_time="02:00", weekdays="7", interval_hours="24", retention_days="60"):
     project = validate_project(project)
+    migrate_legacy_backup_config()
     env = dict(env or read_env(project))
     if not env:
         raise ValueError(f"No .env file was found for {project}.")
@@ -931,6 +1201,8 @@ def configure_scheduled_backup(project, env=None):
         raise ValueError(f"Backup task folder must be located below {BACKUP_ROOT}.")
     if not BACKUP_SCRIPT_SOURCE.is_file():
         raise ValueError(f"Bundled backup script is missing: {BACKUP_SCRIPT_SOURCE}")
+    if not BACKUP_DISPATCHER_SOURCE.is_file():
+        raise ValueError(f"Bundled backup dispatcher is missing: {BACKUP_DISPATCHER_SOURCE}")
 
     BACKUP_TASK_DIR.mkdir(parents=True, exist_ok=True)
     if BACKUP_SCRIPT_PATH.exists():
@@ -943,10 +1215,10 @@ def configure_scheduled_backup(project, env=None):
     script_text = BACKUP_SCRIPT_SOURCE.read_text(encoding="utf-8")
     atomic_write_text(BACKUP_SCRIPT_PATH, script_text, 0o750)
 
-    previous = read_simple_env_file(BACKUP_ENV_PATH)
-    retention = previous.get("RETENTION_DAYS", "60")
-    if not retention.isdigit():
-        retention = "60"
+    schedule = validate_backup_schedule(kind, schedule_time, weekdays, interval_hours, retention_days)
+    previous = read_simple_env_file(backup_schedule_path(project))
+    if not previous:
+        previous = read_simple_env_file(BACKUP_ENV_PATH)
     mysql_cnf = previous.get("MYSQL_CNF") or str(BACKUP_CNF_PATH)
     container_cnf = previous.get("CONTAINER_CNF") or "/tmp/GLPI_mysql_backup.cnf"
     values = {
@@ -957,19 +1229,34 @@ def configure_scheduled_backup(project, env=None):
         "BACKUP_ROOT": str(BACKUP_ROOT),
         "MYSQL_CNF": mysql_cnf,
         "CONTAINER_CNF": container_cnf,
-        "RETENTION_DAYS": retention,
+        "RETENTION_DAYS": schedule["retention_days"],
+        "SCHEDULE_ENABLED": "yes" if enabled else "no",
+        "SCHEDULE_KIND": schedule["kind"],
+        "SCHEDULE_TIME": schedule["time"],
+        "SCHEDULE_WEEKDAYS": schedule["weekdays"],
+        "INTERVAL_HOURS": schedule["interval_hours"],
     }
-    if any(not re.fullmatch(r"[A-Za-z0-9_./-]+", value) for value in values.values()):
+    if any(
+        not re.fullmatch(r"[A-Za-z0-9_./,:-]+", value)
+        for value in values.values()
+    ):
         raise ValueError("Backup configuration contains unsupported characters.")
     config_text = "# Generated and maintained by GLPI Builder.\n" + "".join(
         f"{key}={value}\n" for key, value in values.items()
     )
-    atomic_write_text(BACKUP_ENV_PATH, config_text, 0o600)
+    BACKUP_PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+    BACKUP_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(backup_schedule_path(project), config_text, 0o600)
+    atomic_write_text(BACKUP_DISPATCHER_PATH, BACKUP_DISPATCHER_SOURCE.read_text(encoding="utf-8"), 0o750)
 
     messages = [
-        f"Scheduled backup source: {project}",
-        f"Backup environment: {BACKUP_ENV_PATH}",
-        f"Task Scheduler command: /bin/bash {BACKUP_SCRIPT_PATH}",
+        f"Backup configuration: {project}",
+        (
+            f"Backup schedule: {schedule['kind']} at {schedule['time']}"
+            if enabled else "Scheduled backups disabled; Run backup now remains available."
+        ),
+        f"Backup environment: {backup_schedule_path(project)}",
+        f"Task Scheduler command: /bin/bash {BACKUP_DISPATCHER_PATH}",
     ]
     if not Path(mysql_cnf).is_file():
         messages.append(f"Warning: MariaDB credential file is not present yet: {mysql_cnf}")
@@ -991,8 +1278,13 @@ def latest_successful_backup(project):
     if not BACKUP_ROOT.is_dir():
         return None
     candidates = []
+    search_roots = [BACKUP_ROOT / project, BACKUP_ROOT]
     try:
-        for index, folder in enumerate(BACKUP_ROOT.iterdir()):
+        folders = []
+        for root in search_roots:
+            if root.is_dir():
+                folders.extend(root.iterdir())
+        for index, folder in enumerate(folders):
             if index >= MAX_SCAN_ENTRIES:
                 break
             if folder.is_symlink() or not folder.is_dir() or not folder.name.startswith("GLPI_Backup_"):
@@ -1025,22 +1317,26 @@ def latest_successful_backup(project):
 
 def scheduled_backup_status(project):
     project = validate_project(project)
-    selected = current_backup_source_project() == project
+    schedule = backup_schedule_status(project)
+    selected = schedule["enabled"]
+    configured = read_simple_env_file(backup_schedule_path(project))
+    if not configured and read_simple_env_file(BACKUP_ENV_PATH).get("PROJECT_NAME") == project:
+        configured = read_simple_env_file(BACKUP_ENV_PATH)
     status = {
         "selected": selected,
         "ready": False,
         "issues": [],
-        "latest": latest_successful_backup(project) if selected else None,
+        "latest": latest_successful_backup(project),
+        "schedule": schedule,
     }
-    if not selected:
+    if not configured:
         return status
 
-    configured = read_simple_env_file(BACKUP_ENV_PATH)
     if configured.get("PROJECT_NAME") != project:
         status["issues"].append("Backup environment does not point to this project.")
     if not BACKUP_SCRIPT_PATH.is_file():
         status["issues"].append("Managed backup script is missing.")
-    if not BACKUP_ENV_PATH.is_file():
+    if not backup_schedule_path(project).is_file() and not BACKUP_ENV_PATH.is_file():
         status["issues"].append("Backup environment file is missing.")
     mysql_cnf = Path(configured.get("MYSQL_CNF") or BACKUP_CNF_PATH)
     if not mysql_cnf.is_file():
@@ -1064,6 +1360,141 @@ def scheduled_backup_status(project):
 
     status["ready"] = not status["issues"]
     return status
+
+
+def backup_age(created_at):
+    """Return backup age metadata without trusting locale-specific parsing."""
+    if not created_at:
+        return {"days": None, "label": "Unknown age", "stale": True}
+    parsed = None
+    for pattern in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            parsed = datetime.strptime(str(created_at), pattern)
+            break
+        except ValueError:
+            continue
+    if parsed is None:
+        return {"days": None, "label": "Unknown age", "stale": True}
+    days = max(0, int((datetime.now() - parsed).total_seconds() // 86400))
+    return {
+        "days": days,
+        "label": "Today" if days == 0 else f"{days} day{'s' if days != 1 else ''} old",
+        "stale": days > BACKUP_STALE_DAYS,
+    }
+
+
+def backup_inventory(db_backups, file_backups, *, demo=False):
+    """Describe restore sources and conservatively pair matching database/files."""
+    rows = []
+    for kind, choices in (("Database", db_backups), ("GLPI files", file_backups)):
+        for value, label in choices:
+            path = Path(value)
+            size_bytes = 0
+            modified = ""
+            if demo:
+                size_bytes = 184 * 1024 * 1024 if kind == "Database" else 612 * 1024 * 1024
+                modified = "2026-07-27 19:45"
+            else:
+                try:
+                    stat_result = path.stat()
+                    size_bytes = stat_result.st_size if path.is_file() else 0
+                    modified = datetime.fromtimestamp(stat_result.st_mtime).strftime("%Y-%m-%d %H:%M")
+                except OSError:
+                    pass
+            name = path.name.lower()
+            pair_key = re.sub(
+                r"(?:[-_.]?(?:database|db|sql|files?|glpi-files?))?(?:\.(?:sql|dump|tar|gz|tgz|zip|bz2|xz))+$",
+                "",
+                name,
+            ).strip("-_.") or path.parent.name.lower()
+            rows.append({
+                "kind": kind,
+                "value": value,
+                "label": label,
+                "size_label": format_size(size_bytes) if size_bytes else "Directory / unknown",
+                "modified": modified or "Unknown",
+                "pair_key": pair_key,
+            })
+    counts = {}
+    for row in rows:
+        counts.setdefault(row["pair_key"], set()).add(row["kind"])
+    for row in rows:
+        row["complete_pair"] = len(counts.get(row["pair_key"], ())) == 2
+    return rows
+
+
+def newest_local_image(current, available):
+    repository, separator, current_tag = str(current or "").rpartition(":")
+    if not separator or not repository:
+        return ""
+
+    def version_key(tag):
+        parts = re.findall(r"[0-9]+", tag)
+        return tuple(int(part) for part in parts) if parts else ()
+
+    current_key = version_key(current_tag)
+    candidates = []
+    for image in available:
+        candidate_repo, candidate_separator, candidate_tag = str(image).rpartition(":")
+        if candidate_separator and candidate_repo == repository:
+            candidate_key = version_key(candidate_tag)
+            if candidate_key and candidate_key > current_key:
+                candidates.append((candidate_key, image))
+    return max(candidates, default=((), ""))[1]
+
+
+def last_action_timestamp(project, action_fragment):
+    for filename in list_logs(project, limit=80):
+        if action_fragment not in filename:
+            continue
+        try:
+            stamp = datetime.strptime(filename[:15], "%Y%m%d-%H%M%S")
+            return stamp.strftime("%Y-%m-%d %H:%M")
+        except ValueError:
+            continue
+    return ""
+
+
+def enrich_project_operational_metadata(project, available_images):
+    project = dict(project)
+    backup_status = dict(project.get("backup_status") or {})
+    if "schedule" not in backup_status:
+        backup_status["schedule"] = (
+            backup_schedule_status(project["name"])
+            if not project.get("simulated")
+            else {
+                "enabled": False, "kind": "daily", "time": "02:00",
+                "weekdays": "7", "interval_hours": 24,
+                "retention_days": 60, "next_run": "",
+                "last_status": "Not run", "last_attempt": "",
+                "last_success": "", "dispatcher_healthy": False,
+            }
+        )
+    project["backup_status"] = backup_status
+    latest = project.get("backup_status", {}).get("latest")
+    project["backup_age"] = backup_age(latest.get("created_at") if latest else "")
+    project["newer_glpi_image"] = newest_local_image(
+        project.get("glpi_image"), available_images
+    )
+    project["newer_db_image"] = newest_local_image(
+        project.get("mariadb_image"), available_images
+    )
+    drift = []
+    if project.get("tz") and project["tz"] != TZ_DEFAULT:
+        drift.append(f"Time zone differs from the Builder default ({TZ_DEFAULT}).")
+    if project.get("cookie_samesite") != DEFAULT_SESSION_COOKIE_SAMESITE:
+        drift.append("Cookie SameSite differs from the current Builder default.")
+    if project.get("cookie_secure") != DEFAULT_SESSION_COOKIE_SECURE:
+        drift.append("Cookie Secure differs from the current Builder default.")
+    if not project.get("simulated"):
+        drift.extend(managed_project_issues(project["name"])[:4])
+    project["configuration_drift"] = drift
+    project["contract_status"] = "Review" if drift else "Current"
+    project["last_rebuild"] = (
+        "2026-07-27 20:01" if project.get("simulated")
+        else last_action_timestamp(project["name"], "rebuild")
+    )
+    return project
 
 
 def build_env(project, glpi_image, mariadb_image, host_port, container_port, tz, clean_db, cookie_samesite=None, cookie_secure=None):
@@ -1443,7 +1874,14 @@ def get_csrf_token():
 
 @app.context_processor
 def inject_csrf_token():
-    return {"csrf_token": get_csrf_token(), "app_version": APP_VERSION}
+    return {
+        "csrf_token": get_csrf_token(),
+        "app_version": APP_VERSION,
+        "test_preview_active": (
+            BUILDER_TEST_PREVIEW_MODE
+            and bool(session.get("test_preview_active"))
+        ),
+    }
 
 
 def require_csrf():
@@ -1713,7 +2151,7 @@ def execute_scheduled_backup(project, on_line=None):
         raise ValueError(details)
 
     environment = dict(os.environ)
-    environment["GLPI_BACKUP_ENV"] = str(BACKUP_ENV_PATH)
+    environment["GLPI_BACKUP_ENV"] = str(backup_schedule_path(project))
     process = subprocess.Popen(
         ["/bin/bash", str(BACKUP_SCRIPT_PATH)],
         stdout=subprocess.PIPE,
@@ -1932,7 +2370,29 @@ def flash_error(message, project=None, action="error"):
             suffix = "<br>Error log: " + f"<a href=\"{url_for('view_log', project=project, filename=log_name)}\">{esc(log_name)}</a>"
         except Exception:
             suffix = ""
-    flash(text_to_html(message) + suffix, "err")
+    lower = str(message).lower()
+    if "port" in lower:
+        cause = "The requested port is unavailable or outside the allowed range."
+        next_step = "Choose another unused TCP port and review the project again."
+    elif "backup" in lower or "archive" in lower:
+        cause = "A restore source is missing, incomplete or outside the configured backup root."
+        next_step = "Open Backups, verify the database/files pair, then retry."
+    elif "image" in lower:
+        cause = "The selected container image is not locally available or not allowed."
+        next_step = "Load an allowed image on the Synology and select it again."
+    elif "database" in lower or "mariadb" in lower:
+        cause = "The database container or credentials did not pass validation."
+        next_step = "Run database diagnostics and review the linked action log."
+    else:
+        cause = "A safety or runtime check prevented the requested action."
+        next_step = "Review the details below and retry only after correcting the cause."
+    html = (
+        '<div class="error-summary"><strong>Action could not be completed</strong>'
+        f"<span>{esc(cause)}</span><span><b>Next step:</b> {esc(next_step)}</span>"
+        f"<details><summary>Technical details</summary>{text_to_html(message)}</details>"
+        f"{suffix}</div>"
+    )
+    flash(html, "err")
 
 
 def reset_db_user(project):
@@ -2883,7 +3343,7 @@ def discover_projects(containers=None):
     except Exception:
         pass
 
-    backup_source = current_backup_source_project()
+    backup_sources = set(scheduled_backup_projects())
     projects = []
     for name in sorted(names):
         env = read_env(name)
@@ -2902,11 +3362,12 @@ def discover_projects(containers=None):
         env_port = env.get("GLPI_HTTP_PORT", "")
         shown_port = str(active_ports[0]) if active_ports else env_port
         mappings = [mapping["mapping"] for mapping in snapshot_mappings]
-        backup_state = scheduled_backup_status(name) if name == backup_source else {
+        backup_state = scheduled_backup_status(name) if name in backup_sources else {
             "selected": False,
             "ready": False,
             "issues": [],
             "latest": None,
+            "schedule": backup_schedule_status(name),
         }
         projects.append({
             "name": name,
@@ -2923,7 +3384,7 @@ def discover_projects(containers=None):
             "mappings": ", ".join(mappings) if mappings else "-",
             "latest_log": latest_log(name),
             "logs": list_logs(name, limit=5),
-            "backup_source": name == backup_source,
+            "backup_source": name in backup_sources,
             "backup_status": backup_state,
         })
     return projects
@@ -2984,317 +3445,14 @@ def discover_unmanaged_glpi_projects(containers=None, managed_projects=None):
     return detected
 
 
-HTML = """
-<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>GLPI Builder {{ app_version }}</title>
-<style>
-body { font-family: system-ui, -apple-system, Segoe UI, sans-serif; max-width: 1240px; margin: 32px auto; padding: 0 16px; background: #f7f7f7; color: #222; }
-.card { background: white; border: 1px solid #ddd; border-radius: 10px; padding: 18px 20px; margin-bottom: 18px; box-shadow: 0 1px 3px rgba(0,0,0,.05); }
-label { display: block; font-weight: 600; margin-top: 12px; }
-input[type=text], input[type=number], select { width: 100%; max-width: 860px; padding: 9px; border: 1px solid #bbb; border-radius: 6px; font-size: 14px; }
-input[type=checkbox] { margin-right: 7px; }
-button { padding: 10px 14px; border: 0; border-radius: 7px; background: #1f6feb; color: white; font-weight: 700; cursor: pointer; margin-top: 14px; }
-button.secondary { background: #555; }
-button.danger { background: #c62828; }
-button.small { padding: 7px 10px; font-size: 13px; margin-top: 8px; }
-code, pre { background: #f0f0f0; border-radius: 6px; }
-pre { padding: 12px; overflow: auto; white-space: pre-wrap; }
-.msg { padding: 10px 12px; border-radius: 7px; background: #eef6ff; border: 1px solid #b9dafc; margin: 8px 0; }
-.warn { background: #fff7e6; border-color: #f0c36d; }
-.err { background: #ffebee; border-color: #ef9a9a; }
-.ok { background: #e8f5e9; border-color: #a5d6a7; }
-small { color: #555; }
-table { width: 100%; border-collapse: collapse; margin-top: 10px; }
-th, td { text-align: left; border-bottom: 1px solid #ddd; padding: 9px; vertical-align: top; }
-th { background: #f4f4f4; }
-.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
-.project-actions { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; margin-top: 10px; }
-details { margin-top: 10px; }
-hr { border: 0; border-top: 1px solid #ddd; margin: 18px 0; }
-.footer-note { color: #666; font-size: 13px; }
-</style>
-</head>
-<body>
-<h1>GLPI Builder {{ app_version }}</h1>
-
-{% with messages = get_flashed_messages(with_categories=true) %}
-{% if messages %}
-<div class="card">
-{% for category, message in messages %}
-<div class="msg {{ category }}">{{ message|safe }}</div>
-{% endfor %}
-</div>
-{% endif %}
-{% endwith %}
-
-<div class="card">
-<h2>Existing projects</h2>
-{% if projects %}
-<table>
-<thead>
-<tr>
-<th>Project</th>
-<th>Port</th>
-<th>Status</th>
-<th>Images</th>
-<th>Logs</th>
-</tr>
-</thead>
-<tbody>
-{% for p in projects %}
-<tr>
-<td><strong>{{ p.name }}</strong><br><small>{{ p.path }}</small></td>
-<td>
-Env: <code>{{ p.env_port or '-' }}</code><br>
-Active: <code>{{ p.active_port or '-' }}</code><br>
-<small>{{ p.mappings }}</small>
-</td>
-<td>
-GLPI: <code>{{ p.glpi_status }}</code><br>
-DB: <code>{{ p.db_status }}</code><br>
-Cookie SameSite: <code>{{ p.cookie_samesite }}</code><br>
-Cookie Secure: <code>{{ p.cookie_secure }}</code>
-</td>
-<td>
-<small>GLPI: {{ p.glpi_image or '-' }}<br>MariaDB: {{ p.mariadb_image or '-' }}</small>
-</td>
-<td>
-{% if p.logs %}
-{% for log in p.logs %}
-<a href="{{ url_for('view_log', project=p.name, filename=log) }}">{{ log }}</a><br>
-{% endfor %}
-{% else %}
-<small>No logs</small>
-{% endif %}
-</td>
-</tr>
-<tr>
-<td colspan="5">
-<details>
-<summary>Manage {{ p.name }}</summary>
-<div class="project-actions">
-<form method="post" action="{{ url_for('change_port_route') }}" onsubmit="return confirm('Recreate the GLPI container with the new port? Database and files remain unchanged.');">
-<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-<input type="hidden" name="project" value="{{ p.name }}">
-<label>New host port</label>
-<input type="number" name="host_port" value="{{ p.active_port or p.env_port }}">
-<button class="small" type="submit">Apply port and recreate GLPI container</button>
-</form>
-
-<form method="post" action="{{ url_for('rebuild_glpi_route') }}" onsubmit="return confirm('Recreate only the GLPI container using the existing .env?');">
-<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-<input type="hidden" name="project" value="{{ p.name }}">
-<button class="secondary small" type="submit">Recreate GLPI container</button>
-</form>
-
-<form method="post" action="{{ url_for('change_cookie_route') }}" onsubmit="return confirm('Apply cookie settings and recreate only the GLPI container? Database and files remain unchanged.');">
-<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-<input type="hidden" name="project" value="{{ p.name }}">
-<label>Cookie SameSite</label>
-<select name="cookie_samesite">
-<option value="Lax" {% if p.cookie_samesite == 'Lax' %}selected{% endif %}>Lax - recommended for SSO</option>
-<option value="Strict" {% if p.cookie_samesite == 'Strict' %}selected{% endif %}>Strict - more restrictive, may break SSO</option>
-<option value="None" {% if p.cookie_samesite == 'None' %}selected{% endif %}>None - only for a special HTTPS/proxy flow</option>
-</select>
-<label>Cookie Secure</label>
-<select name="cookie_secure">
-<option value="Off" {% if p.cookie_secure == 'Off' %}selected{% endif %}>Off - suitable for internal HTTP access</option>
-<option value="On" {% if p.cookie_secure == 'On' %}selected{% endif %}>On - use only when GLPI is accessed through HTTPS</option>
-</select>
-<small>Lax is the safe default for normal SSO redirects. Use Secure=On only when GLPI is opened through HTTPS.</small>
-<button class="small" type="submit">Apply cookie settings</button>
-</form>
-
-<form method="post" action="{{ url_for('diagnose') }}">
-<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-<input type="hidden" name="project" value="{{ p.name }}">
-<button class="secondary small" type="submit">Show diagnostics</button>
-</form>
-
-<form method="post" action="{{ url_for('testdb_route') }}">
-<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-<input type="hidden" name="project" value="{{ p.name }}">
-<button class="secondary small" type="submit">Test database login</button>
-</form>
-
-<form method="post" action="{{ url_for('resetdb_route') }}" onsubmit="return confirm('Set the database user password to the value in .env?');">
-<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-<input type="hidden" name="project" value="{{ p.name }}">
-<label><input type="checkbox" name="confirm_resetdb" value="yes"> Confirm database user reset</label>
-<button class="danger small" type="submit">Restore database user password</button>
-</form>
-</div>
-</details>
-</td>
-</tr>
-{% endfor %}
-</tbody>
-</table>
-{% else %}
-<p>No existing projects with a <code>.env</code> were found below <code>{{ base_path }}</code>.</p>
-{% endif %}
-</div>
-
-<div class="card">
-<h2>Scan backup directory</h2>
-<form method="get" action="{{ url_for('index') }}">
-<label>Backup directory</label>
-<input type="text" name="backup_root" value="{{ backup_root }}">
-<button class="secondary" type="submit">Scan backup directory</button>
-</form>
-<p><small>Database backups found: {{ db_backups|length }} | GLPI files backups found: {{ file_backups|length }}</small></p>
-</div>
-
-<div class="card">
-<h2>Create a new project or perform a full restore</h2>
-<form method="post" action="{{ url_for('create') }}">
-<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-<input type="hidden" name="backup_root" value="{{ backup_root }}">
-
-<label>Project name</label>
-<input type="text" name="project" value="glpitestnew20">
-
-<label>GLPI image</label>
-<input type="text" name="glpi_image" value="glpi/glpi:11.0.8">
-
-<label>MariaDB image</label>
-<input type="text" name="mariadb_image" value="mariadb:12.2.2">
-
-<label>GLPI host port</label>
-<input type="number" name="host_port" value="8775">
-<input type="hidden" name="container_port" value="8080">
-<small>Only the host port changes. Internally, GLPI remains on port 8080 according to the proven structure.</small>
-
-<label>Time zone</label>
-<input type="text" name="tz" value="{{ tz_default }}">
-
-<label>Cookie SameSite for GLPI/SSO</label>
-<select name="cookie_samesite">
-<option value="Lax" selected>Lax - recommended for SSO</option>
-<option value="Strict">Strict - more restrictive, may break SSO</option>
-<option value="None">None - only for a special HTTPS/proxy flow</option>
-</select>
-<label>Cookie Secure</label>
-<select name="cookie_secure">
-<option value="Off" selected>Off - suitable for internal HTTP access</option>
-<option value="On">On - use only when GLPI is accessed through HTTPS</option>
-</select>
-<small>These PHP settings are reapplied after a restore. Lax is the normal SSO default. Enable Secure only for HTTPS-only access.</small>
-
-<p>
-<label><input type="checkbox" name="force_recreate" checked> Recreate GLPI container</label>
-<label><input type="checkbox" name="clean_db"> Remove database container/directory and start clean</label>
-<label><input type="checkbox" name="restore_everything" checked> Restore everything: database and GLPI files</label>
-</p>
-
-<div class="msg warn">
-<strong>Confirmation for existing projects</strong><br>
-When using an existing project name or starting clean, confirm below to prevent accidental overwrites or deletion.
-<label><input type="checkbox" name="confirm_destructive" value="yes"> I understand that existing data or containers may be changed or removed.</label>
-<label>Enter the project name to confirm when using an existing project</label>
-<input type="text" name="confirm_project" placeholder="for example glpitestnew20">
-</div>
-
-<h3>1. Database backup</h3>
-<label>Select database backup</label>
-<select name="db_backup_select">
-<option value="">-- select database backup --</option>
-{% for value, label in db_backups %}
-<option value="{{ value }}">{{ label }}</option>
-{% endfor %}
-</select>
-
-<label>Or enter a database backup path manually</label>
-<input type="text" name="db_backup_manual" placeholder="/volume1/docker/_BACKUPS/backup.sql.gz">
-
-<h3>2. GLPI files/config/plugins backup</h3>
-<label>Select GLPI files backup</label>
-<select name="file_backup_select">
-<option value="">-- select zip/tar backup --</option>
-{% for value, label in file_backups %}
-<option value="{{ value }}">{{ label }}</option>
-{% endfor %}
-</select>
-
-<label>Or enter a directory/archive path manually</label>
-<input type="text" name="file_backup_manual" placeholder="/volume1/docker/_BACKUPS/GLPI_FILES_BACKUP.zip or /volume1/docker/_BACKUPS/glpi_files_folder">
-
-<button type="submit">Rebuild and restore completely</button>
-</form>
-</div>
-
-<div class="card">
-<h2>Manage an existing project manually</h2>
-<p><small>Use this when a project is absent from the list but has a valid <code>.env</code>.</small></p>
-<div class="project-actions">
-<form method="post" action="{{ url_for('change_port_route') }}" onsubmit="return confirm('Recreate the GLPI container with the new port? Database and files remain unchanged.');">
-<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-<label>Project name</label>
-<input type="text" name="project" value="glpitestnew20">
-<label>New GLPI host port</label>
-<input type="number" name="host_port" value="8775">
-<button type="submit">Apply port and recreate GLPI container</button>
-</form>
-
-<form method="post" action="{{ url_for('change_cookie_route') }}" onsubmit="return confirm('Apply cookie settings and recreate only the GLPI container?');">
-<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-<label>Project name</label>
-<input type="text" name="project" value="glpitestnew20">
-<label>Cookie SameSite</label>
-<select name="cookie_samesite">
-<option value="Lax" selected>Lax - recommended for SSO</option>
-<option value="Strict">Strict - more restrictive, may break SSO</option>
-<option value="None">None - only for a special HTTPS/proxy flow</option>
-</select>
-<label>Cookie Secure</label>
-<select name="cookie_secure">
-<option value="Off" selected>Off - suitable for internal HTTP access</option>
-<option value="On">On - use only when GLPI is accessed through HTTPS</option>
-</select>
-<button type="submit">Apply cookie settings</button>
-</form>
-
-<form method="post" action="{{ url_for('diagnose') }}">
-<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-<label>Project name</label>
-<input type="text" name="project" value="glpitestnew20">
-<button class="secondary" type="submit">Show environment and containers</button>
-</form>
-
-<form method="post" action="{{ url_for('testdb_route') }}">
-<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-<label>Project name</label>
-<input type="text" name="project" value="glpitestnew20">
-<button class="secondary" type="submit">Test database login as glpiuser</button>
-</form>
-
-<form method="post" action="{{ url_for('resetdb_route') }}" onsubmit="return confirm('Set the database user password to the value in .env?');">
-<input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-<label>Project name</label>
-<input type="text" name="project" value="glpitestnew20">
-<label><input type="checkbox" name="confirm_resetdb" value="yes"> Confirm database user reset</label>
-<button class="danger" type="submit">Set database user password from .env</button>
-</form>
-</div>
-</div>
-
-<p class="footer-note">Builder container: authenticated administration only. Stop it when it is not needed.</p>
-</body>
-</html>
-"""
-
-
 CREATE_PREVIEW_HTML = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Execution plan · GLPI Builder</title>
 <style>
-:root{--bg:#f3f6f9;--card:#fff;--line:#d8e0e8;--ink:#17212b;--muted:#667483;--brand:#16704a;--danger:#b42318}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px system-ui,-apple-system,"Segoe UI",sans-serif}
-header{background:#102a43;color:#fff;padding:20px}header div,main{max-width:900px;margin:auto}main{padding:28px 18px 50px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:20px;box-shadow:0 1px 2px #102a4310;margin-bottom:18px}
+:root{--bg:#f4f7fb;--card:#fff;--line:#dce4ee;--ink:#172033;--muted:#64748b;--brand:#2364d2;--danger:#b42318}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 10% 0,#eaf1ff 0,transparent 30%),var(--bg);color:var(--ink);font:15px system-ui,-apple-system,"Segoe UI",sans-serif}
+header{background:#fff;color:#12233f;padding:18px;border-bottom:1px solid var(--line)}header div,main{max-width:960px;margin:auto}main{padding:30px 18px 50px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:22px;box-shadow:0 10px 32px #16345f0c;margin-bottom:18px}
 h1,h2{margin-top:0}.risk{border-left:5px solid var(--brand);padding:12px 14px;background:#edf8f3;border-radius:8px}.risk.danger{border-color:var(--danger);background:#fff0ef}
 dl{display:grid;grid-template-columns:minmax(170px,240px) 1fr;gap:0;border-top:1px solid var(--line)}dt,dd{margin:0;padding:10px 0;border-bottom:1px solid var(--line)}dt{font-weight:700;padding-right:15px}dd{overflow-wrap:anywhere}
 .actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center}button,.button{border:0;border-radius:8px;padding:11px 15px;background:var(--brand);color:#fff;font-weight:750;text-decoration:none;cursor:pointer}.secondary{background:#425466}
@@ -3302,9 +3460,10 @@ dl{display:grid;grid-template-columns:minmax(170px,240px) 1fr;gap:0;border-top:1
 </style></head><body>
 <header><div><h1>Review the execution plan</h1><div>{{ app_version }}</div></div></header>
 <main>
+{% if demo_only %}<section class="card"><p class="risk"><strong>Simulation only:</strong> confirming this plan adds a temporary demo project to your current preview session. Docker, files and backups are not changed.</p></section>{% endif %}
 <section class="card"><h2>{{ plan.title }}</h2><p class="risk {{ 'danger' if plan.destructive else '' }}"><strong>Risk:</strong> {{ plan.risk }}</p>
 <dl>{% for label,value in plan.rows %}<dt>{{ label }}</dt><dd>{{ value }}</dd>{% endfor %}</dl></section>
-<section class="card"><div class="actions">{% if preview_only %}<strong>Preview only</strong>{% else %}<form method="post" action="{{ url_for('execute_create') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="preview_token" value="{{ preview_token }}"><button type="submit">Confirm plan and start</button></form>{% endif %}<a class="button secondary" href="{{ url_for('index') }}#new-project">{{ 'Back' if preview_only else 'Back and edit' }}</a></div></section>
+<section class="card"><div class="actions">{% if preview_only %}<strong>Preview only</strong>{% else %}<form method="post" action="{{ url_for('execute_create') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="preview_token" value="{{ preview_token }}"><button type="submit">{{ 'Add simulated project' if demo_only else 'Confirm plan and start' }}</button></form>{% endif %}<a class="button secondary" href="{{ url_for('new_project_page') }}">{{ 'Back' if preview_only else 'Back and edit' }}</a></div></section>
 </main></body></html>"""
 
 
@@ -3313,10 +3472,10 @@ PROGRESS_HTML = r"""<!doctype html>
 {% if job.status in ['queued', 'running'] %}<meta http-equiv="refresh" content="2">{% endif %}
 <title>{{ job.title }} progress · {{ job.project }} · GLPI Builder</title>
 <style>
-:root{--bg:#f3f6f9;--card:#fff;--line:#d8e0e8;--ink:#17212b;--muted:#667483;--brand:#16704a;--danger:#b42318;--wait:#a15c00}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px system-ui,-apple-system,"Segoe UI",sans-serif}
-header{background:#102a43;color:#fff;padding:20px}header div,main{max-width:900px;margin:auto}main{padding:28px 18px 50px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:20px;box-shadow:0 1px 2px #102a4310;margin-bottom:18px}
+:root{--bg:#f4f7fb;--card:#fff;--line:#dce4ee;--ink:#172033;--muted:#64748b;--brand:#2364d2;--danger:#b42318;--wait:#a15c00}
+*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 10% 0,#eaf1ff 0,transparent 30%),var(--bg);color:var(--ink);font:15px system-ui,-apple-system,"Segoe UI",sans-serif}
+header{background:#fff;color:#12233f;padding:18px;border-bottom:1px solid var(--line)}header div,main{max-width:960px;margin:auto}main{padding:30px 18px 50px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:22px;box-shadow:0 10px 32px #16345f0c;margin-bottom:18px}
 h1,h2{margin-top:0}.meta{color:var(--muted)}.status{display:inline-block;border-radius:999px;padding:5px 10px;background:#edf8f3;color:#16643d;font-weight:750}.status.failed{background:#fff0ef;color:var(--danger)}.status.running,.status.queued{background:#fff7e6;color:var(--wait)}
 progress{display:block;width:100%;height:24px;margin:16px 0;accent-color:var(--brand)}.percent{font-size:28px;font-weight:800}.timeline{list-style:none;padding:0;margin:0}.timeline li{padding:10px 0 10px 20px;border-left:3px solid #a9d8c3;position:relative}.timeline li:before{content:"";position:absolute;left:-7px;top:16px;width:11px;height:11px;border-radius:50%;background:var(--brand)}
 .error{white-space:pre-wrap;background:#fff0ef;border:1px solid #f5b1ab;padding:12px;border-radius:8px;color:#7a271a}.actions{display:flex;gap:10px;flex-wrap:wrap}.button{display:inline-block;border-radius:8px;padding:10px 14px;background:var(--brand);color:#fff;font-weight:700;text-decoration:none}.secondary{background:#425466}
@@ -3330,22 +3489,6 @@ progress{display:block;width:100%;height:24px;margin:16px 0;accent-color:var(--b
 </main></body></html>"""
 
 
-@app.route("/", methods=["GET"])
-def index():
-    backup_root = request.args.get("backup_root", BACKUP_ROOT)
-    db_backups = scan_files(backup_root, DB_EXTENSIONS)
-    file_backups = scan_files(backup_root, FILE_CHOICE_EXTENSIONS)
-    projects = discover_projects()
-    return render_template_string(
-        HTML,
-        backup_root=backup_root,
-        db_backups=db_backups,
-        file_backups=file_backups,
-        tz_default=TZ_DEFAULT,
-        projects=projects,
-        base_path=str(BASE_PATH),
-    )
-
 
 @app.route("/create", methods=["POST"])
 def create():
@@ -3353,18 +3496,32 @@ def create():
     project_for_log = None
     try:
         require_csrf()
-        data = validate_create_request(request.form)
+        data = (
+            validate_demo_create_request(request.form)
+            if test_demo_is_active()
+            else validate_create_request(request.form)
+        )
         project_for_log = data["project"]
         preview_token = store_create_preview(data)
+        plan = build_create_plan(data)
+        if test_demo_is_active():
+            plan["risk"] = "None - simulation only; Docker and host storage remain unchanged"
+            plan["destructive"] = False
+            plan["steps"] = [
+                "Validate the demo form and simulated inputs",
+                "Add the project to this browser preview session",
+                "Show project, backup, activity and YAML screens using demo data",
+            ]
         return render_template_string(
             CREATE_PREVIEW_HTML,
-            plan=build_create_plan(data),
+            plan=plan,
             preview_token=preview_token,
             preview_only=False,
+            demo_only=test_demo_is_active(),
         )
     except Exception as exc:
         flash_error(str(exc), project_for_log, "create-preview-error")
-    return redirect(url_for("index", backup_root=backup_root))
+    return redirect(url_for("new_project_page"))
 
 
 @app.route("/create/execute", methods=["POST"])
@@ -3375,6 +3532,23 @@ def execute_create():
         require_csrf()
         stored_data = consume_create_preview(request.form.get("preview_token"))
         backup_root = stored_data.get("backup_root") or BACKUP_ROOT
+        if test_demo_is_active():
+            data = validate_demo_create_request(stored_data)
+            demo_projects = list(session.get("test_demo_projects", []))
+            demo_projects.append({
+                "name": data["project"],
+                "port": data["host_port"],
+                "glpi_image": data["glpi_image"],
+                "mariadb_image": data["mariadb_image"],
+                "backup_source": data["update_backup_source"],
+            })
+            session["test_demo_projects"] = demo_projects[-8:]
+            flash(
+                f"Simulated project {esc(data['project'])} was added to this local preview. "
+                "No Docker container or host file was created.",
+                "ok",
+            )
+            return redirect(url_for("project_detail_page", project=data["project"]))
         data = validate_create_request(stored_data)
         project = data["project"]
         project_for_log = project
@@ -3394,7 +3568,7 @@ def execute_create():
         return redirect(url_for("restore_progress", job_token=job_token))
     except Exception as exc:
         flash_error(str(exc), project_for_log, "create-restore-error")
-    return redirect(url_for("index", backup_root=backup_root))
+    return redirect(url_for("new_project_page"))
 
 
 @app.route("/progress/<job_token>", methods=["GET"])
@@ -3405,32 +3579,6 @@ def restore_progress(job_token):
         return redirect(url_for("index"))
     elapsed = max(0, (job["finished_at"] or int(time.time())) - job["created_at"])
     return render_template_string(PROGRESS_HTML, job=job, elapsed=elapsed)
-
-
-@app.route("/ui-preview", methods=["GET"])
-def ui_preview():
-    if not UI_PREVIEW_MODE:
-        abort(404)
-    data = {
-        "project": "glpi-ui-preview",
-        "host_port": 8775,
-        "glpi_image": "glpi/glpi:11-preview",
-        "mariadb_image": "mariadb:11-preview",
-        "fresh_install": False,
-        "existing_state": False,
-        "skip_plugins": False,
-        "db_backup": "/volume1/docker/_BACKUPS/example-database.sql.gz",
-        "file_backup": "/volume1/docker/_BACKUPS/example-glpi-files.tar.gz",
-        "cookie_samesite": "Lax",
-        "cookie_secure": "Off",
-        "tz": TZ_DEFAULT,
-    }
-    return render_template_string(
-        CREATE_PREVIEW_HTML,
-        plan=build_create_plan(data),
-        preview_token="",
-        preview_only=True,
-    )
 
 
 @app.route("/change-port", methods=["POST"])
@@ -3445,7 +3593,7 @@ def change_port_route():
         flash_action_success(project, "change-port", messages)
     except Exception as exc:
         flash_error(str(exc), project_for_log, "change-port-error")
-    return redirect(url_for("index"))
+    return redirect(url_for("project_detail_page", project=project_for_log)) if project_for_log else redirect(url_for("projects_page"))
 
 
 @app.route("/change-cookie", methods=["POST"])
@@ -3461,7 +3609,7 @@ def change_cookie_route():
         flash_action_success(project, "change-cookie-settings", messages)
     except Exception as exc:
         flash_error(str(exc), project_for_log, "change-cookie-settings-error")
-    return redirect(url_for("index"))
+    return redirect(url_for("project_detail_page", project=project_for_log)) if project_for_log else redirect(url_for("projects_page"))
 
 
 @app.route("/set-backup-source", methods=["POST"])
@@ -3471,12 +3619,45 @@ def set_backup_source_route():
         require_csrf()
         project = validate_project(request.form.get("project"))
         project_for_log = project
-        messages = configure_scheduled_backup(project)
+        schedule = validate_backup_schedule(
+            request.form.get("schedule_kind", "daily"),
+            request.form.get("schedule_time", "02:00"),
+            request.form.get("schedule_weekdays", "7"),
+            request.form.get("interval_hours", "24"),
+            request.form.get("retention_days", "60"),
+        )
+        enabled = request.form.get("schedule_enabled", "yes") == "yes"
+        if test_demo_is_active():
+            overrides = dict(session.get("test_demo_schedule_overrides", {}))
+            overrides[project] = {
+                "enabled": enabled,
+                "kind": schedule["kind"],
+                "time": schedule["time"],
+                "weekdays": schedule["weekdays"],
+                "interval_hours": int(schedule["interval_hours"]),
+                "retention_days": int(schedule["retention_days"]),
+                "next_run": "Simulated after saving",
+                "last_status": "Not run",
+                "last_attempt": "",
+                "last_success": "",
+                "dispatcher_healthy": True,
+            }
+            session["test_demo_schedule_overrides"] = overrides
+            flash("Simulated backup schedule saved for this preview session.", "ok")
+            return redirect(url_for("project_detail_page", project=project))
+        messages = configure_scheduled_backup(
+            project,
+            enabled=enabled,
+            kind=schedule["kind"],
+            schedule_time=schedule["time"],
+            weekdays=schedule["weekdays"],
+            interval_hours=schedule["interval_hours"],
+            retention_days=schedule["retention_days"],
+        )
         flash_action_success(project, "set-backup-source", messages)
     except Exception as exc:
         flash_error(str(exc), project_for_log, "set-backup-source-error")
-    anchor = f"manage-{project_for_log}" if project_for_log else "projects"
-    return redirect(url_for("index") + f"#{anchor}")
+    return redirect(url_for("project_detail_page", project=project_for_log)) if project_for_log else redirect(url_for("projects_page"))
 
 
 @app.route("/run-backup", methods=["POST"])
@@ -3505,8 +3686,7 @@ def run_backup_now_route():
         return redirect(url_for("restore_progress", job_token=job_token))
     except Exception as exc:
         flash_error(str(exc), project_for_log, "manual-backup-error")
-    anchor = f"manage-{project_for_log}" if project_for_log else "projects"
-    return redirect(url_for("index") + f"#{anchor}")
+    return redirect(url_for("project_detail_page", project=project_for_log)) if project_for_log else redirect(url_for("projects_page"))
 
 
 @app.route("/rebuild-glpi", methods=["POST"])
@@ -3516,11 +3696,13 @@ def rebuild_glpi_route():
         require_csrf()
         project = validate_project(request.form.get("project"))
         project_for_log = project
+        if request.form.get("confirm_rebuild") != project:
+            raise ValueError("Type the exact project name to confirm recreating the GLPI container.")
         messages = rebuild_glpi(project)
         flash_action_success(project, "rebuild-glpi", messages)
     except Exception as exc:
         flash_error(str(exc), project_for_log, "rebuild-glpi-error")
-    return redirect(url_for("index"))
+    return redirect(url_for("project_detail_page", project=project_for_log)) if project_for_log else redirect(url_for("projects_page"))
 
 
 @app.route("/diagnose", methods=["POST"])
@@ -3553,7 +3735,7 @@ def diagnose():
         write_action_log(project, "diagnostics", ["Diagnostics viewed", "\n".join(lines)])
     except Exception as exc:
         flash_error(str(exc), project_for_log, "diagnostics-error")
-    return redirect(url_for("index"))
+    return redirect(url_for("project_detail_page", project=project_for_log)) if project_for_log else redirect(url_for("projects_page"))
 
 
 @app.route("/testdb", methods=["POST"])
@@ -3568,7 +3750,7 @@ def testdb_route():
         flash(safe_pre(out), "ok" if ok else "err")
     except Exception as exc:
         flash_error(str(exc), project_for_log, "database-test-error")
-    return redirect(url_for("index"))
+    return redirect(url_for("project_detail_page", project=project_for_log)) if project_for_log else redirect(url_for("projects_page"))
 
 
 @app.route("/resetdb", methods=["POST"])
@@ -3580,12 +3762,14 @@ def resetdb_route():
         project_for_log = project
         if request.form.get("confirm_resetdb") != "yes":
             raise ValueError("Select the confirmation box before resetting the database user.")
+        if request.form.get("confirm_project") != project:
+            raise ValueError("Type the exact project name to confirm database credential recovery.")
         ok, out = reset_db_user(project)
         write_action_log(project, "database-user-reset", [out])
         flash(text_to_html(out), "ok" if ok else "err")
     except Exception as exc:
         flash_error(str(exc), project_for_log, "database-user-reset-error")
-    return redirect(url_for("index"))
+    return redirect(url_for("project_detail_page", project=project_for_log)) if project_for_log else redirect(url_for("projects_page"))
 
 
 @app.route("/logs/<project>/<filename>", methods=["GET"])
@@ -3623,86 +3807,68 @@ a {{ color: #1f6feb; }}
 </html>"""
 
 
-V11_HTML = r"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>GLPI Builder</title>
-<style>
-:root{--bg:#f3f6f9;--card:#fff;--line:#d8e0e8;--ink:#17212b;--muted:#667483;--brand:#16704a;--danger:#b42318}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px system-ui,-apple-system,"Segoe UI",sans-serif}
-header{background:#102a43;color:#fff;padding:20px}header .header-inner,main{max-width:1080px;margin:auto}.header-inner{display:flex;justify-content:space-between;align-items:flex-start;gap:18px}.header-actions{display:flex;align-items:center;gap:10px}.header-actions form{margin:0}.header-actions button{margin:0;padding:7px 10px;background:#425466}.version{color:#c9d8e6;font-size:13px;line-height:1.3;text-align:right;white-space:nowrap}h1{margin:0;font-size:25px}h2{margin:0 0 14px}h3{margin:0 0 8px}
-main{padding:24px 18px 50px}.grid,.row{display:grid;gap:14px}.grid{grid-template-columns:repeat(auto-fit,minmax(290px,1fr));margin:16px 0 26px}.row{grid-template-columns:minmax(0,1fr) minmax(0,1fr)}.row-project{grid-template-columns:minmax(0,1fr) minmax(140px,180px)}.row-settings{grid-template-columns:minmax(220px,280px) repeat(2,minmax(150px,180px));justify-content:start}#new-project form{max-width:920px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px;box-shadow:0 1px 2px #102a4310}.project{display:flex;flex-direction:column;gap:10px}.detected{border-color:#efc27d;background:#fffdf8}.meta{color:var(--muted);font-size:13px}.status{display:inline-block;border-radius:999px;padding:3px 9px;background:#eef2f6;font-size:12px}.running{background:#e8f7ef;color:#16643d}.warning{background:#fff0cf;color:#805000}.issue-list{margin:3px 0 0;padding-left:20px;font-size:13px}.backup-panel{border:1px solid #b8c5d1;border-radius:9px;padding:11px 12px;background:#f7f9fb;overflow-wrap:anywhere}.backup-panel.ready{border-color:#9bd7b5;background:#f1fbf6}.backup-panel.issue{border-color:#efc27d;background:#fff8eb}.backup-head{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}.backup-panel ul{margin:7px 0 0;padding-left:20px;font-size:13px}.backup-panel form{margin-top:9px}.backup-panel button{padding:7px 10px;font-size:13px;border-radius:7px}.notice{padding:12px 14px;border-radius:9px;margin-bottom:10px;background:#eef5ff;border:1px solid #b9d3f8}.notice.err{background:#fff0ef;border-color:#f5b1ab}.notice.ok{background:#ecfdf3;border-color:#9bd7b5}
-label{display:block;font-size:14px;line-height:1.35;font-weight:600;margin:14px 0 7px}input,select{width:100%;min-height:40px;border:1px solid #b9c5d0;border-radius:8px;padding:8px 11px;background:#fff;color:var(--ink);font:inherit;font-size:15px;line-height:1.2}.compact-control{max-width:180px}.confirm-field{max-width:360px}.overwrite-confirmation{display:none}.overwrite-option:has(#overwrite-existing:checked) .overwrite-confirmation{display:block}button,.button{display:inline-block;border:0;border-radius:8px;padding:10px 14px;background:var(--brand);color:#fff;font:inherit;font-weight:700;text-decoration:none;cursor:pointer}details[id^="manage-"] button{padding:7px 10px;font-size:13px;border-radius:7px}details[id^="manage-"] > form + form{margin-top:6px}.review-button{margin-top:16px}.preview-button{margin-top:14px}.secondary{background:#425466}.danger{background:var(--danger)}details{border-top:1px solid var(--line);margin-top:14px;padding-top:12px}summary{font-weight:700;cursor:pointer}.actions{display:flex;gap:8px;flex-wrap:wrap}.actions form{display:inline}.actions form input{width:auto}.empty{text-align:center;color:var(--muted);padding:35px}.step{border-left:4px solid var(--brand);padding-left:13px;margin:22px 0}.check{display:flex;align-items:flex-start;gap:8px;font-weight:500}.check input,.mode-option input{width:auto;min-height:auto;margin-top:4px}.mode-grid{display:grid;grid-template-columns:minmax(0,2fr) minmax(250px,1fr);gap:12px}.mode-option{display:flex;gap:10px;border:1px solid #9bcfb5;border-radius:9px;padding:12px;margin:12px 0 0;background:#f1fbf6;font-weight:500}.mode-option.rare{border-color:#e7b1ab;background:#fff7f5}.mode-option strong{display:block}small{display:inline-block;color:var(--muted);line-height:1.4;margin-top:6px}
-@media(max-width:700px){.row,.row-project,.row-settings,.mode-grid{grid-template-columns:1fr}input,select{min-height:44px}.compact-control,.confirm-field{max-width:none}#new-project form{max-width:none}.version{font-size:12px;white-space:normal}}
-</style></head><body>
-<header><div class="header-inner"><h1>GLPI Builder</h1><div class="header-actions"><div class="version">{{ app_version }}</div><form method="post" action="{{ url_for('logout') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button type="submit">Sign out</button></form></div></div></header>
-<main>
-{% with messages=get_flashed_messages(with_categories=true) %}{% for category,message in messages %}<div class="notice {{ category }}">{{ message|safe }}</div>{% endfor %}{% endwith %}
-<div id="projects"><h2>Projects</h2></div>
-<div class="grid">
-{% for p in projects %}<article class="card project"><div><h3>{{ p.name }}</h3><span class="status {{ 'running' if p.glpi_status=='running' else '' }}">GLPI {{ p.glpi_status }}</span> <span class="status {{ 'running' if p.db_status=='running' else '' }}">DB {{ p.db_status }}</span>{% if p.backup_source %} <span class="status running">Backup source</span>{% endif %}</div>
-<div><strong>Web port:</strong> {{ p.active_port or 'not configured' }}</div><div class="meta">{{ p.glpi_image }}<br>{{ p.mariadb_image }}</div>
-{% if p.glpi_status=='running' and p.active_port %}<div class="actions"><a class="button" href="http://{{ request.host.split(':')[0] }}:{{ p.active_port }}" target="_blank">Open GLPI</a></div>{% endif %}
-<details id="manage-{{ p.name }}"><summary>Project management</summary>
-<form method="post" action="{{ url_for('change_port_route') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="project" value="{{ p.name }}"><label>New web port</label><input class="compact-control" type="number" name="host_port" min="1" max="65535" value="{{ p.active_port }}" required><button>Change port + recreate container</button></form>
-<form method="post" action="{{ url_for('rebuild_glpi_route') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="project" value="{{ p.name }}"><button class="secondary">Recreate GLPI container</button></form>
-{% if not p.backup_source %}<form method="post" action="{{ url_for('set_backup_source_route') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="project" value="{{ p.name }}"><button class="secondary">Use for scheduled backups</button></form>{% else %}<details><summary>Scheduled backup</summary><section class="backup-panel {{ 'ready' if p.backup_status.ready else 'issue' }}"><div class="backup-head"><span class="status {{ 'running' if p.backup_status.ready else '' }}">{{ 'Backup ready' if p.backup_status.ready else 'Needs attention' }}</span></div>{% if p.backup_status.ready %}{% if p.backup_status.latest %}<div class="meta">Last successful: {{ p.backup_status.latest.created_at }}<br>{{ p.backup_status.latest.name }} · {{ p.backup_status.latest.size_label }} · Checksum manifest {{ 'available' if p.backup_status.latest.checksum_manifest else 'missing' }}</div>{% else %}<div class="meta">No verified backup has been created for this project yet.</div>{% endif %}<form method="post" action="{{ url_for('run_backup_now_route') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="project" value="{{ p.name }}"><button>Run backup now</button></form>{% else %}<ul>{% for issue in p.backup_status.issues %}<li>{{ issue }}</li>{% endfor %}</ul>{% endif %}</section></details>{% endif %}
-<details><summary>SSO and cookie settings</summary><form method="post" action="{{ url_for('change_cookie_route') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="project" value="{{ p.name }}"><div class="row"><div><label>SameSite</label><select name="cookie_samesite"><option {{ 'selected' if p.cookie_samesite=='Lax' }}>Lax</option><option {{ 'selected' if p.cookie_samesite=='Strict' }}>Strict</option><option {{ 'selected' if p.cookie_samesite=='None' }}>None</option></select></div><div><label>Secure</label><select name="cookie_secure"><option {{ 'selected' if p.cookie_secure=='Off' }}>Off</option><option {{ 'selected' if p.cookie_secure=='On' }}>On</option></select></div></div><button>Apply settings</button></form></details>
-<details><summary>Diagnostics and logs</summary><div class="actions"><form method="post" action="{{ url_for('diagnose') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="project" value="{{ p.name }}"><button class="secondary">Diagnostics</button></form><form method="post" action="{{ url_for('testdb_route') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="project" value="{{ p.name }}"><button class="secondary">Test database</button></form></div>{% for log in p.logs %}<div><a href="{{ url_for('view_log',project=p.name,filename=log) }}">{{ log }}</a></div>{% endfor %}</details>
-</details></article>{% else %}<div class="card empty">No managed GLPI projects found yet.</div>{% endfor %}
-</div>
-
-{% if unmanaged_projects %}
-<div id="detected-projects"><h2>Detected but not managed</h2><p class="meta">These GLPI Compose projects are visible in Docker, but they do not match the Builder contract. They are shown read-only; their Compose files and data are not changed.</p></div>
-<div class="grid">
-{% for p in unmanaged_projects %}<article class="card project detected"><div><h3>{{ p.name }}</h3><span class="status {{ 'running' if p.glpi_status=='running' else '' }}">GLPI {{ p.glpi_status }}</span> <span class="status {{ 'running' if p.db_status=='running' else '' }}">DB {{ p.db_status }}</span> <span class="status warning">Read-only</span></div>
-<div><strong>Web port:</strong> {{ p.active_port or 'not published' }}</div><div class="meta">{{ p.mappings }}<br>{{ p.glpi_image or '-' }}<br>{{ p.mariadb_image or '-' }}<br>{{ p.path }}</div>
-{% if p.glpi_status=='running' and p.active_port %}<div class="actions"><a class="button" href="http://{{ request.host.split(':')[0] }}:{{ p.active_port }}" target="_blank">Open GLPI</a></div>{% endif %}
-<details><summary>Why it is not managed</summary><ul class="issue-list">{% for issue in p.issues %}<li>{{ issue }}</li>{% else %}<li>The project differs from the locked Builder contract.</li>{% endfor %}</ul></details>
-</article>{% endfor %}
-</div>
-{% endif %}
-
-<section class="card" id="new-project"><h2>New Project or Restore</h2>
-<form method="post" action="{{ url_for('create') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="backup_root" value="{{ backup_root }}"><input type="hidden" name="container_port" value="8080">
-<div class="step"><h3>Project</h3><div class="row row-project"><div><label>Project name</label><input name="project" pattern="[a-z0-9][a-z0-9_-]{2,50}" placeholder="glpi-production" required></div><div><label>Web port</label><input type="number" name="host_port" min="1" max="65535" value="{{ suggested_host_port }}" required></div></div></div>
-<div class="step"><h3>Versions</h3><div class="row"><div><label>GLPI image</label><select name="glpi_image" required>{% for image in glpi_images %}<option>{{ image }}</option>{% else %}<option value="">No allowed local GLPI image</option>{% endfor %}</select></div><div><label>Database image</label><select name="mariadb_image" required>{% for image in db_images %}<option>{{ image }}</option>{% else %}<option value="">No allowed local database image</option>{% endfor %}</select></div></div></div>
-<div class="step"><h3>Mode and required backups</h3><div class="mode-grid"><label class="mode-option"><input type="radio" name="operation_mode" value="restore" checked><span><strong>Full restore</strong></span></label><label class="mode-option rare"><input type="radio" name="operation_mode" value="fresh"><span><strong>Fresh installation</strong></span></label></div><div class="row"><div><label>Database backup</label><select name="db_backup_select"><option value="">Select required database backup</option>{% for value,label in db_backups %}<option value="{{ value }}">{{ label }}</option>{% endfor %}</select></div><div><label>GLPI files/config backup</label><select name="file_backup_select"><option value="">Select required GLPI files/config backup</option>{% for value,label in file_backups %}<option value="{{ value }}">{{ label }}</option>{% endfor %}</select></div></div><input type="hidden" name="db_backup_manual"><input type="hidden" name="file_backup_manual"><label class="check"><input type="checkbox" name="skip_plugins" value="yes">Restore without plugins</label></div>
-<div class="step"><h3>Review and execute</h3><details><summary>Advanced settings</summary><div class="row row-settings"><div><label>Time zone</label><input name="tz" value="{{ tz_default }}"></div><div><label>Cookie SameSite</label><select name="cookie_samesite"><option>Lax</option><option>Strict</option><option>None</option></select></div><div><label>Cookie Secure</label><select name="cookie_secure"><option>Off</option><option>On</option></select></div></div><div class="overwrite-option"><label class="check"><input id="overwrite-existing" type="checkbox" name="confirm_destructive" value="yes">Overwrite existing project</label><div id="overwrite-confirmation" class="overwrite-confirmation"><label for="confirm-project">Type the project name to confirm overwrite</label><input id="confirm-project" class="confirm-field" name="confirm_project" autocomplete="off"></div></div><label class="check"><input type="checkbox" name="update_backup_source" value="yes">Use this project for scheduled backups</label>{% if ui_preview_mode %}<a class="button secondary preview-button" href="{{ url_for('ui_preview') }}">Preview review screen</a>{% endif %}</details>
-<button class="review-button">Review plan</button></div></form></section>
-</main></body></html>"""
-
-
 LOGIN_HTML = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Sign in · GLPI Builder</title>
 <style>
-:root{--bg:#f3f6f9;--card:#fff;--line:#d8e0e8;--ink:#17212b;--muted:#667483;--brand:#16704a;--danger:#b42318}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px system-ui,-apple-system,"Segoe UI",sans-serif;min-height:100vh;display:grid;place-items:center;padding:20px}.card{width:min(430px,100%);background:var(--card);border:1px solid var(--line);border-radius:12px;padding:24px;box-shadow:0 2px 8px #102a4318}h1{font-size:24px;margin:0 0 8px}p{color:var(--muted);line-height:1.45}label{display:block;font-weight:650;margin:15px 0 7px}input{width:100%;min-height:43px;border:1px solid #b9c5d0;border-radius:8px;padding:9px 11px;font:inherit}button{width:100%;margin-top:20px;border:0;border-radius:8px;padding:11px 14px;background:var(--brand);color:#fff;font:inherit;font-weight:700;cursor:pointer}.error{padding:10px 12px;border-radius:8px;background:#fff0ef;border:1px solid #f5b1ab;color:var(--danger)}
-</style></head><body><main class="card"><h1>GLPI Builder</h1><p>Sign in with the administrator password and the current six-digit code from your authenticator app.</p>
-{% if error %}<div class="error">Unable to sign in. Check the credentials and try again.</div>{% endif %}
+:root{color-scheme:light;--navy:#12233f;--blue:#2364d2;--blue-dark:#184da8;--ink:#172033;--muted:#64748b;--line:#dce3ec;--danger:#b42318}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(circle at 15% 0,#eaf1ff 0,transparent 36%),#f4f7fb;color:var(--ink);font:15px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.shell{width:min(960px,calc(100% - 32px));margin:48px auto}.brand{display:flex;align-items:center;gap:12px;margin-bottom:22px;color:var(--navy);font-weight:750;letter-spacing:-.01em}.brand-mark{display:grid;place-items:center;width:38px;height:38px;border-radius:11px;background:linear-gradient(145deg,#2e71df,#174ca7);box-shadow:0 8px 22px #1d5ecb3b;color:#fff;font-size:18px}.brand small{display:block;color:var(--muted);font-size:12px;font-weight:550;letter-spacing:.02em}
+.layout{display:grid;grid-template-columns:minmax(0,.9fr) minmax(420px,1.1fr);overflow:hidden;background:#fff;border:1px solid #dbe3ee;border-radius:20px;box-shadow:0 24px 70px #16345f1c}.visual{display:flex;flex-direction:column;justify-content:space-between;min-height:560px;padding:44px;background:linear-gradient(155deg,#12233f,#183862);color:#fff}.eyebrow{display:inline-flex;align-items:center;gap:7px;width:max-content;padding:5px 10px;border:1px solid #ffffff2b;border-radius:999px;background:#ffffff12;color:#d8e6ff;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.08em}.visual h1{max-width:360px;margin:22px 0 12px;font-size:34px;line-height:1.13;letter-spacing:-.035em}.visual p{margin:0;color:#c9d5e8}.security{display:grid;gap:13px;margin-top:36px}.security-item{display:flex;align-items:center;gap:11px;color:#dbe6f5;font-size:13px}.icon{display:grid;place-items:center;flex:0 0 28px;height:28px;border:1px solid #ffffff31;border-radius:8px;background:#ffffff12;font-size:13px}.visual-foot{padding-top:20px;border-top:1px solid #ffffff1c;color:#aebed5;font-size:12px}
+.panel{display:flex;flex-direction:column;justify-content:center;padding:48px}.panel-head{margin-bottom:24px}.panel-head h2{margin:0 0 7px;color:var(--navy);font-size:25px;letter-spacing:-.025em}.panel-head p{margin:0;color:var(--muted);font-size:14px}.error{display:flex;gap:10px;margin:0 0 20px;padding:12px 14px;border:1px solid #f3b9b4;border-radius:10px;background:#fff5f4;color:var(--danger);font-size:14px;font-weight:600}.error:before{content:"!";display:grid;place-items:center;flex:0 0 20px;height:20px;border-radius:50%;background:var(--danger);color:#fff;font-size:12px}
+.field{margin-top:16px}label{display:flex;justify-content:space-between;gap:10px;margin-bottom:7px;color:#29364a;font-size:13px;font-weight:700}.hint{color:#8491a4;font-weight:500}input{width:100%;height:44px;padding:0 13px;border:1px solid #cbd5e1;border-radius:9px;background:#fff;color:var(--ink);font:inherit;outline:none;transition:border-color .15s,box-shadow .15s}input:focus{border-color:var(--blue);box-shadow:0 0 0 3px #2364d21c}input::placeholder{color:#a1adbd}button{display:flex;align-items:center;justify-content:center;width:100%;height:46px;margin-top:24px;border:0;border-radius:10px;background:linear-gradient(180deg,var(--blue),var(--blue-dark));box-shadow:0 8px 20px #205fc332;color:#fff;font:700 14px system-ui;cursor:pointer}button:hover{filter:brightness(1.04)}button:focus-visible{outline:3px solid #2364d23d;outline-offset:2px}.footnote{margin:14px 0 0;text-align:center;color:#8491a4;font-size:12px}
+.test-preview{margin-top:24px;padding:16px;border:1px solid #cfe0fb;border-radius:12px;background:#f4f8ff}.test-preview strong{display:block;color:#294369}.test-preview p{margin:4px 0 12px;color:#657994;font-size:12px}.preview-actions{display:grid;grid-template-columns:1fr 1fr;gap:9px}.preview-button{display:flex;align-items:center;justify-content:center;height:39px;border:1px solid #aac6ef;border-radius:9px;background:#fff;color:#24569f;font-size:12px;font-weight:750;text-decoration:none}.preview-button:hover{background:#edf5ff;text-decoration:none}.preview-button:focus-visible{outline:3px solid #2364d23d;outline-offset:2px}
+@media(max-width:760px){.shell{margin:20px auto}.layout{grid-template-columns:1fr}.visual{min-height:auto;padding:30px}.visual h1{font-size:28px}.security{grid-template-columns:1fr 1fr}.visual-foot{display:none}.panel{padding:34px}}@media(max-width:520px){.shell{width:min(100% - 20px,960px);margin:10px auto}.brand{margin:15px 4px}.layout{border-radius:15px}.visual{padding:25px 22px}.visual h1{font-size:25px}.security{grid-template-columns:1fr}.panel{padding:30px 21px}}
+</style></head><body><div class="shell"><div class="brand"><div class="brand-mark">G</div><div>GLPI Builder<small>Infrastructure deployment console</small></div></div>
+<main class="layout"><section class="visual"><div><span class="eyebrow">● Administrator access</span><h1>Welcome back.</h1><p>Sign in to manage deployments, restores and backups.</p><div class="security"><div class="security-item"><span class="icon">✓</span><span>Password-protected administration</span></div><div class="security-item"><span class="icon">⌁</span><span>Time-based two-factor authentication</span></div><div class="security-item"><span class="icon">◈</span><span>Short-lived secure sessions</span></div></div></div><div class="visual-foot">Authorized administrators only. Authentication attempts are rate-limited and audited.</div></section>
+<section class="panel"><div class="panel-head"><h2>Sign in to GLPI Builder</h2><p>Enter your administrator credentials to continue.</p></div>
+{% if error %}<div class="error" role="alert">Unable to sign in. Check the credentials and try again.</div>{% endif %}
 <form method="post" action="{{ url_for('login') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="next" value="{{ next_path }}">
-<label for="username">Username</label><input id="username" name="username" autocomplete="username" required autofocus>
-<label for="password">Password</label><input id="password" type="password" name="password" autocomplete="current-password" required>
-<label for="totp">Authenticator code</label><input id="totp" name="totp" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" required>
-<button type="submit">Sign in</button></form></main></body></html>"""
+<div class="field"><label for="username">Username</label><input id="username" name="username" autocomplete="username" placeholder="Your administrator username" required autofocus></div>
+<div class="field"><label for="password">Password</label><input id="password" type="password" name="password" autocomplete="current-password" placeholder="Your administrator password" required></div>
+<div class="field"><label for="totp">Authenticator code <span class="hint">6 digits</span></label><input id="totp" name="totp" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" placeholder="000000" required></div>
+<button type="submit">Sign in</button><p class="footnote">Your session automatically expires after inactivity.</p></form>
+{% if test_preview_enabled %}<aside class="test-preview"><strong>Local test preview</strong><p>Inspect the interface without credentials. Builder changes remain disabled.</p><div class="preview-actions"><a class="preview-button" href="{{ url_for('test_preview_enter') }}">View Builder</a><a class="preview-button" href="{{ url_for('test_preview_setup') }}">View setup</a></div></aside>{% endif %}
+</section></main></div></body></html>"""
 
 SETUP_HTML = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Secure setup · GLPI Builder</title>
 <style>
-body{margin:0;background:#f3f6f9;color:#17212b;font:15px system-ui;display:grid;place-items:center;min-height:100vh;padding:20px}.card{width:min(560px,100%);background:#fff;border:1px solid #d8e0e8;border-radius:12px;padding:24px}label{display:block;font-weight:650;margin:14px 0 6px}input{width:100%;box-sizing:border-box;padding:10px;border:1px solid #b9c5d0;border-radius:8px}.secret{font:14px ui-monospace;overflow-wrap:anywhere;background:#eef4f8;padding:10px;border-radius:8px}button{width:100%;margin-top:20px;padding:11px;border:0;border-radius:8px;background:#16704a;color:#fff;font-weight:700}.error{background:#fff0ef;color:#b42318;padding:10px;border-radius:8px}
-</style></head><body><main class="card"><h1>Secure first-time setup</h1>
-<p>Create the only administrator account. Copy the setup token from the container log, add the secret below manually to your authenticator app, then enter its current six-digit code. This page is permanently disabled after setup.</p>
-{% if error %}<div class="error">{{ error }}</div>{% endif %}
-<p>Authenticator secret:</p><div class="secret">{{ totp_secret }}</div>
-<form method="post" action="{{ url_for('setup') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">
-<label for="setup_token">Setup token from the container log</label><input id="setup_token" name="setup_token" autocomplete="off" required>
-<label for="username">Administrator username</label><input id="username" name="username" pattern="[A-Za-z0-9_.-]{3,64}" required autofocus>
-<label for="password">Password (minimum 14 characters)</label><input id="password" type="password" name="password" minlength="14" autocomplete="new-password" required>
-<label for="confirm_password">Confirm password</label><input id="confirm_password" type="password" name="confirm_password" minlength="14" autocomplete="new-password" required>
-<label for="totp">Authenticator code</label><input id="totp" name="totp" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" required>
-<button type="submit">Finish secure setup</button></form></main></body></html>"""
+:root{color-scheme:light;--navy:#12233f;--blue:#2364d2;--blue-dark:#184da8;--ink:#172033;--muted:#64748b;--line:#dce3ec;--soft:#f5f8fc;--danger:#b42318}
+*{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(circle at 15% 0,#eaf1ff 0,transparent 36%),#f4f7fb;color:var(--ink);font:15px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+.shell{width:min(1040px,calc(100% - 32px));margin:48px auto}.brand{display:flex;align-items:center;gap:12px;margin-bottom:22px;color:var(--navy);font-weight:750;letter-spacing:-.01em}.brand-mark{display:grid;place-items:center;width:38px;height:38px;border-radius:11px;background:linear-gradient(145deg,#2e71df,#174ca7);box-shadow:0 8px 22px #1d5ecb3b;color:#fff;font-size:18px}.brand small{display:block;color:var(--muted);font-size:12px;font-weight:550;letter-spacing:.02em}
+.layout{display:grid;grid-template-columns:minmax(0,.85fr) minmax(460px,1.15fr);overflow:hidden;background:#fff;border:1px solid #dbe3ee;border-radius:20px;box-shadow:0 24px 70px #16345f1c}.intro{padding:44px;background:linear-gradient(155deg,#12233f,#183862);color:#fff}.eyebrow{display:inline-flex;align-items:center;gap:7px;padding:5px 10px;border:1px solid #ffffff2b;border-radius:999px;background:#ffffff12;color:#d8e6ff;font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.08em}.intro h1{max-width:420px;margin:22px 0 12px;font-size:34px;line-height:1.13;letter-spacing:-.035em}.intro>p{margin:0;color:#c9d5e8}.steps{display:grid;gap:20px;margin-top:38px}.step{display:grid;grid-template-columns:34px 1fr;gap:13px}.step-number{display:grid;place-items:center;width:30px;height:30px;border:1px solid #ffffff38;border-radius:50%;background:#ffffff12;color:#fff;font-size:13px;font-weight:750}.step strong{display:block;margin:2px 0 3px}.step span{color:#b9c8dd;font-size:13px}.privacy{margin-top:38px;padding-top:20px;border-top:1px solid #ffffff1c;color:#aebed5;font-size:12px}
+.panel{padding:40px 44px}.panel-head{margin-bottom:25px}.panel-head h2{margin:0 0 6px;color:var(--navy);font-size:23px;letter-spacing:-.02em}.panel-head p{margin:0;color:var(--muted);font-size:14px}.error{display:flex;gap:10px;margin:0 0 20px;padding:12px 14px;border:1px solid #f3b9b4;border-radius:10px;background:#fff5f4;color:var(--danger);font-size:14px;font-weight:600}.error:before{content:"!";display:grid;place-items:center;flex:0 0 20px;height:20px;border-radius:50%;background:var(--danger);color:#fff;font-size:12px}
+.field{margin-top:16px}label{display:flex;justify-content:space-between;gap:10px;margin-bottom:7px;color:#29364a;font-size:13px;font-weight:700}.hint{color:#8491a4;font-weight:500}input{width:100%;height:44px;padding:0 13px;border:1px solid #cbd5e1;border-radius:9px;background:#fff;color:var(--ink);font:inherit;outline:none;transition:border-color .15s,box-shadow .15s}input:focus{border-color:var(--blue);box-shadow:0 0 0 3px #2364d21c}input::placeholder{color:#a1adbd}.row{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+.mfa{margin:20px 0;padding:15px;border:1px solid #cfe0fb;border-radius:12px;background:#f4f8ff}.mfa-title{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;color:#294369;font-size:13px;font-weight:750}.badge{padding:3px 7px;border-radius:999px;background:#dceaff;color:#2156a8;font-size:11px}.secret{padding:11px 12px;border:1px dashed #9bb9e8;border-radius:8px;background:#fff;color:#15325d;font:600 14px/1.4 ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.045em;overflow-wrap:anywhere;user-select:all}.mfa-help{margin:8px 0 0;color:#657994;font-size:12px}
+.scheduler{margin:22px 0 4px;padding:16px;border:1px solid #dce3ec;border-radius:12px;background:#fbfcfe}.scheduler-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px}.scheduler h3{margin:0 0 4px;color:#23324a;font-size:15px}.scheduler p{margin:0;color:#65748a;font-size:12px}.scheduler-status{flex:0 0 auto;padding:4px 8px;border-radius:999px;background:#fff0d8;color:#8a5200;font-size:11px;font-weight:750}.scheduler-status.ready{background:#e7f7ed;color:#176b3a}.scheduler ol{margin:13px 0;padding-left:20px;color:#425169;font-size:12px}.scheduler li+li{margin-top:4px}.command-wrap{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:stretch}.command{min-width:0;padding:10px 11px;border:1px solid #d6deea;border-radius:8px;background:#fff;color:#233b5d;font:600 11px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;overflow-wrap:anywhere;user-select:all}.copy-command{width:auto;height:auto;min-height:38px;margin:0;padding:0 12px;border:1px solid #aac6ef;border-radius:8px;background:#fff;box-shadow:none;color:#24569f;font-size:12px}.copy-command:hover{background:#edf5ff;filter:none}.scheduler-foot{display:flex;justify-content:space-between;gap:12px;margin-top:9px}.scheduler-foot a{color:#24569f;font-size:12px;font-weight:700}.scheduler-foot span{color:#8491a4;font-size:11px}
+button{display:flex;align-items:center;justify-content:center;width:100%;height:46px;margin-top:23px;border:0;border-radius:10px;background:linear-gradient(180deg,var(--blue),var(--blue-dark));box-shadow:0 8px 20px #205fc332;color:#fff;font:700 14px system-ui;cursor:pointer}button:hover{filter:brightness(1.04)}button:focus-visible{outline:3px solid #2364d23d;outline-offset:2px}.footnote{margin:14px 0 0;text-align:center;color:#8491a4;font-size:12px}.preview-banner{margin:0 0 18px;padding:12px 14px;border:1px solid #eed09b;border-radius:10px;background:#fff8e8;color:#805000;font-size:13px}.preview-back{display:block;margin-top:12px;text-align:center;font-weight:700}fieldset{min-width:0;margin:0;padding:0;border:0}fieldset:disabled{opacity:.72}fieldset:disabled button{cursor:not-allowed;box-shadow:none}
+@media(max-width:820px){.shell{margin:20px auto}.layout{grid-template-columns:1fr}.intro{padding:30px}.intro h1{font-size:28px}.steps{grid-template-columns:1fr 1fr}.privacy{display:none}.panel{padding:30px}}@media(max-width:560px){.shell{width:min(100% - 20px,1040px);margin:10px auto}.brand{margin:15px 4px}.layout{border-radius:15px}.intro{padding:25px 22px}.intro h1{font-size:25px}.steps{grid-template-columns:1fr;gap:14px;margin-top:24px}.panel{padding:26px 20px}.row{grid-template-columns:1fr}.scheduler-head,.scheduler-foot{display:block}.scheduler-status{display:inline-block;margin-top:9px}.command-wrap{grid-template-columns:1fr}.copy-command{min-height:40px}.scheduler-foot span{display:block;margin-top:5px}}
+</style></head><body><div class="shell"><div class="brand"><div class="brand-mark">G</div><div>GLPI Builder<small>Infrastructure deployment console</small></div></div>
+<main class="layout"><section class="intro"><span class="eyebrow">● Secure onboarding</span><h1>Let’s secure your Builder.</h1>
+<p>Complete this one-time setup before managing GLPI environments.</p>
+<div class="steps"><div class="step"><div class="step-number">1</div><div><strong>Verify this instance</strong><span>Use the token shown in the container log.</span></div></div>
+<div class="step"><div class="step-number">2</div><div><strong>Create your administrator</strong><span>Choose a unique username and strong password.</span></div></div>
+<div class="step"><div class="step-number">3</div><div><strong>Enable two-factor authentication</strong><span>Add the secret to your authenticator and confirm a code.</span></div></div>
+<div class="step"><div class="step-number">4</div><div><strong>Enable scheduled backups</strong><span>Create one DSM task for every project schedule.</span></div></div></div>
+<div class="privacy">Your password is stored as a one-way hash. This onboarding page is permanently disabled after successful setup.</div></section>
+<section class="panel"><div class="panel-head"><h2>Administrator setup</h2><p>All fields are required. This takes about one minute.</p></div>
+{% if preview_only %}<div class="preview-banner"><strong>Read-only test preview.</strong> This screen cannot create or change an administrator.</div>{% endif %}
+{% if error %}<div class="error" role="alert">{{ error }}</div>{% endif %}
+<form method="post" action="{{ url_for('setup') if not preview_only else '#' }}"><fieldset {% if preview_only %}disabled{% endif %}><input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+<div class="field"><label for="setup_token">Instance setup token <span class="hint">Container log</span></label><input id="setup_token" name="setup_token" autocomplete="off" placeholder="Paste the one-time token" required autofocus></div>
+<div class="field"><label for="username">Administrator username</label><input id="username" name="username" pattern="[A-Za-z0-9_.\-]{3,64}" autocomplete="username" placeholder="For example: builder-admin" required></div>
+<div class="row"><div class="field"><label for="password">Password <span class="hint">14+ characters</span></label><input id="password" type="password" name="password" minlength="14" autocomplete="new-password" placeholder="Enter a strong password" required></div>
+<div class="field"><label for="confirm_password">Confirm password</label><input id="confirm_password" type="password" name="confirm_password" minlength="14" autocomplete="new-password" placeholder="Repeat your password" required></div></div>
+<div class="mfa"><div class="mfa-title"><span>Authenticator setup secret</span><span class="badge">Step 3</span></div><div class="secret" title="Select and copy this secret">{{ totp_secret }}</div><p class="mfa-help">Add this secret manually to Microsoft Authenticator, Google Authenticator or another TOTP app.</p></div>
+<div class="field"><label for="totp">Six-digit verification code <span class="hint">Changes every 30 seconds</span></label><input id="totp" name="totp" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" placeholder="000000" required></div>
+<section class="scheduler" aria-labelledby="scheduler-title"><div class="scheduler-head"><div><h3 id="scheduler-title">Scheduled backups <span class="badge">Optional now</span></h3><p>Create one Synology task. It safely handles every project and its own frequency.</p></div><span class="scheduler-status {{ 'ready' if dispatcher_healthy else '' }}">{{ 'Task detected' if dispatcher_healthy else 'Not detected yet' }}</span></div>
+<ol><li>In DSM, open <strong>Control Panel → Task Scheduler</strong>.</li><li>Create a <strong>User-defined script</strong>, run it as <strong>root</strong> every <strong>5 minutes</strong>.</li><li>Paste this exact command and run the task once:</li></ol>
+<div class="command-wrap"><code class="command" id="dispatcher-command">{{ dispatcher_command }}</code><button class="copy-command" type="button" data-copy-command>Copy command</button></div>
+<div class="scheduler-foot"><a href="{{ request.path }}">Check task status</a><span>You can safely finish setup first and configure this later under Backups.</span></div></section>
+<button type="submit">Complete secure setup&nbsp; →</button><p class="footnote">Setup can only be completed once for this installation.</p>
+</fieldset></form>{% if preview_only %}<a class="preview-back" href="{{ url_for('login') }}">← Back to sign in</a>{% endif %}</section></main></div>
+<script src="{{ url_for('ui_javascript') }}" defer></script></body></html>"""
 
 
 @app.route("/setup", methods=["GET", "POST"])
@@ -3770,7 +3936,50 @@ def setup():
         except ValueError as exc:
             login_rate_record_failure(key)
             error = str(exc)
-    return render_template_string(SETUP_HTML, error=error, totp_secret=secret)
+    dispatcher = read_simple_env_file(BACKUP_STATE_DIR / "dispatcher.env")
+    dispatcher_epoch = safe_int(dispatcher.get("LAST_HEARTBEAT"), 0, 0)
+    return render_template_string(
+        SETUP_HTML,
+        error=error,
+        totp_secret=secret,
+        preview_only=False,
+        dispatcher_command=f"/bin/bash {BACKUP_DISPATCHER_PATH}",
+        dispatcher_healthy=bool(
+            dispatcher_epoch and time.time() - dispatcher_epoch < 1200
+        ),
+    )
+
+
+@app.route("/test-preview/enter", methods=["GET"])
+def test_preview_enter():
+    if not BUILDER_TEST_PREVIEW_MODE:
+        abort(404)
+    session.clear()
+    session["test_preview_active"] = True
+    session["csrf_token"] = secrets.token_urlsafe(32)
+    return redirect(url_for("index"))
+
+
+@app.route("/test-preview/setup", methods=["GET"])
+def test_preview_setup():
+    if not BUILDER_TEST_PREVIEW_MODE:
+        abort(404)
+    return render_template_string(
+        SETUP_HTML,
+        error="",
+        totp_secret="TEST-PREVIEW-SECRET-NOT-A-REAL-CREDENTIAL",
+        preview_only=True,
+        dispatcher_command=f"/bin/bash {BACKUP_DISPATCHER_PATH}",
+        dispatcher_healthy=False,
+    )
+
+
+@app.route("/test-preview/exit", methods=["GET"])
+def test_preview_exit():
+    if not BUILDER_TEST_PREVIEW_MODE:
+        abort(404)
+    session.clear()
+    return redirect(url_for("login"))
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -3780,14 +3989,27 @@ def login():
             "Authentication configuration is invalid.", 503
         )
     next_path = safe_internal_next(request.values.get("next"))
-    if request.method == "GET":
+    if request.method in {"GET", "HEAD"}:
         if authenticated_session_is_current():
             return redirect(next_path)
-        return render_template_string(LOGIN_HTML, error=False, next_path=next_path)
+        return render_template_string(
+            LOGIN_HTML,
+            error=False,
+            next_path=next_path,
+            test_preview_enabled=BUILDER_TEST_PREVIEW_MODE,
+        )
 
     key = login_rate_key()
     if login_rate_is_blocked(key):
-        response = make_response(render_template_string(LOGIN_HTML, error=True, next_path=next_path), 429)
+        response = make_response(
+            render_template_string(
+                LOGIN_HTML,
+                error=True,
+                next_path=next_path,
+                test_preview_enabled=BUILDER_TEST_PREVIEW_MODE,
+            ),
+            429,
+        )
         response.headers["Retry-After"] = str(LOGIN_RATE_BLOCK_SECONDS)
         return response
     try:
@@ -3802,7 +4024,12 @@ def login():
             write_last_totp_counter(counter)
     except Exception:
         login_rate_record_failure(key)
-        return render_template_string(LOGIN_HTML, error=True, next_path=next_path), 401
+        return render_template_string(
+            LOGIN_HTML,
+            error=True,
+            next_path=next_path,
+            test_preview_enabled=BUILDER_TEST_PREVIEW_MODE,
+        ), 401
 
     login_rate_clear(key)
     now = int(time.time())
@@ -3827,7 +4054,21 @@ def logout():
 
 @app.before_request
 def require_admin_authentication():
-    if request.endpoint in {"healthz", "favicon", "login", "setup"}:
+    if request.endpoint in {"healthz", "favicon", "login", "setup", "ui_javascript"}:
+        return None
+    if request.endpoint in {
+        "test_preview_enter",
+        "test_preview_setup",
+        "test_preview_exit",
+    }:
+        return None
+    if BUILDER_TEST_PREVIEW_MODE and session.get("test_preview_active"):
+        if request.method != "GET" and request.endpoint not in {
+            "create",
+            "execute_create",
+            "set_backup_source_route",
+        }:
+            return ("Changes are disabled in the local test preview.", 403)
         return None
     if AUTH_CONFIG_ERROR or not AUTH_CONFIG:
         return redirect(url_for("setup")) if not AUTH_CONFIG_PATH.exists() else (
@@ -3882,27 +4123,620 @@ def favicon():
     return ("", 204)
 
 
-def v11_index():
-    backup_root = BACKUP_ROOT
+@app.route("/assets/app.js")
+def ui_javascript():
+    response = make_response(UI_JAVASCRIPT)
+    response.headers["Content-Type"] = "application/javascript; charset=utf-8"
+    return response
+
+
+@app.route("/api/status")
+def status_snapshot():
+    _docker_snapshot, projects = professional_ui_snapshot()
+    return jsonify({
+        "checked_at": datetime.now().strftime("%H:%M:%S"),
+        "projects": [
+            {
+                "name": project["name"],
+                "glpi": project["glpi_status"],
+                "database": project["db_status"],
+            }
+            for project in projects
+        ],
+    })
+
+
+def test_demo_is_active():
+    return (
+        BUILDER_TEST_PREVIEW_MODE
+        and has_request_context()
+        and bool(session.get("test_preview_active"))
+    )
+
+
+def demo_project(
+    name,
+    port,
+    *,
+    glpi_image="glpi/glpi:11.0.8",
+    mariadb_image="mariadb:11.4",
+    glpi_status="running",
+    db_status="running",
+    backup_source=False,
+    backup_ready=False,
+    latest=None,
+):
+    issues = []
+    if backup_source and not backup_ready:
+        issues = ["The latest backup verification is intentionally failing in this demo."]
+    return {
+        "name": name,
+        "env_port": str(port),
+        "active_port": str(port),
+        "glpi_status": glpi_status,
+        "db_status": db_status,
+        "glpi_image": glpi_image,
+        "mariadb_image": mariadb_image,
+        "tz": "Europe/Brussels",
+        "cookie_samesite": "Lax",
+        "cookie_secure": "Off",
+        "path": f"/demo-only/{name}",
+        "mappings": f"0.0.0.0:{port} → 8080/tcp (simulated)",
+        "latest_log": "20260727-201500-demo-action.log",
+        "logs": [
+            "20260727-201500-demo-action.log",
+            "20260727-194500-health-check.log",
+        ],
+        "backup_source": backup_source,
+        "backup_status": {
+            "selected": backup_source,
+            "ready": backup_ready,
+            "issues": issues,
+            "latest": latest,
+            "schedule": {
+                "enabled": backup_source,
+                "kind": "daily",
+                "time": "02:00",
+                "weekdays": "7",
+                "interval_hours": 24,
+                "retention_days": 60,
+                "next_run": "2026-07-28 02:00" if backup_source else "",
+                "last_status": "success" if backup_ready else ("failed" if backup_source else "Not run"),
+                "last_attempt": "2026-07-27 02:00" if backup_source else "",
+                "last_success": "2026-07-27 02:04" if backup_ready else "",
+                "dispatcher_healthy": True,
+            },
+        },
+        "simulated": True,
+    }
+
+
+def demo_preview_projects():
+    projects = [
+        demo_project(
+            "demo-production",
+            8088,
+            backup_source=True,
+            backup_ready=True,
+            latest={
+                "name": "demo-production-20260727.sql.gz",
+                "created_at": "2026-07-27 19:45",
+                "size_label": "184 MB",
+                "checksum_manifest": True,
+            },
+        ),
+        demo_project("demo-staging", 8089),
+        demo_project(
+            "demo-recovery",
+            8090,
+            glpi_status="exited",
+            backup_source=True,
+            backup_ready=False,
+        ),
+    ]
+    for item in session.get("test_demo_projects", []):
+        if not isinstance(item, dict):
+            continue
+        try:
+            projects.append(
+                demo_project(
+                    validate_project(item.get("name")),
+                    validate_port(item.get("port"), "Demo port"),
+                    glpi_image=str(
+                        item.get("glpi_image") or "glpi/glpi:11.0.8"
+                    ),
+                    mariadb_image=str(
+                        item.get("mariadb_image") or "mariadb:11.4"
+                    ),
+                    backup_source=bool(item.get("backup_source")),
+                    backup_ready=bool(item.get("backup_source")),
+                )
+            )
+        except ValueError:
+            continue
+    overrides = session.get("test_demo_schedule_overrides", {})
+    if isinstance(overrides, dict):
+        for project in projects:
+            override = overrides.get(project["name"])
+            if not isinstance(override, dict):
+                continue
+            project["backup_source"] = bool(override.get("enabled"))
+            project["backup_status"]["selected"] = project["backup_source"]
+            project["backup_status"]["schedule"].update(override)
+            project["backup_status"]["ready"] = project["backup_source"]
+            project["backup_status"]["issues"] = []
+    return projects
+
+
+def demo_backup_choices():
+    root = "/demo-only/backups"
+    return {
+        "database": [
+            (f"{root}/demo-production.sql.gz", "demo-production.sql.gz · verified"),
+            (f"{root}/demo-legacy.dump.gz", "demo-legacy.dump.gz · migration sample"),
+        ],
+        "files": [
+            (f"{root}/demo-production-files.tar.gz", "demo-production-files.tar.gz · verified"),
+            (f"{root}/demo-legacy-files.tar.gz", "demo-legacy-files.tar.gz · migration sample"),
+        ],
+    }
+
+
+def validate_demo_create_request(source):
+    operation_mode = str(source.get("operation_mode") or "restore").strip().lower()
+    if operation_mode not in OPERATION_MODES:
+        raise ValueError("Operation mode must be Full restore or Fresh installation.")
+    fresh_install = operation_mode == "fresh"
+    backup_choices = demo_backup_choices()
+    db_backup = str(
+        source.get("db_backup")
+        or source.get("db_backup_select")
+        or ""
+    )
+    file_backup = str(
+        source.get("file_backup")
+        or source.get("file_backup_select")
+        or ""
+    )
+    if not fresh_install:
+        if db_backup not in {value for value, _label in backup_choices["database"]}:
+            raise ValueError("Select one of the simulated database backups.")
+        if file_backup not in {value for value, _label in backup_choices["files"]}:
+            raise ValueError("Select one of the simulated GLPI files backups.")
+    else:
+        db_backup = ""
+        file_backup = ""
+    project = validate_project(source.get("project"))
+    if project in {item["name"] for item in demo_preview_projects()}:
+        raise ValueError("That simulated project already exists.")
+    host_port = validate_port(source.get("host_port"), "Host port")
+    glpi_image = str(source.get("glpi_image") or "glpi/glpi:11.0.8").strip()
+    mariadb_image = str(source.get("mariadb_image") or "mariadb:11.4").strip()
+    if glpi_image != "glpi/glpi:11.0.8":
+        raise ValueError("Select the simulated GLPI image shown in the wizard.")
+    if mariadb_image not in {"mariadb:10.11", "mariadb:11.4"}:
+        raise ValueError("Select the simulated database image shown in the wizard.")
+    tz = str(source.get("tz") or TZ_DEFAULT).strip()
+    if tz != TZ_DEFAULT:
+        raise ValueError("The demo preview uses the configured default time zone.")
+    return {
+        "project": project,
+        "glpi_image": glpi_image,
+        "mariadb_image": mariadb_image,
+        "host_port": host_port,
+        "container_port": GLPI_INTERNAL_PORT,
+        "tz": tz,
+        "cookie_samesite": validate_cookie_samesite(source.get("cookie_samesite")),
+        "cookie_secure": validate_cookie_secure(source.get("cookie_secure")),
+        "operation_mode": operation_mode,
+        "fresh_install": fresh_install,
+        "clean_db": fresh_install,
+        "force_recreate": True,
+        "restore_everything": not fresh_install,
+        "skip_plugins": fresh_install or form_flag(source, "skip_plugins"),
+        "update_backup_source": form_flag(source, "update_backup_source"),
+        "db_backup": db_backup,
+        "file_backup": file_backup,
+        "existing_state": False,
+        "confirm_destructive": False,
+        "confirm_project": "",
+        "backup_root": "/demo-only/backups",
+    }
+
+
+def demo_compose_yaml(project):
+    selected = next(
+        (item for item in demo_preview_projects() if item["name"] == project),
+        None,
+    )
+    if not selected:
+        return ""
+    return f"""# Simulated configuration — never sent to Docker
+services:
+  {project}-db:
+    image: {selected["mariadb_image"]}
+    container_name: {project}-db
+    environment:
+      MARIADB_ROOT_PASSWORD: ${{MARIADB_ROOT_PASSWORD}}
+      MARIADB_PASSWORD: ${{GLPI_DB_PASSWORD}}
+    volumes:
+      - /demo-only/{project}/db:/var/lib/mysql:rw
+  {project}:
+    image: {selected["glpi_image"]}
+    container_name: {project}
+    ports:
+      - "{selected["active_port"]}:8080"
+    environment:
+      GLPI_DB_PASSWORD: ${{GLPI_DB_PASSWORD}}
+      GLPI_SESSION_COOKIE_SAMESITE: {selected["cookie_samesite"]}
+      GLPI_SESSION_COOKIE_SECURE: {selected["cookie_secure"]}
+    volumes:
+      - /demo-only/{project}/glpi:/var/glpi:rw
+"""
+
+
+def professional_ui_snapshot():
     docker_snapshot = dashboard_docker_snapshot()
-    backup_choices = scan_backup_choices(backup_root, include_dirs=True)
-    projects = discover_projects(docker_snapshot["containers"])
+    projects = []
+    for item in discover_projects(docker_snapshot["containers"]):
+        if isinstance(item, dict):
+            projects.append(item)
+            continue
+        projects.append({
+            name: getattr(item, name, default)
+            for name, default in (
+                ("name", ""),
+                ("env_port", ""),
+                ("active_port", ""),
+                ("glpi_status", "unknown"),
+                ("db_status", "unknown"),
+                ("glpi_image", ""),
+                ("mariadb_image", ""),
+                ("tz", ""),
+                ("cookie_samesite", "Lax"),
+                ("cookie_secure", "Off"),
+                ("path", ""),
+                ("mappings", "-"),
+                ("latest_log", None),
+                ("logs", []),
+                ("backup_source", False),
+                ("backup_status", {"selected": False, "ready": False, "issues": [], "latest": None}),
+            )
+        })
+    if test_demo_is_active():
+        docker_snapshot = dict(docker_snapshot)
+        docker_snapshot["image_tags"] = tuple(sorted(set(
+            docker_snapshot["image_tags"]
+        ) | {"glpi/glpi:11.0.8", "mariadb:10.11", "mariadb:11.4"}))
+        known = {item["name"] for item in projects}
+        projects.extend(
+            item for item in demo_preview_projects()
+            if item["name"] not in known
+        )
+    projects = [
+        enrich_project_operational_metadata(
+            item, docker_snapshot["image_tags"]
+        )
+        for item in projects
+    ]
+    return docker_snapshot, projects
+
+
+def render_professional_page(template, page_title, active_page, **context):
     return render_template_string(
-        V11_HTML,
+        page_template(template),
+        page_title=page_title,
+        active_page=active_page,
+        **context,
+    )
+
+
+def overview_findings(projects, unmanaged_projects):
+    findings = []
+    for project in projects:
+        if project["glpi_status"] != "running":
+            findings.append({
+                "title": f"{project['name']}: GLPI is {project['glpi_status']}",
+                "detail": "Open the project to run diagnostics or recreate the GLPI container.",
+            })
+        if project["db_status"] != "running":
+            findings.append({
+                "title": f"{project['name']}: database is {project['db_status']}",
+                "detail": "Database-dependent operations may be unavailable.",
+            })
+        if project["backup_source"] and not project["backup_status"]["ready"]:
+            findings.append({
+                "title": f"{project['name']}: backup needs attention",
+                "detail": "; ".join(project["backup_status"]["issues"]) or "Review backup readiness.",
+            })
+    if unmanaged_projects:
+        findings.append({
+            "title": f"{len(unmanaged_projects)} unmanaged GLPI environment(s) detected",
+            "detail": "These environments are display-only and cannot be changed by Builder.",
+        })
+    return findings[:8]
+
+
+@app.route("/", methods=["GET"])
+def index():
+    docker_snapshot, projects = professional_ui_snapshot()
+    unmanaged = discover_unmanaged_glpi_projects(docker_snapshot["containers"], projects)
+    running = sum(
+        project["glpi_status"] == "running" and project["db_status"] == "running"
+        for project in projects
+    )
+    issue_count = sum(project["glpi_status"] != "running" for project in projects)
+    issue_count += sum(project["db_status"] != "running" for project in projects)
+    scheduled = [project for project in projects if project["backup_source"]]
+    ready_schedules = sum(project["backup_status"]["ready"] for project in scheduled)
+    latest_values = [
+        project["backup_status"]["latest"] for project in scheduled
+        if project["backup_status"]["latest"]
+    ]
+    latest = max(latest_values, key=lambda item: item.get("created_at", "")) if latest_values else None
+    stats = {
+        "projects": len(projects),
+        "running": running,
+        "issues": issue_count,
+        "backup_label": f"{ready_schedules}/{len(scheduled)}" if scheduled else "None",
+        "backup_detail": (
+            f"Latest: {latest['created_at']}" if latest else
+            ("No verified backup created yet" if scheduled else "No schedules enabled")
+        ),
+        "images": len(docker_snapshot["image_tags"]),
+    }
+    return render_professional_page(
+        OVERVIEW,
+        "Overview",
+        "overview",
         projects=projects,
-        unmanaged_projects=discover_unmanaged_glpi_projects(docker_snapshot["containers"], projects),
-        backup_root=str(backup_root),
+        stats=stats,
+        issues=overview_findings(projects, unmanaged),
+        unmanaged_projects=unmanaged,
+    )
+
+
+@app.route("/projects", methods=["GET"])
+def projects_page():
+    docker_snapshot, projects = professional_ui_snapshot()
+    return render_professional_page(
+        PROJECTS,
+        "Projects",
+        "projects",
+        projects=projects,
+        unmanaged_projects=discover_unmanaged_glpi_projects(
+            docker_snapshot["containers"], projects
+        ),
+    )
+
+
+@app.route("/projects/new", methods=["GET"])
+def new_project_page():
+    backup_choices = (
+        demo_backup_choices()
+        if test_demo_is_active()
+        else scan_backup_choices(BACKUP_ROOT, include_dirs=True)
+    )
+    docker_snapshot, _projects = professional_ui_snapshot()
+    return render_professional_page(
+        WIZARD,
+        "New project",
+        "projects",
+        backup_root=(
+            "/demo-only/backups"
+            if test_demo_is_active()
+            else str(BACKUP_ROOT)
+        ),
         db_backups=backup_choices["database"],
         file_backups=backup_choices["files"],
         glpi_images=local_image_tags("glpi", docker_snapshot["image_tags"]),
         db_images=local_image_tags("database", docker_snapshot["image_tags"]),
-        suggested_host_port=suggest_free_host_port(containers=docker_snapshot["containers"]),
+        suggested_host_port=suggest_free_host_port(
+            containers=docker_snapshot["containers"]
+        ),
         tz_default=TZ_DEFAULT,
-        ui_preview_mode=UI_PREVIEW_MODE,
+        demo_mode=test_demo_is_active(),
     )
 
 
-app.view_functions["index"] = v11_index
+@app.route("/projects/<project>", methods=["GET"])
+def project_detail_page(project):
+    project = validate_project(project)
+    _docker_snapshot, projects = professional_ui_snapshot()
+    selected = next((item for item in projects if item["name"] == project), None)
+    if not selected:
+        abort(404)
+    return render_professional_page(
+        PROJECT_DETAIL,
+        project,
+        "projects",
+        project=selected,
+    )
+
+
+@app.route("/projects/<project>/compose", methods=["GET"])
+def project_compose_page(project):
+    project = validate_project(project)
+    _docker_snapshot, projects = professional_ui_snapshot()
+    if not any(item["name"] == project for item in projects):
+        abort(404)
+    selected = next(item for item in projects if item["name"] == project)
+    if selected.get("simulated") and test_demo_is_active():
+        compose_yaml = sanitized_compose_yaml(demo_compose_yaml(project))
+    else:
+        path = compose_file(project)
+        if not path.is_file():
+            abort(404)
+        compose_yaml = sanitized_compose_yaml(path.read_text(encoding="utf-8"))
+    if request.args.get("download") == "1":
+        response = make_response(compose_yaml)
+        response.headers["Content-Type"] = "application/yaml; charset=utf-8"
+        response.headers["Content-Disposition"] = (
+            f'attachment; filename="{project}-docker-compose.sanitized.yml"'
+        )
+        return response
+    return render_professional_page(
+        COMPOSE_VIEW,
+        f"{project} YAML",
+        "projects",
+        project=project,
+        compose_yaml=compose_yaml,
+    )
+
+
+@app.route("/backups", methods=["GET"])
+def backups_page():
+    backup_choices = (
+        demo_backup_choices()
+        if test_demo_is_active()
+        else scan_backup_choices(BACKUP_ROOT, include_dirs=True)
+    )
+    _docker_snapshot, projects = professional_ui_snapshot()
+    inventory = backup_inventory(
+        backup_choices["database"],
+        backup_choices["files"],
+        demo=test_demo_is_active(),
+    )
+    dispatcher = read_simple_env_file(BACKUP_STATE_DIR / "dispatcher.env")
+    dispatcher_epoch = int(dispatcher.get("LAST_HEARTBEAT", "0") or 0)
+    return render_professional_page(
+        BACKUPS,
+        "Backups",
+        "backups",
+        projects=projects,
+        backup_root=(
+            "/demo-only/backups"
+            if test_demo_is_active()
+            else str(BACKUP_ROOT)
+        ),
+        db_backups=backup_choices["database"],
+        file_backups=backup_choices["files"],
+        inventory=inventory,
+        complete_pairs=len({
+            item["pair_key"] for item in inventory if item["complete_pair"]
+        }),
+        verified_at=(
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            if request.args.get("verify") == "1" else ""
+        ),
+        stale_days=BACKUP_STALE_DAYS,
+        dispatcher_command=f"/bin/bash {BACKUP_DISPATCHER_PATH}",
+        dispatcher_healthy=bool(
+            test_demo_is_active()
+            or (dispatcher_epoch and time.time() - dispatcher_epoch < 1200)
+        ),
+        legacy_backup_config=(
+            not test_demo_is_active()
+            and BACKUP_ENV_PATH.is_file()
+        ),
+    )
+
+
+def recent_activity(projects, selected_project=None, limit=80):
+    activity = []
+    for project in projects:
+        if selected_project and project["name"] != selected_project:
+            continue
+        for filename in list_logs(project["name"], limit=20):
+            match = re.match(
+                r"^(?P<date>[0-9]{8})-(?P<time>[0-9]{6})-(?P<action>.+)\.log$",
+                filename,
+            )
+            label = filename
+            shown_time = ""
+            if match:
+                action = match.group("action").replace("-", " ").replace("_", " ")
+                label = action.capitalize()
+                try:
+                    stamp = datetime.strptime(
+                        match.group("date") + match.group("time"), "%Y%m%d%H%M%S"
+                    )
+                    shown_time = stamp.strftime("%Y-%m-%d %H:%M")
+                except ValueError:
+                    pass
+            activity.append({
+                "project": project["name"],
+                "filename": filename,
+                "label": label,
+                "time": shown_time,
+            })
+    return sorted(
+        activity, key=lambda item: item["filename"], reverse=True
+    )[:limit]
+
+
+@app.route("/activity", methods=["GET"])
+def activity_page():
+    selected_project = request.args.get("project", "").strip() or None
+    if selected_project:
+        selected_project = validate_project(selected_project)
+    _docker_snapshot, projects = professional_ui_snapshot()
+    if test_demo_is_active():
+        activities = [
+            {
+                "project": "demo-production",
+                "filename": "20260727-201500-demo-action.log",
+                "label": "Scheduled backup completed",
+                "time": "2026-07-27 20:15",
+                "simulated": True,
+            },
+            {
+                "project": "demo-staging",
+                "filename": "20260727-200100-health-check.log",
+                "label": "Health check passed",
+                "time": "2026-07-27 20:01",
+                "simulated": True,
+            },
+            {
+                "project": "demo-recovery",
+                "filename": "20260727-194500-diagnostics.log",
+                "label": "Diagnostics found a stopped GLPI container",
+                "time": "2026-07-27 19:45",
+                "simulated": True,
+            },
+        ]
+        if selected_project:
+            activities = [
+                item for item in activities
+                if item["project"] == selected_project
+            ]
+    else:
+        activities = recent_activity(projects, selected_project)
+    return render_professional_page(
+        ACTIVITY,
+        "Activity",
+        "activity",
+        activities=activities,
+        selected_project=selected_project,
+    )
+
+
+@app.route("/settings", methods=["GET"])
+def settings_page():
+    auth = {
+        "username": AUTH_CONFIG.username,
+        "idle_minutes": AUTH_CONFIG.session_timeout_seconds // 60,
+        "absolute_hours": AUTH_CONFIG.session_absolute_timeout_seconds // 3600,
+    }
+    return render_professional_page(
+        SETTINGS,
+        "Settings",
+        "settings",
+        auth=auth,
+        base_path=str(BASE_PATH),
+        backup_root=str(BACKUP_ROOT),
+        tz_default=TZ_DEFAULT,
+        cookie_secure=app.config["SESSION_COOKIE_SECURE"],
+        glpi_prefixes=ALLOWED_GLPI_IMAGES,
+        db_prefixes=ALLOWED_DB_IMAGES,
+        request_line_limit=APACHE_REQUEST_LINE_LIMIT,
+        request_line_kib=APACHE_REQUEST_LINE_LIMIT // 1024,
+        glpi_internal_port=GLPI_INTERNAL_PORT,
+        default_cookie_samesite=DEFAULT_SESSION_COOKIE_SAMESITE,
+        default_cookie_secure=DEFAULT_SESSION_COOKIE_SECURE,
+        max_scan_entries=MAX_SCAN_ENTRIES,
+        operation_modes=OPERATION_MODES,
+    )
 
 
 @app.after_request

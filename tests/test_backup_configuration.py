@@ -40,6 +40,7 @@ class BackupConfigurationTest(unittest.TestCase):
             encoding="utf-8",
         )
         source = Path(module.__file__).resolve().parent / "backup" / "GLPI_backup.sh"
+        dispatcher_source = Path(module.__file__).resolve().parent / "backup" / "GLPI_backup_dispatcher.sh"
         self.patches = (
             patch.object(module, "BASE_PATH", self.base_path),
             patch.object(module, "BACKUP_ROOT", self.backup_root),
@@ -48,6 +49,10 @@ class BackupConfigurationTest(unittest.TestCase):
             patch.object(module, "BACKUP_SCRIPT_PATH", self.task_dir / "GLPI_backup.sh"),
             patch.object(module, "BACKUP_ENV_PATH", self.task_dir / "GLPI_backup.env"),
             patch.object(module, "BACKUP_CNF_PATH", self.task_dir / "GLPI_mysql_backup.cnf"),
+            patch.object(module, "BACKUP_DISPATCHER_SOURCE", dispatcher_source),
+            patch.object(module, "BACKUP_DISPATCHER_PATH", self.task_dir / "GLPI_backup_dispatcher.sh"),
+            patch.object(module, "BACKUP_PROJECTS_DIR", self.task_dir / "projects"),
+            patch.object(module, "BACKUP_STATE_DIR", self.task_dir / "state"),
             patch.object(module, "database_container_for_project", return_value="glpi-prod-mdb1222"),
         )
         for context in self.patches:
@@ -63,15 +68,16 @@ class BackupConfigurationTest(unittest.TestCase):
     def test_configuration_tracks_project_without_hardcoded_folder_name(self):
         messages = module.configure_scheduled_backup(self.project)
 
-        config = module.read_simple_env_file(module.BACKUP_ENV_PATH)
+        config = module.read_simple_env_file(module.backup_schedule_path(self.project))
         self.assertEqual(config["PROJECT_NAME"], self.project)
         self.assertEqual(config["PROJECT_DIR"], str(self.base_path / self.project))
         self.assertEqual(config["DB_CONTAINER"], "glpi-prod-mdb1222")
         self.assertEqual(config["DB_NAME"], "glpi")
         self.assertEqual(config["RETENTION_DAYS"], "60")
         self.assertEqual(module.current_backup_source_project(), self.project)
-        self.assertEqual(os.stat(module.BACKUP_ENV_PATH).st_mode & 0o777, 0o600)
+        self.assertEqual(os.stat(module.backup_schedule_path(self.project)).st_mode & 0o777, 0o600)
         self.assertEqual(os.stat(module.BACKUP_SCRIPT_PATH).st_mode & 0o777, 0o750)
+        self.assertEqual(os.stat(module.BACKUP_DISPATCHER_PATH).st_mode & 0o777, 0o750)
         self.assertTrue(any("Task Scheduler command" in message for message in messages))
 
     def test_existing_unmanaged_script_is_preserved_once(self):
@@ -87,8 +93,8 @@ class BackupConfigurationTest(unittest.TestCase):
     def test_backup_status_reports_readiness_and_latest_verified_backup(self):
         module.configure_scheduled_backup(self.project)
         module.BACKUP_CNF_PATH.write_text("[client]\nuser=root\n", encoding="utf-8")
-        backup = self.backup_root / "GLPI_Backup_20260711-120000"
-        backup.mkdir()
+        backup = self.backup_root / self.project / "GLPI_Backup_20260711-120000"
+        backup.mkdir(parents=True)
         (backup / "BACKUP_INFO").write_text(
             "PROJECT_NAME=glpi-production\nCREATED_AT=2026-07-11T12:00:00+0200\n",
             encoding="utf-8",
@@ -155,7 +161,7 @@ class BackupConfigurationTest(unittest.TestCase):
         self.assertIn("TEMP_BACKUP_DIR", source)
         self.assertIn('tar -C "$PROJECT_DIR"', source)
         self.assertIn("SHA256SUMS", source)
-        self.assertIn('find "$BACKUP_ROOT"', source)
+        self.assertIn('find "$PROJECT_BACKUP_ROOT"', source)
 
     @unittest.skipUnless(hasattr(os, "geteuid") and os.geteuid() == 0, "requires an isolated root test container")
     def test_backup_script_runs_end_to_end_with_portable_archive(self):
@@ -214,7 +220,9 @@ class BackupConfigurationTest(unittest.TestCase):
                 result = subprocess.run(["bash", str(script)], capture_output=True, text=True, env=environment)
                 self.assertEqual(result.returncode, 0, result.stderr)
 
-                backup_directories = list(isolated_backups.glob("GLPI_Backup_*"))
+                backup_directories = list(
+                    (isolated_backups / "glpi-backup-script-test").glob("GLPI_Backup_*")
+                )
                 self.assertEqual(len(backup_directories), 1)
                 backup = backup_directories[0]
                 self.assertGreater((backup / "glpi-database.sql").stat().st_size, 0)

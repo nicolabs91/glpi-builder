@@ -25,10 +25,11 @@ required = [
     '@app.route("/run-backup", methods=["POST"])',
     "subprocess.Popen(",
     "is_managed_glpi_project(",
-    "atomic_write_text(BACKUP_ENV_PATH",
-    "if not UI_PREVIEW_MODE:",
+    "atomic_write_text(backup_schedule_path(project)",
+    "atomic_write_text(BACKUP_DISPATCHER_PATH",
+    "if not BUILDER_TEST_PREVIEW_MODE:",
     "def require_admin_authentication():",
-    'request.endpoint in {"healthz", "favicon", "login", "setup"}',
+    'request.endpoint in {"healthz", "favicon", "login", "setup", "ui_javascript"}',
     "authenticated_session_is_current()",
     "write_last_totp_counter(counter)",
     "LOGIN_RATE_MAX_BUCKETS = 1024",
@@ -61,6 +62,8 @@ installer_required = [
     'scripts/provision_admin.py" --env "$APP_DIR/.env" --check',
     'docker compose --project-name "$COMPOSE_PROJECT"',
     'up -d --no-build --force-recreate',
+    'backup/GLPI_backup_dispatcher.sh" "$BACKUP_DISPATCHER"',
+    'Fixed Task Scheduler command: /bin/bash $BACKUP_DISPATCHER',
     "previous container remains stopped",
 ]
 missing_installer = [item for item in installer_required if item not in installer_source]

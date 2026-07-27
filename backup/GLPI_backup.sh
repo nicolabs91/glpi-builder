@@ -43,13 +43,14 @@ fi
 RUNNING=$("${DOCKER[@]}" inspect --format '{{.State.Running}}' "$DB_CONTAINER")
 [ "$RUNNING" = "true" ] || fail "Database container is not running: $DB_CONTAINER"
 
-mkdir -p "$BACKUP_ROOT"
+PROJECT_BACKUP_ROOT="$BACKUP_ROOT/$PROJECT_NAME"
+mkdir -p "$PROJECT_BACKUP_ROOT"
 LOCK_DIR="$SCRIPT_DIR/.GLPI_backup.lock"
 mkdir "$LOCK_DIR" 2>/dev/null || fail "Another GLPI backup is already running"
 
 STAMP=$(date +%Y%m%d-%H%M%S)
-BACKUP_DIR="$BACKUP_ROOT/GLPI_Backup_$STAMP"
-TEMP_BACKUP_DIR="$BACKUP_ROOT/.GLPI_Backup_$STAMP.partial.$$"
+BACKUP_DIR="$PROJECT_BACKUP_ROOT/GLPI_Backup_$STAMP"
+TEMP_BACKUP_DIR="$PROJECT_BACKUP_ROOT/.GLPI_Backup_$STAMP.partial.$$"
 CNF_COPIED=0
 
 cleanup() {
@@ -101,7 +102,7 @@ mv "$TEMP_BACKUP_DIR" "$BACKUP_DIR"
 TEMP_BACKUP_DIR=""
 
 echo "Removing GLPI backups older than $RETENTION_DAYS days..."
-find "$BACKUP_ROOT" \
+find "$PROJECT_BACKUP_ROOT" \
   -mindepth 1 \
   -maxdepth 1 \
   -type d \

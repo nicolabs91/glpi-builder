@@ -10,6 +10,7 @@ LEGACY_CONTAINER="glpi-project-builder-full-restore"
 STATE_FILE="$APP_DIR/.last-install-state"
 BACKUP_TASK_DIR="/volume1/docker/_BACKUPS/Restore_Scripts/GLPI"
 BACKUP_SCRIPT="$BACKUP_TASK_DIR/GLPI_backup.sh"
+BACKUP_DISPATCHER="$BACKUP_TASK_DIR/GLPI_backup_dispatcher.sh"
 
 cd "$APP_DIR"
 
@@ -30,7 +31,7 @@ if [ -z "$CURRENT_SECRET" ] || [ "$CURRENT_SECRET" = "CHANGE_ME_RANDOM_64_HEX" ]
 fi
 chmod 600 .env
 
-# Releases before 0.3.4 stored the PBKDF2 hash without quotes. Docker Compose
+# Older installations may store the PBKDF2 hash without quotes. Docker Compose
 # then treated its "$" separators as variable references and passed a broken
 # hash to the container, making /healthz return 503. Migrate it in place while
 # preserving the exact hash.
@@ -68,9 +69,11 @@ if [ -f "$BACKUP_SCRIPT" ] && ! sudo grep -Eq "Managed by GLPI (Project )?Builde
   fi
 fi
 sudo cp "$APP_DIR/backup/GLPI_backup.sh" "$BACKUP_SCRIPT"
-sudo chmod 750 "$BACKUP_SCRIPT"
+sudo cp "$APP_DIR/backup/GLPI_backup_dispatcher.sh" "$BACKUP_DISPATCHER"
+sudo chmod 750 "$BACKUP_SCRIPT" "$BACKUP_DISPATCHER"
 echo "Backup script installed: $BACKUP_SCRIPT"
-echo "Fixed Task Scheduler command: /bin/bash $BACKUP_SCRIPT"
+echo "Backup dispatcher installed: $BACKUP_DISPATCHER"
+echo "Fixed Task Scheduler command: /bin/bash $BACKUP_DISPATCHER"
 
 sudo docker build -t "$IMAGE" .
 sudo docker run --rm "$IMAGE" docker --version
@@ -79,7 +82,7 @@ sudo docker run --rm "$IMAGE" python tests/test_static_security.py
 
 OLD_NAME=""
 if sudo docker container inspect "$CONTAINER" >/dev/null 2>&1; then
-  OLD_NAME="${CONTAINER}-pre-v11-$(date +%Y%m%d-%H%M%S)"
+  OLD_NAME="${CONTAINER}-pre-upgrade-$(date +%Y%m%d-%H%M%S)"
   sudo docker stop "$CONTAINER" >/dev/null 2>&1 || true
   sudo docker rename "$CONTAINER" "$OLD_NAME"
 elif sudo docker container inspect "$LEGACY_CONTAINER" >/dev/null 2>&1; then

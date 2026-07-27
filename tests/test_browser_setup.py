@@ -66,6 +66,31 @@ class BrowserSetupTest(unittest.TestCase):
         session_cookie = response.headers.get("Set-Cookie", "")
         self.assertIn("glpi_builder_session=", session_cookie)
         self.assertNotIn("; Secure", session_cookie)
+        self.assertIn(b'pattern="[A-Za-z0-9_.\\-]{3,64}"', response.data)
+
+    def test_setup_explains_single_synology_scheduler_task(self):
+        response = self.client.get("/setup")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"Scheduled backups", response.data)
+        self.assertIn(b"Control Panel", response.data)
+        self.assertIn(b"Task Scheduler", response.data)
+        self.assertIn(b"User-defined script", response.data)
+        self.assertIn(b"every <strong>5 minutes</strong>", response.data)
+        self.assertIn(b"Copy command", response.data)
+        self.assertIn(
+            b"/bin/bash /volume1/docker/_BACKUPS/Restore_Scripts/GLPI/GLPI_backup_dispatcher.sh",
+            response.data,
+        )
+        self.assertIn(b"Optional now", response.data)
+        self.assertIn(b"Check task status", response.data)
+        self.assertIn(b'<script src="/assets/app.js" defer></script>', response.data)
+        script = self.client.get("/assets/app.js")
+        self.assertEqual(script.status_code, 200)
+        self.assertIn(b"data-copy-command", script.data)
+
+    def test_setup_head_request_is_read_only(self):
+        response = self.client.head("/setup")
+        self.assertEqual(response.status_code, 200)
 
     def test_setup_rejects_bad_csrf_password_confirmation_and_totp(self):
         self.client.get("/setup")

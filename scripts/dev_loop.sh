@@ -20,15 +20,17 @@ trap cleanup EXIT INT TERM
 
 cd "$ROOT"
 mkdir -p "$TEMP_ROOT/_BACKUPS"
+cp docker-compose.app.yml "$TEMP_ROOT/docker-compose.app.yml"
+cp .env.example "$TEMP_ROOT/.env"
 
 echo "[1/6] Checking Python syntax"
-python3 -m py_compile app.py auth_security.py scripts/provision_admin.py tests/*.py
+python3 -m py_compile app.py app_ui.py auth_security.py scripts/provision_admin.py tests/*.py
 
 echo "[2/6] Checking locked YAML sources"
 python3 tests/test_yaml_contract.py
 
 echo "[3/6] Validating Builder Compose"
-docker compose -f docker-compose.app.yml config --quiet
+docker compose -f "$TEMP_ROOT/docker-compose.app.yml" config --quiet
 
 echo "[4/6] Building a clean Docker image"
 docker build --pull -t "$IMAGE" .

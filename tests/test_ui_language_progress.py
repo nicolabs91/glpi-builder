@@ -26,7 +26,7 @@ class UiLanguageAndProgressTest(unittest.TestCase):
         authenticate(self.client, module)
 
     def test_dashboard_is_english(self):
-        self.assertEqual(module.APP_VERSION, "0.1.2-rc.2")
+        self.assertEqual(module.APP_VERSION, "0.3.0")
         with patch.object(module, "discover_projects", return_value=[]), \
              patch.object(module, "scan_backup_choices", return_value={"database": [], "files": []}), \
              patch.object(module, "suggest_free_host_port", return_value=18888), \
@@ -34,55 +34,20 @@ class UiLanguageAndProgressTest(unittest.TestCase):
             response = self.client.get("/")
 
         self.assertEqual(response.status_code, 200)
+        self.assertIn(b"Infrastructure overview", response.data)
         self.assertIn(b"Projects", response.data)
-        self.assertIn(b"New Project or Restore", response.data)
-        self.assertEqual(response.data.count(b"New Project or Restore"), 1)
-        self.assertNotIn(b"New project or restore", response.data)
-        self.assertIn(b"<h3>Project</h3>", response.data)
-        self.assertIn(b"<h3>Versions</h3>", response.data)
-        self.assertIn(b"<h3>Mode and required backups</h3>", response.data)
-        self.assertIn(b"<h3>Review and execute</h3>", response.data)
-        self.assertNotIn(b"<h3>1. Project</h3>", response.data)
-        self.assertNotIn(b"<h3>2. Versions</h3>", response.data)
-        self.assertNotIn(b"<h3>3. Mode and required backups</h3>", response.data)
-        self.assertNotIn(b"<h3>4. Review and execute</h3>", response.data)
-        self.assertNotIn(b'href="#new-project"', response.data)
-        self.assertIn(b"Review plan", response.data)
-        self.assertIn(b'class="review-button">Review plan', response.data)
-        self.assertIn(b".review-button{margin-top:16px}", response.data)
-        self.assertIn(b"row row-project", response.data)
-        self.assertIn(b"row row-settings", response.data)
-        self.assertIn(b'name="host_port" min="1" max="65535" value="18888"', response.data)
-        self.assertIn(b"compact-control", response.data)
+        self.assertIn(b"Backups", response.data)
+        self.assertIn(b"Activity", response.data)
+        self.assertIn(b"Settings", response.data)
+        self.assertIn(b'href="/projects/new"', response.data)
+        self.assertIn(b"New project", response.data)
+        self.assertIn(b'aria-label="Primary"', response.data)
+        self.assertIn(b'aria-label="Mobile navigation"', response.data)
         self.assertIn(b"font:inherit", response.data)
-        self.assertIn(b'value="restore" checked', response.data)
-        self.assertIn(b"Full restore", response.data)
-        self.assertIn(b"Fresh installation", response.data)
-        self.assertNotIn(b"Full restore (standard)", response.data)
-        self.assertNotIn(b"Fresh installation (rare)", response.data)
-        self.assertIn(b"Restore without plugins", response.data)
-        self.assertIn(b"Overwrite existing project", response.data)
-        self.assertIn(b'name="update_backup_source" value="yes"', response.data)
-        self.assertNotIn(b'name="update_backup_source" value="yes" checked', response.data)
-        self.assertIn(b"Use this project for scheduled backups", response.data)
-        self.assertIn(b'class="overwrite-confirmation"', response.data)
-        self.assertIn(b".overwrite-confirmation{display:none}", response.data)
-        self.assertIn(b"#overwrite-existing:checked", response.data)
-        self.assertIn(b"Type the project name to confirm overwrite", response.data)
-        self.assertNotIn(b"For an existing project, type the project name to confirm", response.data)
-        self.assertNotIn(b"I understand that an existing project name", response.data)
-        self.assertIn(b'class="version">0.1.2-rc.2</div>', response.data)
-        self.assertNotIn(b"internal administration tool", response.data)
-        self.assertNotIn(b"Status, web port and recent administration activity", response.data)
-        self.assertNotIn(b"Complete these four steps", response.data)
-        self.assertNotIn(b"Used in normal operation", response.data)
-        self.assertNotIn(b"Deletes database, config, files and plugins", response.data)
-        self.assertNotIn(b"Full restore is the default", response.data)
-        self.assertNotIn(b"GLPI config and files are restored", response.data)
-        self.assertNotIn(b"Nothing is changed until", response.data)
+        self.assertIn(b'class="version">0.3.0</span>', response.data)
         self.assertIn(b'<html lang="en">', response.data)
 
-    def test_project_card_uses_the_native_management_section_without_manage_link(self):
+    def test_project_management_is_moved_to_project_detail(self):
         project = type(
             "Project",
             (),
@@ -137,29 +102,10 @@ class UiLanguageAndProgressTest(unittest.TestCase):
             response = self.client.get("/")
 
         self.assertEqual(response.status_code, 200)
-        self.assertIn(b"Project management", response.data)
-        self.assertIn(b"Backup ready", response.data)
-        self.assertIn(b"Run backup now", response.data)
-        self.assertIn(b"GLPI_Backup_20260711-120000", response.data)
-        self.assertNotIn(b"Not selected", response.data)
-        self.assertIn(b"Backup source", response.data)
-        self.assertLess(response.data.index(b"Backup source"), response.data.index(b"Web port:"))
-        self.assertLess(response.data.index(b"Project management"), response.data.index(b"Scheduled backup"))
-        self.assertIn(b"Use for scheduled backups", response.data)
-        self.assertIn(b"Recreate GLPI container", response.data)
-        self.assertNotIn(b"Reapply GLPI container", response.data)
-        self.assertIn(b"Change port + recreate container", response.data)
-        self.assertNotIn(b">Apply port</button>", response.data)
-        self.assertIn(b'id="manage-glpi-existing"', response.data)
-        self.assertNotIn(b'href="#manage-glpi-existing"', response.data)
-        self.assertIn(
-            b'details[id^="manage-"] button{padding:7px 10px;font-size:13px;border-radius:7px}',
-            response.data,
-        )
-        self.assertIn(
-            b'details[id^="manage-"] > form + form{margin-top:6px}',
-            response.data,
-        )
+        self.assertIn(b"glpi-existing", response.data)
+        self.assertIn(b'href="/projects/glpi-existing"', response.data)
+        self.assertNotIn(b"/change-port", response.data)
+        self.assertNotIn(b"/resetdb", response.data)
 
     def test_running_progress_page_refreshes_and_lists_real_stage(self):
         token = module.create_progress_job("glpi-progress-test", module.BACKUP_ROOT)
@@ -176,19 +122,14 @@ class UiLanguageAndProgressTest(unittest.TestCase):
         self.assertIn(b'http-equiv="refresh"', response.data)
         self.assertIn(b"Restoring database", response.data)
         self.assertIn(b"57%", response.data)
-        self.assertIn(b"<div>0.1.2-rc.2</div>", response.data)
+        self.assertIn(b"<div>0.3.0</div>", response.data)
         self.assertNotIn(b"0.2 \xc2\xb7 project", response.data)
 
-    def test_local_ui_preview_button_is_explicitly_gated(self):
-        with patch.object(module, "UI_PREVIEW_MODE", True), \
-             patch.object(module, "discover_projects", return_value=[]), \
-             patch.object(module, "scan_backup_choices", return_value={"database": [], "files": []}), \
-             patch.object(module, "local_image_tags", side_effect=lambda kind, *_: ["glpi/glpi:test"] if kind == "glpi" else ["mariadb:test"]):
-            response = self.client.get("/")
-
+    def test_obsolete_local_ui_preview_button_is_absent(self):
+        response = self.client.get("/projects/new")
         self.assertEqual(response.status_code, 200)
-        self.assertIn(b'href="/ui-preview"', response.data)
-        self.assertIn(b"Preview review screen", response.data)
+        self.assertNotIn(b"/ui-preview", response.data)
+        self.assertNotIn(b"Preview review screen", response.data)
 
     def test_first_free_docker_port_is_suggested(self):
         class Containers:

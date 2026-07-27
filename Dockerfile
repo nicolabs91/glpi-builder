@@ -25,6 +25,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
+COPY app_ui.py .
 COPY auth_security.py .
 COPY docker-compose.app.yml .
 COPY install_on_synology.sh .

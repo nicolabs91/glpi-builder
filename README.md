@@ -1,4 +1,4 @@
-# GLPI Builder v11 for Synology
+# GLPI Builder 0.3 for Synology
 
 GLPI Builder creates and restores internal GLPI Docker projects on a
 Synology NAS. This version was developed for a Synology RS822RP+ with projects
@@ -30,8 +30,9 @@ rate limited per source address and globally.
 
 ## Features
 
-- English dashboard for managed GLPI projects plus read-only discovery and
-  rejection reasons for existing GLPI Compose projects;
+- professional multi-page console with Overview, Projects, Backups, Activity,
+  Settings, project details, and a guided create/restore wizard;
+- read-only discovery and rejection reasons for existing GLPI Compose projects;
 - strict GLPI project discovery: unrelated Docker directories and generic
   `.env` files are excluded;
 - guided full-restore and fresh-installation flow;
@@ -51,8 +52,10 @@ rate limited per source address and globally.
   project is created or rebuilt;
 - GLPI container reapplication, database check, and diagnostics;
 - only one mutating administration action at a time;
-- central Synology backup script with locking, atomic publication, checksums,
-  and 60-day retention by default;
+- independent scheduled-backup settings per project, executed serially by one
+  central Synology Task Scheduler dispatcher;
+- backup scripts with locking, atomic publication, checksums, project-specific
+  storage, and configurable retention;
 - backup readiness under **Project management**, with actionable warnings,
   latest successful backup time, size, and checksum-manifest status;
 - **Run backup now** as a monitored background job using the same script as
@@ -66,7 +69,8 @@ rate limited per source address and globally.
 ## Requirements
 
 - Synology DSM with Container Manager/Docker and a working Docker CLI;
-- SSH access to the NAS and an account permitted to use `sudo`;
+- SSH access and an account permitted to use `sudo` for the classic installer,
+  or Synology Container Manager and File Station for the graphical installer;
 - project storage below `/volume1/docker`;
 - backups below `/volume1/docker/_BACKUPS`;
 - the required GLPI and MariaDB/MySQL images must already exist locally on the
@@ -184,6 +188,10 @@ graphical first installation:
 6. Open `http://NAS-IP:5055/setup`, enter the setup token, create the
    administrator password, add the displayed Base32 secret to an authenticator
    app, and confirm the current six-digit code.
+7. Follow the optional **Scheduled backups** step. It shows the exact
+   user-defined DSM Task Scheduler command, the required root/five-minute
+   schedule, a copy button, and live task-detection status. This step can be
+   completed later from **Backups** without weakening account setup.
 
 The random setup token is printed only in the container log and changes after
 an unconfigured restart, preventing another LAN client from claiming the first
@@ -297,23 +305,31 @@ The installer automatically copies the bundled script to:
 On the first installation, an existing unmanaged `GLPI_backup.sh` is preserved
 once as `GLPI_backup.pre-builder.sh`. The managed script receives mode `750`.
 
-For an existing project, select **Use for scheduled backups**. For a new
-restore, leave **Use this project for scheduled backups** enabled. The Builder
-then atomically writes:
+Each managed project can have its own enabled/disabled schedule, frequency,
+start time and retention period. The Builder stores those configurations
+atomically below:
 
 ```text
-/volume1/docker/_BACKUPS/Restore_Scripts/GLPI/GLPI_backup.env
+/volume1/docker/_BACKUPS/Restore_Scripts/GLPI/projects/<project>.env
 ```
 
-This file receives mode `600` and contains the current project path, database
-container, database name, and retention period. Only one project can be the
-active scheduled backup source at a time.
+Files receive mode `600`. Existing installations using the former single
+`GLPI_backup.env` file are migrated automatically to a daily 02:00 schedule
+without losing their selected project. The legacy file remains as a
+compatibility fallback until the existing DSM task has been changed to the
+dispatcher command.
 
-The selected project receives a green **Backup source** badge above its web
-port. Under **Project management > Scheduled backup**, it shows **Backup ready**
-only when the managed script, backup environment, MariaDB credential file, GLPI
-data directories, and running database container are all present. Otherwise it
-shows **Needs attention** with the exact missing requirements.
+Create one user-defined DSM Task Scheduler task, run it as root every five
+minutes, and use:
+
+```sh
+/bin/bash /volume1/docker/_BACKUPS/Restore_Scripts/GLPI/GLPI_backup_dispatcher.sh
+```
+
+The dispatcher checks which projects are due and runs them sequentially. It
+writes heartbeat and per-project result state for the Builder UI. A separate
+DSM task per project is not needed. Backups are kept in project-specific
+folders below the backup root, preventing projects from mixing their sets.
 
 The Builder does not create or modify `GLPI_mysql_backup.cnf`. Ensure that this
 file already exists:
@@ -336,14 +352,8 @@ Restrict access to this file:
 sudo chmod 600 /volume1/docker/_BACKUPS/Restore_Scripts/GLPI/GLPI_mysql_backup.cnf
 ```
 
-Create one task in Synology Task Scheduler with this fixed command:
-
-```sh
-/bin/bash /volume1/docker/_BACKUPS/Restore_Scripts/GLPI/GLPI_backup.sh
-```
-
-When **Project management > Scheduled backup** reports **Backup ready**, **Run
-backup now** starts this same script as a monitored background task. The
+When a project's backup configuration reports **Backup ready**, **Run backup
+now** starts the managed backup script as a monitored background task. The
 progress page shows the current phase, output, completion state, and action log.
 Manual backups use the same global administration lock as restores, so two
 mutating operations cannot run at the same time.
