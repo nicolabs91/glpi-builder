@@ -29,7 +29,7 @@ from auth_security import (
     verify_password,
 )
 
-APP_VERSION = "0.1.2-rc.1"
+APP_VERSION = "0.1.2-rc.2"
 UI_PREVIEW_MODE = os.environ.get("UI_PREVIEW_MODE", "0").strip().lower() in {"1", "true", "yes", "on"}
 APP_PORT = int(os.environ.get("APP_PORT", "8080"))
 BASE_PATH = Path(os.environ.get("BASE_PATH", "/volume1/docker"))
@@ -191,7 +191,12 @@ app.config.update(
     SESSION_COOKIE_NAME="glpi_builder_session",
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Strict",
-    SESSION_COOKIE_SECURE=AUTH_CONFIG.cookie_secure if AUTH_CONFIG else True,
+    SESSION_COOKIE_SECURE=(
+        AUTH_CONFIG.cookie_secure
+        if AUTH_CONFIG
+        else os.environ.get("BUILDER_SESSION_COOKIE_SECURE", "false").strip().lower()
+        in {"1", "true", "yes", "on"}
+    ),
 )
 
 LOGIN_RATE_LOCK = threading.Lock()

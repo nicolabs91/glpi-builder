@@ -60,6 +60,13 @@ class BrowserSetupTest(unittest.TestCase):
         self.assertGreaterEqual(len(persisted["FLASK_SECRET_KEY"]), 64)
         self.assertEqual(self.client.get("/setup").status_code, 404)
 
+    def test_http_setup_cookie_is_not_forced_secure(self):
+        self.assertFalse(module.app.config["SESSION_COOKIE_SECURE"])
+        response = self.client.get("/setup")
+        session_cookie = response.headers.get("Set-Cookie", "")
+        self.assertIn("glpi_builder_session=", session_cookie)
+        self.assertNotIn("; Secure", session_cookie)
+
     def test_setup_rejects_bad_csrf_password_confirmation_and_totp(self):
         self.client.get("/setup")
         with self.client.session_transaction() as setup_session:
