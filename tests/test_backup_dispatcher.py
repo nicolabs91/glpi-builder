@@ -16,13 +16,15 @@ class BackupDispatcherTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.root = Path(self.temp.name)
-        self.task = self.root / "tasks"
+        self.task = self.root / "Restore_Scripts" / "GLPI"
+        self.scheduler = self.root / "Synology_task_scheduler"
         self.projects = self.task / "projects"
         self.state = self.task / "state"
         self.projects.mkdir(parents=True)
         self.state.mkdir()
+        self.scheduler.mkdir()
         source_root = Path(module.__file__).resolve().parent / "backup"
-        self.dispatcher = self.task / "GLPI_backup_dispatcher.sh"
+        self.dispatcher = self.scheduler / "GLPI_backup_dispatcher.sh"
         self.dispatcher.write_text(
             (source_root / "GLPI_backup_dispatcher.sh").read_text(encoding="utf-8"),
             encoding="utf-8",
@@ -57,7 +59,10 @@ class BackupDispatcherTest(unittest.TestCase):
     def test_dispatcher_runs_all_due_projects_serially_and_records_state(self):
         self.write_schedule("glpi-one")
         self.write_schedule("glpi-two")
-        subprocess.run(["/bin/bash", str(self.dispatcher)], check=True)
+        subprocess.run(
+            ["/bin/bash", str(self.dispatcher)],
+            check=True,
+        )
         self.assertEqual(
             (self.root / "runs").read_text(encoding="utf-8").splitlines(),
             ["glpi-one", "glpi-two"],
@@ -82,7 +87,7 @@ class BackupDispatcherTest(unittest.TestCase):
 
     def test_existing_dispatcher_lock_prevents_overlapping_run(self):
         self.write_schedule("glpi-one")
-        (self.task / ".GLPI_dispatcher.lock").mkdir()
+        (self.scheduler / ".GLPI_dispatcher.lock").mkdir()
         result = subprocess.run(
             ["/bin/bash", str(self.dispatcher)],
             check=True,

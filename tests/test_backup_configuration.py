@@ -30,6 +30,7 @@ class BackupConfigurationTest(unittest.TestCase):
         self.base_path = self.root / "docker"
         self.backup_root = self.base_path / "_BACKUPS"
         self.task_dir = self.backup_root / "Restore_Scripts" / "GLPI"
+        self.scheduler_dir = self.backup_root / "Synology_task_scheduler"
         self.project = "glpi-production"
         project_path = self.base_path / self.project
         (project_path / "db").mkdir(parents=True)
@@ -45,12 +46,13 @@ class BackupConfigurationTest(unittest.TestCase):
             patch.object(module, "BASE_PATH", self.base_path),
             patch.object(module, "BACKUP_ROOT", self.backup_root),
             patch.object(module, "BACKUP_TASK_DIR", self.task_dir),
+            patch.object(module, "BACKUP_SCHEDULER_DIR", self.scheduler_dir),
             patch.object(module, "BACKUP_SCRIPT_SOURCE", source),
             patch.object(module, "BACKUP_SCRIPT_PATH", self.task_dir / "GLPI_backup.sh"),
             patch.object(module, "BACKUP_ENV_PATH", self.task_dir / "GLPI_backup.env"),
             patch.object(module, "BACKUP_CNF_PATH", self.task_dir / "GLPI_mysql_backup.cnf"),
             patch.object(module, "BACKUP_DISPATCHER_SOURCE", dispatcher_source),
-            patch.object(module, "BACKUP_DISPATCHER_PATH", self.task_dir / "GLPI_backup_dispatcher.sh"),
+            patch.object(module, "BACKUP_DISPATCHER_PATH", self.scheduler_dir / "GLPI_backup_dispatcher.sh"),
             patch.object(module, "BACKUP_PROJECTS_DIR", self.task_dir / "projects"),
             patch.object(module, "BACKUP_STATE_DIR", self.task_dir / "state"),
             patch.object(module, "database_container_for_project", return_value="glpi-prod-mdb1222"),
@@ -78,6 +80,10 @@ class BackupConfigurationTest(unittest.TestCase):
         self.assertEqual(os.stat(module.backup_schedule_path(self.project)).st_mode & 0o777, 0o600)
         self.assertEqual(os.stat(module.BACKUP_SCRIPT_PATH).st_mode & 0o777, 0o750)
         self.assertEqual(os.stat(module.BACKUP_DISPATCHER_PATH).st_mode & 0o777, 0o750)
+        self.assertEqual(
+            module.BACKUP_DISPATCHER_PATH,
+            self.backup_root / "Synology_task_scheduler" / "GLPI_backup_dispatcher.sh",
+        )
         self.assertTrue(any("Task Scheduler command" in message for message in messages))
 
     def test_existing_unmanaged_script_is_preserved_once(self):

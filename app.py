@@ -40,7 +40,7 @@ from app_ui import (
     page_template,
 )
 
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.3.1"
 BUILDER_TEST_PREVIEW_MODE = os.environ.get(
     "BUILDER_TEST_PREVIEW_MODE", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
@@ -48,10 +48,16 @@ APP_PORT = int(os.environ.get("APP_PORT", "8080"))
 BASE_PATH = Path(os.environ.get("BASE_PATH", "/volume1/docker"))
 BACKUP_ROOT = Path(os.environ.get("BACKUP_ROOT", "/volume1/docker/_BACKUPS"))
 BACKUP_TASK_DIR = Path(os.environ.get("BACKUP_TASK_DIR", str(BACKUP_ROOT / "Restore_Scripts" / "GLPI")))
+BACKUP_SCHEDULER_DIR = Path(
+    os.environ.get(
+        "BACKUP_SCHEDULER_DIR",
+        str(BACKUP_ROOT / "Synology_task_scheduler"),
+    )
+)
 BACKUP_SCRIPT_SOURCE = Path(__file__).resolve().parent / "backup" / "GLPI_backup.sh"
 BACKUP_DISPATCHER_SOURCE = Path(__file__).resolve().parent / "backup" / "GLPI_backup_dispatcher.sh"
 BACKUP_SCRIPT_PATH = BACKUP_TASK_DIR / "GLPI_backup.sh"
-BACKUP_DISPATCHER_PATH = BACKUP_TASK_DIR / "GLPI_backup_dispatcher.sh"
+BACKUP_DISPATCHER_PATH = BACKUP_SCHEDULER_DIR / "GLPI_backup_dispatcher.sh"
 BACKUP_ENV_PATH = BACKUP_TASK_DIR / "GLPI_backup.env"
 BACKUP_PROJECTS_DIR = BACKUP_TASK_DIR / "projects"
 BACKUP_STATE_DIR = BACKUP_TASK_DIR / "state"
@@ -1197,14 +1203,16 @@ def configure_scheduled_backup(project, env=None, *, enabled=True, kind="daily",
 
     try:
         BACKUP_TASK_DIR.resolve().relative_to(BACKUP_ROOT.resolve())
+        BACKUP_SCHEDULER_DIR.resolve().relative_to(BACKUP_ROOT.resolve())
     except Exception:
-        raise ValueError(f"Backup task folder must be located below {BACKUP_ROOT}.")
+        raise ValueError(f"Backup task folders must be located below {BACKUP_ROOT}.")
     if not BACKUP_SCRIPT_SOURCE.is_file():
         raise ValueError(f"Bundled backup script is missing: {BACKUP_SCRIPT_SOURCE}")
     if not BACKUP_DISPATCHER_SOURCE.is_file():
         raise ValueError(f"Bundled backup dispatcher is missing: {BACKUP_DISPATCHER_SOURCE}")
 
     BACKUP_TASK_DIR.mkdir(parents=True, exist_ok=True)
+    BACKUP_SCHEDULER_DIR.mkdir(parents=True, exist_ok=True)
     if BACKUP_SCRIPT_PATH.exists():
         existing_header = BACKUP_SCRIPT_PATH.read_text(encoding="utf-8", errors="replace")[:200]
         legacy_path = BACKUP_TASK_DIR / "GLPI_backup.pre-builder.sh"

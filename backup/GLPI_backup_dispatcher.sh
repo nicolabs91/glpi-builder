@@ -4,9 +4,10 @@ set -Eeuo pipefail
 umask 077
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-PROJECTS_DIR="$SCRIPT_DIR/projects"
-STATE_DIR="$SCRIPT_DIR/state"
-BACKUP_SCRIPT="$SCRIPT_DIR/GLPI_backup.sh"
+BACKUP_TASK_DIR=${GLPI_BACKUP_TASK_DIR:-"$(dirname "$SCRIPT_DIR")/Restore_Scripts/GLPI"}
+PROJECTS_DIR="$BACKUP_TASK_DIR/projects"
+STATE_DIR="$BACKUP_TASK_DIR/state"
+BACKUP_SCRIPT="$BACKUP_TASK_DIR/GLPI_backup.sh"
 HEARTBEAT="$STATE_DIR/dispatcher.env"
 LOCK_DIR="$SCRIPT_DIR/.GLPI_dispatcher.lock"
 

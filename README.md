@@ -1,4 +1,4 @@
-# GLPI Builder 0.3 for Synology
+# GLPI Builder 0.3.1 for Synology
 
 GLPI Builder creates and restores internal GLPI Docker projects on a
 Synology NAS. This version was developed for a Synology RS822RP+ with projects
@@ -323,7 +323,7 @@ Create one user-defined DSM Task Scheduler task, run it as root every five
 minutes, and use:
 
 ```sh
-/bin/bash /volume1/docker/_BACKUPS/Restore_Scripts/GLPI/GLPI_backup_dispatcher.sh
+/bin/bash /volume1/docker/_BACKUPS/Synology_task_scheduler/GLPI_backup_dispatcher.sh
 ```
 
 The dispatcher checks which projects are due and runs them sequentially. It
