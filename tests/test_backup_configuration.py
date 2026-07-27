@@ -29,7 +29,9 @@ class BackupConfigurationTest(unittest.TestCase):
         self.root = Path(self.temporary_directory.name)
         self.base_path = self.root / "docker"
         self.backup_root = self.base_path / "_BACKUPS"
-        self.task_dir = self.backup_root / "Restore_Scripts" / "GLPI"
+        self.data_root = self.backup_root / "GLPI_backup"
+        self.task_dir = self.data_root / "_system"
+        self.legacy_task_dir = self.backup_root / "Restore_Scripts" / "GLPI"
         self.scheduler_dir = self.backup_root / "Synology_task_scheduler"
         self.project = "glpi-production"
         project_path = self.base_path / self.project
@@ -45,7 +47,9 @@ class BackupConfigurationTest(unittest.TestCase):
         self.patches = (
             patch.object(module, "BASE_PATH", self.base_path),
             patch.object(module, "BACKUP_ROOT", self.backup_root),
+            patch.object(module, "BACKUP_DATA_ROOT", self.data_root),
             patch.object(module, "BACKUP_TASK_DIR", self.task_dir),
+            patch.object(module, "LEGACY_BACKUP_TASK_DIR", self.legacy_task_dir),
             patch.object(module, "BACKUP_SCHEDULER_DIR", self.scheduler_dir),
             patch.object(module, "BACKUP_SCRIPT_SOURCE", source),
             patch.object(module, "BACKUP_SCRIPT_PATH", self.task_dir / "GLPI_backup.sh"),
@@ -55,6 +59,7 @@ class BackupConfigurationTest(unittest.TestCase):
             patch.object(module, "BACKUP_DISPATCHER_PATH", self.scheduler_dir / "GLPI_backup_dispatcher.sh"),
             patch.object(module, "BACKUP_PROJECTS_DIR", self.task_dir / "projects"),
             patch.object(module, "BACKUP_STATE_DIR", self.task_dir / "state"),
+            patch.object(module, "BACKUP_LOCKS_DIR", self.task_dir / "locks"),
             patch.object(module, "database_container_for_project", return_value="glpi-prod-mdb1222"),
         )
         for context in self.patches:
@@ -76,6 +81,7 @@ class BackupConfigurationTest(unittest.TestCase):
         self.assertEqual(config["DB_CONTAINER"], "glpi-prod-mdb1222")
         self.assertEqual(config["DB_NAME"], "glpi")
         self.assertEqual(config["RETENTION_DAYS"], "60")
+        self.assertEqual(config["BACKUP_ROOT"], str(self.data_root))
         self.assertEqual(module.current_backup_source_project(), self.project)
         self.assertEqual(os.stat(module.backup_schedule_path(self.project)).st_mode & 0o777, 0o600)
         self.assertEqual(os.stat(module.BACKUP_SCRIPT_PATH).st_mode & 0o777, 0o750)
@@ -111,17 +117,54 @@ class BackupConfigurationTest(unittest.TestCase):
         self.assertIn("echo legacy", legacy.read_text(encoding="utf-8"))
         self.assertIn("Managed by GLPI Builder", module.BACKUP_SCRIPT_PATH.read_text(encoding="utf-8"))
 
+    def test_legacy_runtime_is_copied_and_rewritten_without_deletion(self):
+        legacy_projects = self.legacy_task_dir / "projects"
+        legacy_state = self.legacy_task_dir / "state"
+        legacy_projects.mkdir(parents=True)
+        legacy_state.mkdir()
+        legacy_config = legacy_projects / f"{self.project}.env"
+        legacy_config.write_text(
+            "\n".join(
+                [
+                    f"PROJECT_NAME={self.project}",
+                    f"BACKUP_ROOT={self.backup_root}",
+                    f"MYSQL_CNF={self.legacy_task_dir / 'GLPI_mysql_backup.cnf'}",
+                    "SCHEDULE_ENABLED=yes",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        legacy_cnf = self.legacy_task_dir / "GLPI_mysql_backup.cnf"
+        legacy_cnf.write_text("[client]\npassword=legacy-test\n", encoding="utf-8")
+        legacy_log = legacy_state / f"{self.project}.last.log"
+        legacy_log.write_bytes(b"legacy state\\xff")
+
+        module.install_backup_runtime()
+
+        migrated = module.read_simple_env_file(module.backup_schedule_path(self.project))
+        self.assertEqual(migrated["BACKUP_ROOT"], str(self.data_root))
+        self.assertEqual(migrated["MYSQL_CNF"], str(module.BACKUP_CNF_PATH))
+        self.assertEqual(
+            (module.BACKUP_STATE_DIR / legacy_log.name).read_bytes(),
+            b"legacy state\\xff",
+        )
+        self.assertTrue(legacy_config.exists())
+        self.assertTrue(legacy_cnf.exists())
+        self.assertTrue(legacy_log.exists())
+
     def test_backup_status_reports_readiness_and_latest_verified_backup(self):
         module.configure_scheduled_backup(self.project)
         module.BACKUP_CNF_PATH.write_text("[client]\nuser=root\n", encoding="utf-8")
-        backup = self.backup_root / self.project / "GLPI_Backup_20260711-120000"
+        backup = self.data_root / self.project / "2026-07-11_120000"
         backup.mkdir(parents=True)
-        (backup / "BACKUP_INFO").write_text(
-            "PROJECT_NAME=glpi-production\nCREATED_AT=2026-07-11T12:00:00+0200\n",
+        (backup / "manifest.json").write_text(
+            '{"project":"glpi-production","created_at":"2026-07-11T12:00:00+0200",'
+            '"database":"database.sql.gz","files":"files.tar.gz"}',
             encoding="utf-8",
         )
-        (backup / "glpi-database.sql").write_bytes(b"database")
-        (backup / "glpi-files.tar.gz").write_bytes(b"files")
+        (backup / "database.sql.gz").write_bytes(b"database")
+        (backup / "files.tar.gz").write_bytes(b"files")
         (backup / "SHA256SUMS").write_text("checksums\n", encoding="utf-8")
 
         database = type("Database", (), {"status": "running", "reload": lambda self: None})()
@@ -242,18 +285,18 @@ class BackupConfigurationTest(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
 
                 backup_directories = list(
-                    (isolated_backups / "glpi-backup-script-test").glob("GLPI_Backup_*")
+                    (isolated_backups / "glpi-backup-script-test").glob("20??-??-??_??????")
                 )
                 self.assertEqual(len(backup_directories), 1)
                 backup = backup_directories[0]
-                self.assertGreater((backup / "glpi-database.sql").stat().st_size, 0)
+                self.assertGreater((backup / "database.sql.gz").stat().st_size, 0)
                 self.assertTrue((backup / "SHA256SUMS").is_file())
-                self.assertEqual(
-                    module.read_simple_env_file(backup / "BACKUP_INFO")["PROJECT_NAME"],
-                    "glpi-backup-script-test",
+                self.assertIn(
+                    '"project": "glpi-backup-script-test"',
+                    (backup / "manifest.json").read_text(encoding="utf-8"),
                 )
-                self.assertIn("BACKUP_INFO", (backup / "SHA256SUMS").read_text(encoding="utf-8"))
-                with tarfile.open(backup / "glpi-files.tar.gz", "r:gz") as archive:
+                self.assertIn("database.sql.gz", (backup / "SHA256SUMS").read_text(encoding="utf-8"))
+                with tarfile.open(backup / "files.tar.gz", "r:gz") as archive:
                     members = set(archive.getnames())
                 self.assertIn("glpi/config/config_db.php", members)
                 self.assertIn("plugins/plugin.txt", members)

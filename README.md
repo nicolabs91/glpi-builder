@@ -290,7 +290,7 @@ Every selected backup must be below the fixed `BACKUP_ROOT`. Symlinks and paths
 outside that directory are rejected.
 
 The database and GLPI files selectors show only backups whose relative path
-contains `glpi` (case-insensitive), including the managed `GLPI_Backup_*`
+contains `glpi` (case-insensitive), including the managed project backup
 folders. Backups for other applications may remain below `_BACKUPS`, but are
 not offered by GLPI Builder.
 
@@ -299,7 +299,7 @@ not offered by GLPI Builder.
 The installer automatically copies the bundled script to:
 
 ```text
-/volume1/docker/_BACKUPS/Restore_Scripts/GLPI/GLPI_backup.sh
+/volume1/docker/_BACKUPS/GLPI_backup/_system/GLPI_backup.sh
 ```
 
 On the first installation, an existing unmanaged `GLPI_backup.sh` is preserved
@@ -310,7 +310,7 @@ start time and retention period. The Builder stores those configurations
 atomically below:
 
 ```text
-/volume1/docker/_BACKUPS/Restore_Scripts/GLPI/projects/<project>.env
+/volume1/docker/_BACKUPS/GLPI_backup/_system/projects/<project>.env
 ```
 
 Files receive mode `600`. Existing installations using the former single
@@ -332,12 +332,18 @@ DSM task per project is not needed. Backups are kept in project-specific
 folders below the backup root, preventing projects from mixing their sets.
 The Builder creates `Synology_task_scheduler` automatically when it is missing
 and atomically installs the dispatcher there whenever the Builder starts.
+Project backup sets are stored below
+`/volume1/docker/_BACKUPS/GLPI_backup/<project>/`. Internal schedules, state,
+locks, and the managed backup script live separately below
+`/volume1/docker/_BACKUPS/GLPI_backup/_system/`. Existing control files are
+copied safely from the former `Restore_Scripts/GLPI` location when their new
+equivalent does not exist; the old location is never deleted automatically.
 
 The Builder does not create or modify `GLPI_mysql_backup.cnf`. Ensure that this
 file already exists:
 
 ```text
-/volume1/docker/_BACKUPS/Restore_Scripts/GLPI/GLPI_mysql_backup.cnf
+/volume1/docker/_BACKUPS/GLPI_backup/_system/GLPI_mysql_backup.cnf
 ```
 
 Minimal example:
@@ -351,7 +357,7 @@ password=<database-root-password>
 Restrict access to this file:
 
 ```sh
-sudo chmod 600 /volume1/docker/_BACKUPS/Restore_Scripts/GLPI/GLPI_mysql_backup.cnf
+sudo chmod 600 /volume1/docker/_BACKUPS/GLPI_backup/_system/GLPI_mysql_backup.cnf
 ```
 
 When a project's backup configuration reports **Backup ready**, **Run backup
@@ -360,20 +366,21 @@ progress page shows the current phase, output, completion state, and action log.
 Manual backups use the same global administration lock as restores, so two
 mutating operations cannot run at the same time.
 
-Each run creates a `GLPI_Backup_YYYYMMDD-HHMMSS` directory containing:
+Each run creates a `GLPI_backup/<project>/YYYY-MM-DD_HHMMSS` directory containing:
 
-- `glpi-database.sql`;
-- `glpi-files.tar.gz`;
-- `BACKUP_INFO`, which identifies the source project and creation time;
+- `database.sql.gz`;
+- `files.tar.gz`;
+- `manifest.json`, which identifies the project, creation time, and files;
 - `SHA256SUMS` when `sha256sum` or `shasum` is available.
 
 Sessions, cache, and temporary GLPI files are excluded. The script prevents
 concurrent runs, publishes a backup only after full success, and by default
-removes only `GLPI_Backup_*` directories older than 60 days.
+removes only timestamp-named backup sets older than the configured retention
+period.
 
-The dashboard attributes a backup to a project only when `BACKUP_INFO` matches
-that project. Backups created by older script versions remain usable but are not
-shown as the latest verified project backup until a new backup has completed.
+The dashboard attributes a new backup to a project only when `manifest.json`
+matches that project. Existing `GLPI_Backup_*` sets remain readable for
+compatibility.
 
 ## Rollback
 

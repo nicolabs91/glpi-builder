@@ -4,14 +4,15 @@ set -Eeuo pipefail
 umask 077
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-BACKUP_TASK_DIR=${GLPI_BACKUP_TASK_DIR:-"$(dirname "$SCRIPT_DIR")/Restore_Scripts/GLPI"}
+BACKUP_TASK_DIR=${GLPI_BACKUP_TASK_DIR:-"$(dirname "$SCRIPT_DIR")/GLPI_backup/_system"}
 PROJECTS_DIR="$BACKUP_TASK_DIR/projects"
 STATE_DIR="$BACKUP_TASK_DIR/state"
+LOCKS_DIR="$BACKUP_TASK_DIR/locks"
 BACKUP_SCRIPT="$BACKUP_TASK_DIR/GLPI_backup.sh"
 HEARTBEAT="$STATE_DIR/dispatcher.env"
-LOCK_DIR="$SCRIPT_DIR/.GLPI_dispatcher.lock"
+LOCK_DIR="$LOCKS_DIR/dispatcher.lock"
 
-mkdir -p "$PROJECTS_DIR" "$STATE_DIR"
+mkdir -p "$PROJECTS_DIR" "$STATE_DIR" "$LOCKS_DIR"
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
   echo "Another dispatcher run is already active; exiting safely."
   exit 0

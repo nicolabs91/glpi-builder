@@ -45,12 +45,14 @@ RUNNING=$("${DOCKER[@]}" inspect --format '{{.State.Running}}' "$DB_CONTAINER")
 
 PROJECT_BACKUP_ROOT="$BACKUP_ROOT/$PROJECT_NAME"
 mkdir -p "$PROJECT_BACKUP_ROOT"
-LOCK_DIR="$SCRIPT_DIR/.GLPI_backup.lock"
+LOCKS_DIR="$SCRIPT_DIR/locks"
+mkdir -p "$LOCKS_DIR"
+LOCK_DIR="$LOCKS_DIR/backup.lock"
 mkdir "$LOCK_DIR" 2>/dev/null || fail "Another GLPI backup is already running"
 
-STAMP=$(date +%Y%m%d-%H%M%S)
-BACKUP_DIR="$PROJECT_BACKUP_ROOT/GLPI_Backup_$STAMP"
-TEMP_BACKUP_DIR="$PROJECT_BACKUP_ROOT/.GLPI_Backup_$STAMP.partial.$$"
+STAMP=$(date +%Y-%m-%d_%H%M%S)
+BACKUP_DIR="$PROJECT_BACKUP_ROOT/$STAMP"
+TEMP_BACKUP_DIR="$PROJECT_BACKUP_ROOT/.$STAMP.partial.$$"
 CNF_COPIED=0
 
 cleanup() {
@@ -66,9 +68,7 @@ trap cleanup EXIT INT TERM
 
 mkdir "$TEMP_BACKUP_DIR"
 echo "Starting GLPI backup for $PROJECT_NAME: $STAMP"
-printf 'PROJECT_NAME=%s\nCREATED_AT=%s\n' \
-  "$PROJECT_NAME" "$(date '+%Y-%m-%dT%H:%M:%S%z')" \
-  > "$TEMP_BACKUP_DIR/BACKUP_INFO"
+CREATED_AT=$(date '+%Y-%m-%dT%H:%M:%S%z')
 
 echo "Copying the credential file temporarily to $DB_CONTAINER..."
 "${DOCKER[@]}" cp "$MYSQL_CNF" "$DB_CONTAINER:$CONTAINER_CNF"
@@ -81,22 +81,24 @@ echo "Creating database dump..."
   --single-transaction \
   --quick \
   "$DB_NAME" \
-  > "$TEMP_BACKUP_DIR/glpi-database.sql"
-[ -s "$TEMP_BACKUP_DIR/glpi-database.sql" ] || fail "Database dump is empty"
+  | gzip -c > "$TEMP_BACKUP_DIR/database.sql.gz"
+[ -s "$TEMP_BACKUP_DIR/database.sql.gz" ] || fail "Database dump is empty"
 
 echo "Creating portable GLPI files archive..."
-tar -C "$PROJECT_DIR" -czf "$TEMP_BACKUP_DIR/glpi-files.tar.gz" \
+tar -C "$PROJECT_DIR" -czf "$TEMP_BACKUP_DIR/files.tar.gz" \
   --exclude="glpi/files/_sessions" \
   --exclude="glpi/files/_cache" \
   --exclude="glpi/files/_tmp" \
   glpi plugins
-[ -s "$TEMP_BACKUP_DIR/glpi-files.tar.gz" ] || fail "GLPI files archive is empty"
+[ -s "$TEMP_BACKUP_DIR/files.tar.gz" ] || fail "GLPI files archive is empty"
 
 if command -v sha256sum >/dev/null 2>&1; then
-  (cd "$TEMP_BACKUP_DIR" && sha256sum glpi-database.sql glpi-files.tar.gz BACKUP_INFO > SHA256SUMS)
+  (cd "$TEMP_BACKUP_DIR" && sha256sum database.sql.gz files.tar.gz > SHA256SUMS)
 elif command -v shasum >/dev/null 2>&1; then
-  (cd "$TEMP_BACKUP_DIR" && shasum -a 256 glpi-database.sql glpi-files.tar.gz BACKUP_INFO > SHA256SUMS)
+  (cd "$TEMP_BACKUP_DIR" && shasum -a 256 database.sql.gz files.tar.gz > SHA256SUMS)
 fi
+printf '{\n  "project": "%s",\n  "created_at": "%s",\n  "database": "database.sql.gz",\n  "files": "files.tar.gz",\n  "checksums": "SHA256SUMS"\n}\n' \
+  "$PROJECT_NAME" "$CREATED_AT" > "$TEMP_BACKUP_DIR/manifest.json"
 
 mv "$TEMP_BACKUP_DIR" "$BACKUP_DIR"
 TEMP_BACKUP_DIR=""
@@ -106,7 +108,7 @@ find "$PROJECT_BACKUP_ROOT" \
   -mindepth 1 \
   -maxdepth 1 \
   -type d \
-  -name "GLPI_Backup_*" \
+  -name "20??-??-??_??????" \
   -mtime "+$RETENTION_DAYS" \
   -exec rm -rf -- {} +
 

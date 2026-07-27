@@ -8,7 +8,7 @@ COMPOSE_PROJECT="glpi-builder"
 COMPOSE_FILE="$APP_DIR/docker-compose.app.yml"
 LEGACY_CONTAINER="glpi-project-builder-full-restore"
 STATE_FILE="$APP_DIR/.last-install-state"
-BACKUP_TASK_DIR="/volume1/docker/_BACKUPS/Restore_Scripts/GLPI"
+BACKUP_TASK_DIR="/volume1/docker/_BACKUPS/GLPI_backup/_system"
 BACKUP_SCHEDULER_DIR="/volume1/docker/_BACKUPS/Synology_task_scheduler"
 BACKUP_SCRIPT="$BACKUP_TASK_DIR/GLPI_backup.sh"
 BACKUP_DISPATCHER="$BACKUP_SCHEDULER_DIR/GLPI_backup_dispatcher.sh"
@@ -62,7 +62,8 @@ if ! python3 "$APP_DIR/scripts/provision_admin.py" --env "$APP_DIR/.env" --check
   python3 "$APP_DIR/scripts/provision_admin.py" --env "$APP_DIR/.env" --check
 fi
 
-sudo mkdir -p "$BACKUP_TASK_DIR" "$BACKUP_SCHEDULER_DIR"
+sudo mkdir -p "$BACKUP_TASK_DIR/projects" "$BACKUP_TASK_DIR/state" \
+  "$BACKUP_TASK_DIR/locks" "$BACKUP_SCHEDULER_DIR"
 if [ -f "$BACKUP_SCRIPT" ] && ! sudo grep -Eq "Managed by GLPI (Project )?Builder" "$BACKUP_SCRIPT"; then
   if [ ! -f "$BACKUP_TASK_DIR/GLPI_backup.pre-builder.sh" ]; then
     sudo cp -p "$BACKUP_SCRIPT" "$BACKUP_TASK_DIR/GLPI_backup.pre-builder.sh"

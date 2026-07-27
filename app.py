@@ -47,7 +47,13 @@ BUILDER_TEST_PREVIEW_MODE = os.environ.get(
 APP_PORT = int(os.environ.get("APP_PORT", "8080"))
 BASE_PATH = Path(os.environ.get("BASE_PATH", "/volume1/docker"))
 BACKUP_ROOT = Path(os.environ.get("BACKUP_ROOT", "/volume1/docker/_BACKUPS"))
-BACKUP_TASK_DIR = Path(os.environ.get("BACKUP_TASK_DIR", str(BACKUP_ROOT / "Restore_Scripts" / "GLPI")))
+BACKUP_DATA_ROOT = Path(
+    os.environ.get("BACKUP_DATA_ROOT", str(BACKUP_ROOT / "GLPI_backup"))
+)
+BACKUP_TASK_DIR = Path(
+    os.environ.get("BACKUP_TASK_DIR", str(BACKUP_DATA_ROOT / "_system"))
+)
+LEGACY_BACKUP_TASK_DIR = BACKUP_ROOT / "Restore_Scripts" / "GLPI"
 BACKUP_SCHEDULER_DIR = Path(
     os.environ.get(
         "BACKUP_SCHEDULER_DIR",
@@ -61,6 +67,7 @@ BACKUP_DISPATCHER_PATH = BACKUP_SCHEDULER_DIR / "GLPI_backup_dispatcher.sh"
 BACKUP_ENV_PATH = BACKUP_TASK_DIR / "GLPI_backup.env"
 BACKUP_PROJECTS_DIR = BACKUP_TASK_DIR / "projects"
 BACKUP_STATE_DIR = BACKUP_TASK_DIR / "state"
+BACKUP_LOCKS_DIR = BACKUP_TASK_DIR / "locks"
 BACKUP_CNF_PATH = BACKUP_TASK_DIR / "GLPI_mysql_backup.cnf"
 TZ_DEFAULT = os.environ.get("TZ", "Europe/Brussels")
 MAX_SCAN_ENTRIES = int(os.environ.get("MAX_SCAN_ENTRIES", "500"))
@@ -1190,19 +1197,116 @@ def atomic_write_text(path, text, mode):
             temporary_path.unlink()
 
 
-def install_backup_dispatcher():
-    """Install the fixed DSM Task Scheduler entry point atomically."""
+def _copy_legacy_backup_file(source, destination, mode, *, rewrite_config=False):
+    """Copy one legacy control file without overwriting its new equivalent."""
+    source = Path(source)
+    destination = Path(destination)
+    if destination.exists() or not source.is_file() or source.is_symlink():
+        return False
+    if rewrite_config:
+        text = source.read_text(encoding="utf-8", errors="strict")
+        text = re.sub(
+            r"(?m)^BACKUP_ROOT=.*$",
+            f"BACKUP_ROOT={BACKUP_DATA_ROOT}",
+            text,
+        )
+        text = re.sub(
+            r"(?m)^MYSQL_CNF=.*$",
+            f"MYSQL_CNF={BACKUP_CNF_PATH}",
+            text,
+        )
+        atomic_write_text(destination, text, mode)
+    else:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{destination.name}.", dir=str(destination.parent)
+        )
+        temporary_path = Path(temporary_name)
+        try:
+            with os.fdopen(descriptor, "wb") as handle:
+                handle.write(source.read_bytes())
+                handle.flush()
+                os.fsync(handle.fileno())
+            temporary_path.chmod(mode)
+            os.replace(temporary_path, destination)
+        finally:
+            if temporary_path.exists():
+                temporary_path.unlink()
+    return True
+
+
+def migrate_legacy_backup_runtime():
+    """Copy legacy scheduler configuration/state to the new layout safely."""
+    if not LEGACY_BACKUP_TASK_DIR.is_dir() or LEGACY_BACKUP_TASK_DIR.is_symlink():
+        return []
+    migrated = []
+    _copy_legacy_backup_file(
+        LEGACY_BACKUP_TASK_DIR / "GLPI_mysql_backup.cnf",
+        BACKUP_CNF_PATH,
+        0o600,
+    ) and migrated.append(str(BACKUP_CNF_PATH))
+    _copy_legacy_backup_file(
+        LEGACY_BACKUP_TASK_DIR / "GLPI_backup.env",
+        BACKUP_ENV_PATH,
+        0o600,
+        rewrite_config=True,
+    ) and migrated.append(str(BACKUP_ENV_PATH))
+    for source_dir, destination_dir in (
+        (LEGACY_BACKUP_TASK_DIR / "projects", BACKUP_PROJECTS_DIR),
+        (LEGACY_BACKUP_TASK_DIR / "state", BACKUP_STATE_DIR),
+    ):
+        if not source_dir.is_dir() or source_dir.is_symlink():
+            continue
+        for source in source_dir.iterdir():
+            if not source.is_file() or source.is_symlink():
+                continue
+            rewrite = source_dir.name == "projects" and source.suffix == ".env"
+            mode = 0o600
+            destination = destination_dir / source.name
+            if _copy_legacy_backup_file(
+                source,
+                destination,
+                mode,
+                rewrite_config=rewrite,
+            ):
+                migrated.append(str(destination))
+    return migrated
+
+
+def install_backup_runtime():
+    """Create the backup layout and install its managed scripts atomically."""
     try:
+        BACKUP_DATA_ROOT.resolve().relative_to(BACKUP_ROOT.resolve())
+        BACKUP_TASK_DIR.resolve().relative_to(BACKUP_DATA_ROOT.resolve())
         BACKUP_SCHEDULER_DIR.resolve().relative_to(BACKUP_ROOT.resolve())
     except Exception:
         raise ValueError(
-            f"Backup scheduler folder must be located below {BACKUP_ROOT}."
+            f"Backup runtime folders must be located below {BACKUP_ROOT}."
         )
-    if not BACKUP_DISPATCHER_SOURCE.is_file():
-        raise ValueError(
-            f"Bundled backup dispatcher is missing: {BACKUP_DISPATCHER_SOURCE}"
-        )
+    for source in (BACKUP_SCRIPT_SOURCE, BACKUP_DISPATCHER_SOURCE):
+        if not source.is_file():
+            raise ValueError(f"Bundled backup script is missing: {source}")
+    BACKUP_PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+    BACKUP_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    BACKUP_LOCKS_DIR.mkdir(parents=True, exist_ok=True)
     BACKUP_SCHEDULER_DIR.mkdir(parents=True, exist_ok=True)
+    migrate_legacy_backup_runtime()
+    if BACKUP_SCRIPT_PATH.exists():
+        existing_header = BACKUP_SCRIPT_PATH.read_text(
+            encoding="utf-8", errors="replace"
+        )[:200]
+        preserved = BACKUP_TASK_DIR / "GLPI_backup.pre-builder.sh"
+        if (
+            not re.search(r"Managed by GLPI (?:Project )?Builder", existing_header)
+            and not preserved.exists()
+        ):
+            shutil.copy2(BACKUP_SCRIPT_PATH, preserved)
+            preserved.chmod(0o700)
+    atomic_write_text(
+        BACKUP_SCRIPT_PATH,
+        BACKUP_SCRIPT_SOURCE.read_text(encoding="utf-8"),
+        0o750,
+    )
     atomic_write_text(
         BACKUP_DISPATCHER_PATH,
         BACKUP_DISPATCHER_SOURCE.read_text(encoding="utf-8"),
@@ -1210,8 +1314,14 @@ def install_backup_dispatcher():
     )
 
 
+def install_backup_dispatcher():
+    """Compatibility wrapper for callers that install the backup runtime."""
+    install_backup_runtime()
+
+
 def configure_scheduled_backup(project, env=None, *, enabled=True, kind="daily", schedule_time="02:00", weekdays="7", interval_hours="24", retention_days="60"):
     project = validate_project(project)
+    install_backup_runtime()
     migrate_legacy_backup_config()
     env = dict(env or read_env(project))
     if not env:
@@ -1222,24 +1332,12 @@ def configure_scheduled_backup(project, env=None, *, enabled=True, kind="daily",
         raise ValueError(f"Invalid database container name: {db_container}")
 
     try:
-        BACKUP_TASK_DIR.resolve().relative_to(BACKUP_ROOT.resolve())
+        BACKUP_TASK_DIR.resolve().relative_to(BACKUP_DATA_ROOT.resolve())
         BACKUP_SCHEDULER_DIR.resolve().relative_to(BACKUP_ROOT.resolve())
     except Exception:
         raise ValueError(f"Backup task folders must be located below {BACKUP_ROOT}.")
     if not BACKUP_SCRIPT_SOURCE.is_file():
         raise ValueError(f"Bundled backup script is missing: {BACKUP_SCRIPT_SOURCE}")
-
-    BACKUP_TASK_DIR.mkdir(parents=True, exist_ok=True)
-    install_backup_dispatcher()
-    if BACKUP_SCRIPT_PATH.exists():
-        existing_header = BACKUP_SCRIPT_PATH.read_text(encoding="utf-8", errors="replace")[:200]
-        legacy_path = BACKUP_TASK_DIR / "GLPI_backup.pre-builder.sh"
-        if not re.search(r"Managed by GLPI (?:Project )?Builder", existing_header) and not legacy_path.exists():
-            shutil.copy2(BACKUP_SCRIPT_PATH, legacy_path)
-            legacy_path.chmod(0o700)
-
-    script_text = BACKUP_SCRIPT_SOURCE.read_text(encoding="utf-8")
-    atomic_write_text(BACKUP_SCRIPT_PATH, script_text, 0o750)
 
     schedule = validate_backup_schedule(kind, schedule_time, weekdays, interval_hours, retention_days)
     previous = read_simple_env_file(backup_schedule_path(project))
@@ -1252,7 +1350,7 @@ def configure_scheduled_backup(project, env=None, *, enabled=True, kind="daily",
         "PROJECT_DIR": str(project_dir(project)),
         "DB_CONTAINER": db_container,
         "DB_NAME": db_name,
-        "BACKUP_ROOT": str(BACKUP_ROOT),
+        "BACKUP_ROOT": str(BACKUP_DATA_ROOT),
         "MYSQL_CNF": mysql_cnf,
         "CONTAINER_CNF": container_cnf,
         "RETENTION_DAYS": schedule["retention_days"],
@@ -1302,7 +1400,11 @@ def latest_successful_backup(project):
     if not BACKUP_ROOT.is_dir():
         return None
     candidates = []
-    search_roots = [BACKUP_ROOT / project, BACKUP_ROOT]
+    search_roots = [
+        BACKUP_DATA_ROOT / project,
+        BACKUP_ROOT / project,
+        BACKUP_ROOT,
+    ]
     try:
         folders = []
         for root in search_roots:
@@ -1311,28 +1413,48 @@ def latest_successful_backup(project):
         for index, folder in enumerate(folders):
             if index >= MAX_SCAN_ENTRIES:
                 break
-            if folder.is_symlink() or not folder.is_dir() or not folder.name.startswith("GLPI_Backup_"):
+            if folder.is_symlink() or not folder.is_dir():
                 continue
-            info = read_simple_env_file(folder / "BACKUP_INFO")
-            if info.get("PROJECT_NAME") != project:
+            manifest = {}
+            manifest_path = folder / "manifest.json"
+            if manifest_path.is_file():
+                try:
+                    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                except (OSError, ValueError):
+                    continue
+                if manifest.get("project") != project:
+                    continue
+                database_dump = folder / str(manifest.get("database") or "")
+                files_archive = folder / str(manifest.get("files") or "")
+                created_at = str(manifest.get("created_at") or "")
+            elif folder.name.startswith("GLPI_Backup_"):
+                info = read_simple_env_file(folder / "BACKUP_INFO")
+                if info.get("PROJECT_NAME") != project:
+                    continue
+                database_dump = folder / "glpi-database.sql"
+                files_archive = folder / "glpi-files.tar.gz"
+                created_at = info.get("CREATED_AT") or ""
+            else:
                 continue
-            database_dump = folder / "glpi-database.sql"
-            files_archive = folder / "glpi-files.tar.gz"
             if not database_dump.is_file() or not files_archive.is_file():
                 continue
             if database_dump.stat().st_size <= 0 or files_archive.stat().st_size <= 0:
                 continue
-            candidates.append((folder.stat().st_mtime, folder, info, database_dump, files_archive))
+            candidates.append(
+                (folder.stat().st_mtime, folder, created_at, database_dump, files_archive)
+            )
     except OSError:
         return None
     if not candidates:
         return None
-    _, folder, info, database_dump, files_archive = max(candidates, key=lambda item: item[0])
+    _, folder, created_at, database_dump, files_archive = max(
+        candidates, key=lambda item: item[0]
+    )
     size_bytes = database_dump.stat().st_size + files_archive.stat().st_size
     return {
         "name": folder.name,
         "path": str(folder),
-        "created_at": info.get("CREATED_AT") or time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(folder.stat().st_mtime)),
+        "created_at": created_at or time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(folder.stat().st_mtime)),
         "size_bytes": size_bytes,
         "size_label": format_size(size_bytes),
         "checksum_manifest": (folder / "SHA256SUMS").is_file(),
@@ -4749,6 +4871,7 @@ def settings_page():
         auth=auth,
         base_path=str(BASE_PATH),
         backup_root=str(BACKUP_ROOT),
+        backup_data_root=str(BACKUP_DATA_ROOT),
         tz_default=TZ_DEFAULT,
         cookie_secure=app.config["SESSION_COOKIE_SECURE"],
         glpi_prefixes=ALLOWED_GLPI_IMAGES,
