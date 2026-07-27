@@ -40,7 +40,7 @@ from app_ui import (
     page_template,
 )
 
-APP_VERSION = "0.3.1"
+APP_VERSION = "0.3.0"
 BUILDER_TEST_PREVIEW_MODE = os.environ.get(
     "BUILDER_TEST_PREVIEW_MODE", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
@@ -1190,6 +1190,26 @@ def atomic_write_text(path, text, mode):
             temporary_path.unlink()
 
 
+def install_backup_dispatcher():
+    """Install the fixed DSM Task Scheduler entry point atomically."""
+    try:
+        BACKUP_SCHEDULER_DIR.resolve().relative_to(BACKUP_ROOT.resolve())
+    except Exception:
+        raise ValueError(
+            f"Backup scheduler folder must be located below {BACKUP_ROOT}."
+        )
+    if not BACKUP_DISPATCHER_SOURCE.is_file():
+        raise ValueError(
+            f"Bundled backup dispatcher is missing: {BACKUP_DISPATCHER_SOURCE}"
+        )
+    BACKUP_SCHEDULER_DIR.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(
+        BACKUP_DISPATCHER_PATH,
+        BACKUP_DISPATCHER_SOURCE.read_text(encoding="utf-8"),
+        0o750,
+    )
+
+
 def configure_scheduled_backup(project, env=None, *, enabled=True, kind="daily", schedule_time="02:00", weekdays="7", interval_hours="24", retention_days="60"):
     project = validate_project(project)
     migrate_legacy_backup_config()
@@ -1208,11 +1228,9 @@ def configure_scheduled_backup(project, env=None, *, enabled=True, kind="daily",
         raise ValueError(f"Backup task folders must be located below {BACKUP_ROOT}.")
     if not BACKUP_SCRIPT_SOURCE.is_file():
         raise ValueError(f"Bundled backup script is missing: {BACKUP_SCRIPT_SOURCE}")
-    if not BACKUP_DISPATCHER_SOURCE.is_file():
-        raise ValueError(f"Bundled backup dispatcher is missing: {BACKUP_DISPATCHER_SOURCE}")
 
     BACKUP_TASK_DIR.mkdir(parents=True, exist_ok=True)
-    BACKUP_SCHEDULER_DIR.mkdir(parents=True, exist_ok=True)
+    install_backup_dispatcher()
     if BACKUP_SCRIPT_PATH.exists():
         existing_header = BACKUP_SCRIPT_PATH.read_text(encoding="utf-8", errors="replace")[:200]
         legacy_path = BACKUP_TASK_DIR / "GLPI_backup.pre-builder.sh"
@@ -1255,8 +1273,6 @@ def configure_scheduled_backup(project, env=None, *, enabled=True, kind="daily",
     BACKUP_PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
     BACKUP_STATE_DIR.mkdir(parents=True, exist_ok=True)
     atomic_write_text(backup_schedule_path(project), config_text, 0o600)
-    atomic_write_text(BACKUP_DISPATCHER_PATH, BACKUP_DISPATCHER_SOURCE.read_text(encoding="utf-8"), 0o750)
-
     messages = [
         f"Backup configuration: {project}",
         (

@@ -86,6 +86,21 @@ class BackupConfigurationTest(unittest.TestCase):
         )
         self.assertTrue(any("Task Scheduler command" in message for message in messages))
 
+    def test_dispatcher_install_creates_missing_scheduler_directory(self):
+        self.assertFalse(self.scheduler_dir.exists())
+
+        module.install_backup_dispatcher()
+
+        self.assertTrue(module.BACKUP_DISPATCHER_PATH.is_file())
+        self.assertEqual(
+            os.stat(module.BACKUP_DISPATCHER_PATH).st_mode & 0o777,
+            0o750,
+        )
+        self.assertIn(
+            "Managed by GLPI Builder",
+            module.BACKUP_DISPATCHER_PATH.read_text(encoding="utf-8"),
+        )
+
     def test_existing_unmanaged_script_is_preserved_once(self):
         self.task_dir.mkdir(parents=True)
         module.BACKUP_SCRIPT_PATH.write_text("#!/bin/bash\necho legacy\n", encoding="utf-8")
