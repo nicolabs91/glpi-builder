@@ -28,7 +28,7 @@ required = [
     "atomic_write_text(BACKUP_ENV_PATH",
     "if not UI_PREVIEW_MODE:",
     "def require_admin_authentication():",
-    'request.endpoint in {"healthz", "favicon", "login"}',
+    'request.endpoint in {"healthz", "favicon", "login", "setup"}',
     "authenticated_session_is_current()",
     "write_last_totp_counter(counter)",
     "LOGIN_RATE_MAX_BUCKETS = 1024",

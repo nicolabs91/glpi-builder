@@ -9,6 +9,7 @@ import zipfile
 import tarfile
 import stat
 import hmac
+import json
 import threading
 import subprocess
 from datetime import datetime
@@ -20,9 +21,15 @@ import docker
 from docker.errors import NotFound, ContainerError
 from flask import Flask, request, redirect, url_for, render_template_string, flash, session, g, jsonify, abort, make_response
 
-from auth_security import load_auth_config, matching_totp_counter, verify_password
+from auth_security import (
+    generate_totp_secret,
+    hash_password,
+    load_auth_config,
+    matching_totp_counter,
+    verify_password,
+)
 
-APP_VERSION = "0.1.1-rc.1"
+APP_VERSION = "0.1.2-rc.1"
 UI_PREVIEW_MODE = os.environ.get("UI_PREVIEW_MODE", "0").strip().lower() in {"1", "true", "yes", "on"}
 APP_PORT = int(os.environ.get("APP_PORT", "8080"))
 BASE_PATH = Path(os.environ.get("BASE_PATH", "/volume1/docker"))
@@ -115,18 +122,70 @@ touch /tmp/supervisord.log /tmp/stdout.log /tmp/stderr.log &&
 chmod 666 /tmp/supervisord.log /tmp/stdout.log /tmp/stderr.log &&
 exec /opt/glpi/entrypoint.sh /usr/bin/supervisord -c /etc/supervisor/supervisord.conf"""
 
+AUTH_CONFIG_PATH = Path(os.environ.get("BUILDER_CONFIG_PATH", "/config/builder-auth.json"))
+
+
+def read_persisted_auth():
+    if not AUTH_CONFIG_PATH.is_file():
+        return {}
+    try:
+        if AUTH_CONFIG_PATH.stat().st_mode & 0o077:
+            raise ValueError("Persisted authentication configuration is not private.")
+        data = json.loads(AUTH_CONFIG_PATH.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("Persisted authentication configuration is invalid.")
+        return {str(key): str(value) for key, value in data.items()}
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Unable to load persisted authentication configuration: {exc}") from exc
+
+
+def atomic_write_persisted_auth(data):
+    AUTH_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, temporary_name = tempfile.mkstemp(prefix=".builder-auth-", dir=AUTH_CONFIG_PATH.parent)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary_name, 0o600)
+        os.replace(temporary_name, AUTH_CONFIG_PATH)
+        os.chmod(AUTH_CONFIG_PATH, 0o600)
+    finally:
+        if os.path.exists(temporary_name):
+            os.unlink(temporary_name)
+
+
+try:
+    PERSISTED_AUTH = read_persisted_auth()
+    PERSISTED_AUTH_ERROR = ""
+except ValueError as exc:
+    PERSISTED_AUTH = {}
+    PERSISTED_AUTH_ERROR = str(exc)
+
 app = Flask(__name__)
-configured_flask_secret = os.environ.get("FLASK_SECRET_KEY", "").strip()
+configured_flask_secret = (
+    os.environ.get("FLASK_SECRET_KEY", "").strip()
+    or PERSISTED_AUTH.get("FLASK_SECRET_KEY", "")
+)
 flask_secret_error = ""
 if len(configured_flask_secret) < 32 or configured_flask_secret in {"CHANGE_ME_RANDOM_64_HEX", "CHANGE_ME"}:
     flask_secret_error = "FLASK_SECRET_KEY is missing, placeholder, or too short."
 app.secret_key = configured_flask_secret or secrets.token_hex(32)
 try:
-    AUTH_CONFIG = load_auth_config()
-    AUTH_CONFIG_ERROR = flask_secret_error
+    AUTH_CONFIG = load_auth_config({**os.environ, **PERSISTED_AUTH})
+    AUTH_CONFIG_ERROR = "; ".join(filter(None, (PERSISTED_AUTH_ERROR, flask_secret_error)))
 except ValueError as exc:
     AUTH_CONFIG = None
-    AUTH_CONFIG_ERROR = "; ".join(filter(None, (flask_secret_error, str(exc))))
+    AUTH_CONFIG_ERROR = "; ".join(filter(None, (PERSISTED_AUTH_ERROR, flask_secret_error, str(exc))))
+
+SETUP_TOKEN = ""
+if AUTH_CONFIG is None and not AUTH_CONFIG_PATH.exists() and not PERSISTED_AUTH_ERROR:
+    SETUP_TOKEN = secrets.token_urlsafe(24)
+    print(
+        f"GLPI Builder first-time setup token: {SETUP_TOKEN}",
+        flush=True,
+    )
 
 app.config.update(
     SESSION_COOKIE_NAME="glpi_builder_session",
@@ -3623,11 +3682,98 @@ LOGIN_HTML = r"""<!doctype html>
 <label for="totp">Authenticator code</label><input id="totp" name="totp" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" required>
 <button type="submit">Sign in</button></form></main></body></html>"""
 
+SETUP_HTML = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Secure setup · GLPI Builder</title>
+<style>
+body{margin:0;background:#f3f6f9;color:#17212b;font:15px system-ui;display:grid;place-items:center;min-height:100vh;padding:20px}.card{width:min(560px,100%);background:#fff;border:1px solid #d8e0e8;border-radius:12px;padding:24px}label{display:block;font-weight:650;margin:14px 0 6px}input{width:100%;box-sizing:border-box;padding:10px;border:1px solid #b9c5d0;border-radius:8px}.secret{font:14px ui-monospace;overflow-wrap:anywhere;background:#eef4f8;padding:10px;border-radius:8px}button{width:100%;margin-top:20px;padding:11px;border:0;border-radius:8px;background:#16704a;color:#fff;font-weight:700}.error{background:#fff0ef;color:#b42318;padding:10px;border-radius:8px}
+</style></head><body><main class="card"><h1>Secure first-time setup</h1>
+<p>Create the only administrator account. Copy the setup token from the container log, add the secret below manually to your authenticator app, then enter its current six-digit code. This page is permanently disabled after setup.</p>
+{% if error %}<div class="error">{{ error }}</div>{% endif %}
+<p>Authenticator secret:</p><div class="secret">{{ totp_secret }}</div>
+<form method="post" action="{{ url_for('setup') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+<label for="setup_token">Setup token from the container log</label><input id="setup_token" name="setup_token" autocomplete="off" required>
+<label for="username">Administrator username</label><input id="username" name="username" pattern="[A-Za-z0-9_.-]{3,64}" required autofocus>
+<label for="password">Password (minimum 14 characters)</label><input id="password" type="password" name="password" minlength="14" autocomplete="new-password" required>
+<label for="confirm_password">Confirm password</label><input id="confirm_password" type="password" name="confirm_password" minlength="14" autocomplete="new-password" required>
+<label for="totp">Authenticator code</label><input id="totp" name="totp" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" required>
+<button type="submit">Finish secure setup</button></form></main></body></html>"""
+
+
+@app.route("/setup", methods=["GET", "POST"])
+def setup():
+    global AUTH_CONFIG, AUTH_CONFIG_ERROR
+
+    if AUTH_CONFIG is not None or AUTH_CONFIG_PATH.exists():
+        abort(404)
+    key = "setup:" + login_rate_key()
+    if login_rate_is_blocked(key):
+        return ("Too many setup attempts. Try again later.", 429, {"Retry-After": str(LOGIN_RATE_BLOCK_SECONDS)})
+    secret = session.get("setup_totp_secret")
+    if not secret:
+        secret = generate_totp_secret()
+        session["setup_totp_secret"] = secret
+    error = ""
+    if request.method == "POST":
+        try:
+            require_csrf()
+            if not SETUP_TOKEN or not hmac.compare_digest(
+                str(request.form.get("setup_token", "")),
+                SETUP_TOKEN,
+            ):
+                raise ValueError("The setup token is invalid.")
+            username = str(request.form.get("username", "")).strip()
+            password = str(request.form.get("password", ""))
+            if password != str(request.form.get("confirm_password", "")):
+                raise ValueError("The passwords do not match.")
+            password_hash = hash_password(password)
+            candidate = {
+                "BUILDER_ADMIN_USERNAME": username,
+                "BUILDER_ADMIN_PASSWORD_HASH": password_hash,
+                "BUILDER_ADMIN_TOTP_SECRET": secret,
+                "BUILDER_SESSION_COOKIE_SECURE": os.environ.get(
+                    "BUILDER_SESSION_COOKIE_SECURE", "false"
+                ),
+                "BUILDER_SESSION_TIMEOUT_SECONDS": os.environ.get(
+                    "BUILDER_SESSION_TIMEOUT_SECONDS", "900"
+                ),
+                "BUILDER_SESSION_ABSOLUTE_TIMEOUT_SECONDS": os.environ.get(
+                    "BUILDER_SESSION_ABSOLUTE_TIMEOUT_SECONDS", "28800"
+                ),
+                "FLASK_SECRET_KEY": secrets.token_hex(32),
+            }
+            config = load_auth_config(candidate)
+            counter = matching_totp_counter(secret, request.form.get("totp"), window=1)
+            if counter is None:
+                raise ValueError("The authenticator code is invalid.")
+            atomic_write_persisted_auth(candidate)
+            AUTH_CONFIG = config
+            AUTH_CONFIG_ERROR = ""
+            app.secret_key = candidate["FLASK_SECRET_KEY"]
+            login_rate_clear(key)
+            now = int(time.time())
+            session.clear()
+            session.update(
+                admin_authenticated=True,
+                admin_issued_at=now,
+                admin_last_activity=now,
+                csrf_token=secrets.token_urlsafe(32),
+                login_nonce=secrets.token_urlsafe(24),
+            )
+            write_last_totp_counter(counter)
+            return redirect(url_for("index"))
+        except ValueError as exc:
+            login_rate_record_failure(key)
+            error = str(exc)
+    return render_template_string(SETUP_HTML, error=error, totp_secret=secret)
+
 
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if AUTH_CONFIG_ERROR or not AUTH_CONFIG:
-        return ("Authentication is not configured. Run the administrator provisioning helper.", 503)
+        return redirect(url_for("setup")) if not AUTH_CONFIG_PATH.exists() else (
+            "Authentication configuration is invalid.", 503
+        )
     next_path = safe_internal_next(request.values.get("next"))
     if request.method == "GET":
         if authenticated_session_is_current():
@@ -3676,10 +3822,12 @@ def logout():
 
 @app.before_request
 def require_admin_authentication():
-    if request.endpoint in {"healthz", "favicon", "login"}:
+    if request.endpoint in {"healthz", "favicon", "login", "setup"}:
         return None
     if AUTH_CONFIG_ERROR or not AUTH_CONFIG:
-        return ("Authentication is not configured. Run the administrator provisioning helper.", 503)
+        return redirect(url_for("setup")) if not AUTH_CONFIG_PATH.exists() else (
+            "Authentication configuration is invalid.", 503
+        )
     if not authenticated_session_is_current():
         session.clear()
         next_path = request.full_path if request.method == "GET" else request.path
@@ -3689,7 +3837,7 @@ def require_admin_authentication():
 
 @app.before_request
 def v11_single_mutation_guard():
-    if request.method != "POST" or request.endpoint in {"login", "logout"}:
+    if request.method != "POST" or request.endpoint in {"login", "logout", "setup"}:
         return None
     if not MUTATION_LOCK.acquire(blocking=False):
         return ("Another administration action is already running. Wait until it completes.", 409)
@@ -3706,7 +3854,8 @@ def v11_release_mutation_lock(_error=None):
 
 @app.route("/healthz")
 def healthz():
-    healthy = not AUTH_CONFIG_ERROR and AUTH_CONFIG is not None and BASE_PATH.is_dir() and BACKUP_ROOT.is_dir()
+    onboarding = AUTH_CONFIG is None and not AUTH_CONFIG_PATH.exists() and not PERSISTED_AUTH_ERROR
+    healthy = (onboarding or (not AUTH_CONFIG_ERROR and AUTH_CONFIG is not None)) and BASE_PATH.is_dir() and BACKUP_ROOT.is_dir()
     client = None
     if healthy:
         try:
@@ -3717,7 +3866,10 @@ def healthz():
         finally:
             if client is not None:
                 close_docker_client(client)
-    return jsonify({"status": "ok" if healthy else "unhealthy"}), 200 if healthy else 503
+    return jsonify({
+        "status": "ok" if healthy else "unhealthy",
+        "mode": "setup" if onboarding else "ready",
+    }), 200 if healthy else 503
 
 
 @app.route("/favicon.ico")

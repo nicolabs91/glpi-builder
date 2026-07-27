@@ -72,15 +72,17 @@ class AuthenticationTest(unittest.TestCase):
                     self.assertEqual(module.safe_internal_next(value), "/")
             self.assertEqual(module.safe_internal_next("/progress/token?view=full"), "/progress/token?view=full")
 
-    def test_missing_configuration_fails_closed_but_minimal_health_is_public(self):
+    def test_missing_configuration_exposes_only_setup_and_minimal_health(self):
         with patch.object(module, "AUTH_CONFIG_ERROR", "missing"), patch.object(module, "AUTH_CONFIG", None):
             protected = self.client.get("/")
             login = self.client.get("/login")
             health = self.client.get("/healthz")
-        self.assertEqual(protected.status_code, 503)
-        self.assertEqual(login.status_code, 503)
-        self.assertEqual(health.status_code, 503)
-        self.assertEqual(health.get_json(), {"status": "unhealthy"})
+        self.assertEqual(protected.status_code, 302)
+        self.assertTrue(protected.headers["Location"].endswith("/setup"))
+        self.assertEqual(login.status_code, 302)
+        self.assertTrue(login.headers["Location"].endswith("/setup"))
+        self.assertIn(health.status_code, (200, 503))
+        self.assertEqual(health.get_json()["mode"], "setup")
 
     def test_password_totp_login_rotates_session_and_rejects_replay(self):
         csrf = self.login_csrf()
@@ -212,7 +214,7 @@ class AuthenticationTest(unittest.TestCase):
         self.assertEqual(response.status_code, 302)
 
     def test_route_inventory_has_no_unexpected_public_management_route(self):
-        public = {"login", "healthz", "favicon"}
+        public = {"login", "healthz", "favicon", "setup"}
         management = {rule.endpoint for rule in module.app.url_map.iter_rules()} - {"static"} - public
         expected = {
             "index", "create", "execute_create", "restore_progress", "ui_preview", "change_port_route",

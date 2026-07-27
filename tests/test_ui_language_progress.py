@@ -26,7 +26,7 @@ class UiLanguageAndProgressTest(unittest.TestCase):
         authenticate(self.client, module)
 
     def test_dashboard_is_english(self):
-        self.assertEqual(module.APP_VERSION, "0.1.1-rc.1")
+        self.assertEqual(module.APP_VERSION, "0.1.2-rc.1")
         with patch.object(module, "discover_projects", return_value=[]), \
              patch.object(module, "scan_backup_choices", return_value={"database": [], "files": []}), \
              patch.object(module, "suggest_free_host_port", return_value=18888), \
@@ -71,7 +71,7 @@ class UiLanguageAndProgressTest(unittest.TestCase):
         self.assertIn(b"Type the project name to confirm overwrite", response.data)
         self.assertNotIn(b"For an existing project, type the project name to confirm", response.data)
         self.assertNotIn(b"I understand that an existing project name", response.data)
-        self.assertIn(b'class="version">0.1.1-rc.1</div>', response.data)
+        self.assertIn(b'class="version">0.1.2-rc.1</div>', response.data)
         self.assertNotIn(b"internal administration tool", response.data)
         self.assertNotIn(b"Status, web port and recent administration activity", response.data)
         self.assertNotIn(b"Complete these four steps", response.data)
@@ -176,7 +176,7 @@ class UiLanguageAndProgressTest(unittest.TestCase):
         self.assertIn(b'http-equiv="refresh"', response.data)
         self.assertIn(b"Restoring database", response.data)
         self.assertIn(b"57%", response.data)
-        self.assertIn(b"<div>0.1.1-rc.1</div>", response.data)
+        self.assertIn(b"<div>0.1.2-rc.1</div>", response.data)
         self.assertNotIn(b"0.2 \xc2\xb7 project", response.data)
 
     def test_local_ui_preview_button_is_explicitly_gated(self):

@@ -166,6 +166,38 @@ For upgrades, keep the existing `.env` file. Do not copy `.env.example` over
 it: that would discard the bind choice and authentication enrollment. Duplicate
 configuration keys are rejected before Docker is allowed to publish a port.
 
+### Installation without SSH in Synology Container Manager
+
+The release also includes `docker-compose.container-manager.yml` for a fully
+graphical first installation:
+
+1. Download the release ZIP and extract its `glpi-builder` directory to
+   `/volume1/docker/glpi-builder` with File Station.
+2. Open **Container Manager → Project → Create**.
+3. Select `/volume1/docker/glpi-builder` as the project path and choose
+   `docker-compose.container-manager.yml`.
+4. Review the project. By default port `5055` is published on every NAS IPv4
+   interface. Restrict this port in DSM Firewall to the administration PC or
+   management VLAN before starting the project.
+5. Build and start the project. Open the `glpi-builder` container log in
+   Container Manager and copy the one-time setup token.
+6. Open `http://NAS-IP:5055/setup`, enter the setup token, create the
+   administrator password, add the displayed Base32 secret to an authenticator
+   app, and confirm the current six-digit code.
+
+The random setup token is printed only in the container log and changes after
+an unconfigured restart, preventing another LAN client from claiming the first
+administrator account. The setup page exposes no Docker management actions. It stores only a PBKDF2
+password hash, TOTP secret, and random Flask session key in
+`./config/builder-auth.json`, with mode 600 inside the container. After
+successful enrollment `/setup` permanently returns 404. Keep the `config`
+directory during upgrades.
+
+For HTTPS behind Synology Reverse Proxy, change
+`BUILDER_SESSION_COOKIE_SECURE` to `true` in the project environment and
+recreate the Builder container. Never expose port 5055 directly to the
+internet.
+
 ## Routine administration
 
 Check status and published port:
