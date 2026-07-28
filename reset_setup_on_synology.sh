@@ -25,7 +25,7 @@ case "$APP_DIR" in
     ;;
 esac
 
-if [ -L "$CONFIG_DIR" ] || [ -L "$AUTH_FILE" ] || [ -L "$AUTH_STATE" ] || [ -L "$RECOVERY_ROOT" ]; then
+if [ -L "$APP_DIR" ] || [ -L "$CONFIG_DIR" ] || [ -L "$AUTH_FILE" ] || [ -L "$AUTH_STATE" ] || [ -L "$RECOVERY_ROOT" ]; then
   echo "Refusing authentication reset because a managed path is a symbolic link." >&2
   exit 2
 fi

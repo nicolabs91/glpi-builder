@@ -76,6 +76,15 @@ class SetupResetScriptTest(unittest.TestCase):
         self.assertTrue(self.auth_file.exists())
         self.assertEqual(list(external.iterdir()), [])
 
+    def test_refuses_symlinked_application_directory(self):
+        external_app = Path(self.temporary_directory.name) / "external-app"
+        self.app_dir.rename(external_app)
+        self.app_dir.symlink_to(external_app, target_is_directory=True)
+        result = self.run_script("--confirm-reset")
+        self.assertEqual(result.returncode, 2)
+        self.assertTrue((external_app / "config/builder-auth.json").exists())
+        self.assertFalse((external_app / "config/recovery-backups").exists())
+
 
 if __name__ == "__main__":
     unittest.main()
