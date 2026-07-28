@@ -5,6 +5,7 @@ APP_DIR="${GLPI_BUILDER_APP_DIR:-/volume1/docker/glpi-builder}"
 CONFIG_DIR="$APP_DIR/config"
 AUTH_FILE="$CONFIG_DIR/builder-auth.json"
 AUTH_STATE="${BUILDER_AUTH_STATE_PATH:-/volume1/docker/.glpi-builder-auth-state}"
+RECOVERY_ROOT="$CONFIG_DIR/recovery-backups"
 
 if [ "${1:-}" != "--confirm-reset" ]; then
   echo "Refusing to reset authentication without --confirm-reset." >&2
@@ -24,7 +25,7 @@ case "$APP_DIR" in
     ;;
 esac
 
-if [ -L "$CONFIG_DIR" ] || [ -L "$AUTH_FILE" ] || [ -L "$AUTH_STATE" ]; then
+if [ -L "$CONFIG_DIR" ] || [ -L "$AUTH_FILE" ] || [ -L "$AUTH_STATE" ] || [ -L "$RECOVERY_ROOT" ]; then
   echo "Refusing authentication reset because a managed path is a symbolic link." >&2
   exit 2
 fi
@@ -35,7 +36,7 @@ if [ ! -f "$AUTH_FILE" ]; then
 fi
 
 STAMP=$(date +%Y%m%d-%H%M%S)
-RECOVERY_DIR="$CONFIG_DIR/recovery-backups/$STAMP"
+RECOVERY_DIR="$RECOVERY_ROOT/$STAMP"
 if [ -e "$RECOVERY_DIR" ]; then
   echo "Refusing to overwrite existing recovery backup: $RECOVERY_DIR" >&2
   exit 2

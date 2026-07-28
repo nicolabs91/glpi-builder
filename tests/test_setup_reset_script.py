@@ -67,6 +67,15 @@ class SetupResetScriptTest(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertTrue(target.exists())
 
+    def test_refuses_symlinked_recovery_root(self):
+        external = Path(self.temporary_directory.name) / "external-recovery"
+        external.mkdir()
+        (self.config_dir / "recovery-backups").symlink_to(external, target_is_directory=True)
+        result = self.run_script("--confirm-reset")
+        self.assertEqual(result.returncode, 2)
+        self.assertTrue(self.auth_file.exists())
+        self.assertEqual(list(external.iterdir()), [])
+
 
 if __name__ == "__main__":
     unittest.main()

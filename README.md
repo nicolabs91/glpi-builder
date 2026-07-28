@@ -252,6 +252,14 @@ To explicitly replace the administrator and TOTP enrollment:
 The reset requires the explicit `--confirm-reset` flag, refuses symbolic links
 and unexpected install paths, and does not modify GLPI projects or backups.
 
+If the fresh setup cannot be completed, keep the project stopped and restore
+the previous account from the timestamped recovery directory. Move its
+`builder-auth.json` back to `config/builder-auth.json` and, when present, move
+`totp-replay-state` back to `/volume1/docker/.glpi-builder-auth-state`. Set
+`config` to mode 700 and both restored files to mode 600 before starting the
+project. Do not overwrite a newly created authentication file: move that file
+aside first so the reset remains reversible.
+
 For HTTPS behind Synology Reverse Proxy, change
 `BUILDER_SESSION_COOKIE_SECURE` to `true` in the project environment and
 recreate the Builder container. Never expose port 5055 directly to the
