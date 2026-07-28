@@ -86,6 +86,14 @@ class BackupConfigurationTest(unittest.TestCase):
         self.assertEqual(os.stat(module.backup_schedule_path(self.project)).st_mode & 0o777, 0o600)
         self.assertEqual(os.stat(module.BACKUP_SCRIPT_PATH).st_mode & 0o777, 0o750)
         self.assertEqual(os.stat(module.BACKUP_DISPATCHER_PATH).st_mode & 0o777, 0o750)
+        for directory in (
+            module.BACKUP_TASK_DIR,
+            module.BACKUP_PROJECTS_DIR,
+            module.BACKUP_STATE_DIR,
+            module.BACKUP_LOCKS_DIR,
+        ):
+            self.assertEqual(os.stat(directory).st_mode & 0o777, 0o700)
+        self.assertEqual(os.stat(module.BACKUP_SCHEDULER_DIR).st_mode & 0o777, 0o750)
         self.assertEqual(
             module.BACKUP_DISPATCHER_PATH,
             self.backup_root / "Synology_task_scheduler" / "GLPI_backup_dispatcher.sh",
@@ -106,6 +114,15 @@ class BackupConfigurationTest(unittest.TestCase):
             "Managed by GLPI Builder",
             module.BACKUP_DISPATCHER_PATH.read_text(encoding="utf-8"),
         )
+
+    def test_backup_runtime_rejects_managed_directory_symlink(self):
+        self.task_dir.mkdir(parents=True)
+        target = self.root / "outside-state"
+        target.mkdir()
+        (self.task_dir / "state").symlink_to(target, target_is_directory=True)
+
+        with self.assertRaisesRegex(ValueError, "symlink"):
+            module.install_backup_runtime()
 
     def test_existing_unmanaged_script_is_preserved_once(self):
         self.task_dir.mkdir(parents=True)
@@ -188,6 +205,16 @@ class BackupConfigurationTest(unittest.TestCase):
         self.assertTrue(status["selected"])
         self.assertFalse(status["ready"])
         self.assertTrue(any("credential file" in issue.lower() for issue in status["issues"]))
+
+    def test_dispatcher_detection_accepts_scheduler_fallback_heartbeat(self):
+        fallback = self.scheduler_dir / ".dispatcher.env"
+        fallback.parent.mkdir(parents=True)
+        fallback.write_text(
+            f"LAST_HEARTBEAT={int(module.time.time())}\nSTATUS=idle\n",
+            encoding="utf-8",
+        )
+
+        self.assertTrue(module.dispatcher_is_healthy())
 
     def test_manual_backup_route_starts_a_backup_progress_job(self):
         module.app.config.update(TESTING=True, SECRET_KEY="backup-route-test-secret")

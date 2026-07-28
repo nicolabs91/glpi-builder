@@ -77,6 +77,9 @@ class BackupDispatcherTest(unittest.TestCase):
             module.read_simple_env_file(self.state / "dispatcher.env")["STATUS"],
             "idle",
         )
+        fallback = module.read_simple_env_file(self.scheduler / ".dispatcher.env")
+        self.assertEqual(fallback["STATUS"], "idle")
+        self.assertTrue(fallback["LAST_HEARTBEAT"].isdigit())
 
     def test_dispatcher_does_not_repeat_interval_before_it_is_due(self):
         self.write_schedule("glpi-one")
@@ -98,6 +101,21 @@ class BackupDispatcherTest(unittest.TestCase):
         )
         self.assertIn("already active", result.stdout)
         self.assertFalse((self.root / "runs").exists())
+
+    def test_dispatcher_rejects_symlinked_state_directory(self):
+        self.state.rmdir()
+        outside = self.root / "outside-state"
+        outside.mkdir()
+        self.state.symlink_to(outside, target_is_directory=True)
+
+        result = subprocess.run(
+            ["/bin/bash", str(self.dispatcher)],
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Unsafe symlink", result.stderr)
 
     def test_failed_run_records_error_and_preserves_last_success(self):
         self.write_schedule("glpi-one")

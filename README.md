@@ -201,6 +201,32 @@ password hash, TOTP secret, and random Flask session key in
 successful enrollment `/setup` permanently returns 404. Keep the `config`
 directory during upgrades.
 
+### Upgrade an existing Container Manager installation
+
+1. Download the new release ZIP and stop the `glpi-builder` project in
+   Container Manager.
+2. In File Station, make a safety copy of
+   `/volume1/docker/glpi-builder/config`. This directory contains the existing
+   administrator and TOTP enrollment.
+3. Extract the release and copy its files over
+   `/volume1/docker/glpi-builder`, replacing the application files. Do not
+   delete or replace the existing `config` directory.
+4. In **Container Manager → Project → glpi-builder**, choose **Action → Build**
+   (or recreate/update the project with the existing
+   `docker-compose.container-manager.yml`) so the image is rebuilt from the
+   new source.
+5. Start the project and wait until the `glpi-builder` container is healthy.
+   Sign in with the existing administrator and TOTP code; `/setup` should not
+   appear again.
+6. Run the existing root DSM Task Scheduler task once, open **Backups**, and
+   choose **Verify backup sources**. The dispatcher status should become
+   active.
+
+Rollback is file-based: stop the project, restore the previous release files
+while keeping the same `config` directory, rebuild, and start it again. Project
+data and backups below `/volume1/docker/<project>` and
+`/volume1/docker/_BACKUPS` are not replaced by this Builder upgrade.
+
 For HTTPS behind Synology Reverse Proxy, change
 `BUILDER_SESSION_COOKIE_SECURE` to `true` in the project environment and
 recreate the Builder container. Never expose port 5055 directly to the

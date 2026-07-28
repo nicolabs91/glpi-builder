@@ -40,7 +40,7 @@ from app_ui import (
     page_template,
 )
 
-APP_VERSION = "0.3.0"
+APP_VERSION = "0.3.1"
 BUILDER_TEST_PREVIEW_MODE = os.environ.get(
     "BUILDER_TEST_PREVIEW_MODE", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
@@ -989,6 +989,30 @@ def backup_state_path(project):
     return BACKUP_STATE_DIR / f"{validate_project(project)}.env"
 
 
+def dispatcher_heartbeat_paths():
+    return (
+        BACKUP_STATE_DIR / "dispatcher.env",
+        BACKUP_SCHEDULER_DIR / ".dispatcher.env",
+    )
+
+
+def dispatcher_heartbeat():
+    newest = {}
+    newest_epoch = 0
+    for path in dispatcher_heartbeat_paths():
+        heartbeat = read_simple_env_file(path)
+        epoch = safe_int(heartbeat.get("LAST_HEARTBEAT"), 0, 0)
+        if epoch > newest_epoch:
+            newest = heartbeat
+            newest_epoch = epoch
+    return newest, newest_epoch
+
+
+def dispatcher_is_healthy(max_age_seconds=1200):
+    _heartbeat, heartbeat_epoch = dispatcher_heartbeat()
+    return bool(heartbeat_epoch and time.time() - heartbeat_epoch < max_age_seconds)
+
+
 def safe_int(value, default=0, minimum=None, maximum=None):
     try:
         parsed = int(value)
@@ -1106,8 +1130,6 @@ def backup_schedule_status(project):
         else:
             last = safe_int(state.get("LAST_ATTEMPT"), 0, 0)
             next_run = datetime.fromtimestamp(last) + timedelta(hours=interval_hours) if last else now
-    heartbeat = read_simple_env_file(BACKUP_STATE_DIR / "dispatcher.env")
-    heartbeat_epoch = safe_int(heartbeat.get("LAST_HEARTBEAT"), 0, 0)
     return {
         "enabled": enabled,
         "kind": kind,
@@ -1119,7 +1141,7 @@ def backup_schedule_status(project):
         "last_status": state.get("LAST_STATUS", "Not run"),
         "last_attempt": datetime.fromtimestamp(int(state["LAST_ATTEMPT"])).strftime("%Y-%m-%d %H:%M") if state.get("LAST_ATTEMPT", "").isdigit() else "",
         "last_success": datetime.fromtimestamp(int(state["LAST_SUCCESS"])).strftime("%Y-%m-%d %H:%M") if state.get("LAST_SUCCESS", "").isdigit() else "",
-        "dispatcher_healthy": bool(heartbeat_epoch and time.time() - heartbeat_epoch < 1200),
+        "dispatcher_healthy": dispatcher_is_healthy(),
     }
 
 
@@ -1195,6 +1217,16 @@ def atomic_write_text(path, text, mode):
     finally:
         if temporary_path.exists():
             temporary_path.unlink()
+
+
+def ensure_managed_directory(path, mode):
+    """Create one Builder-owned runtime directory with predictable permissions."""
+    path = Path(path)
+    if path.is_symlink():
+        raise ValueError(f"Managed directory must not be a symlink: {path}")
+    path.mkdir(parents=True, exist_ok=True)
+    os.chmod(path, mode)
+    return path
 
 
 def _copy_legacy_backup_file(source, destination, mode, *, rewrite_config=False):
@@ -1286,10 +1318,11 @@ def install_backup_runtime():
     for source in (BACKUP_SCRIPT_SOURCE, BACKUP_DISPATCHER_SOURCE):
         if not source.is_file():
             raise ValueError(f"Bundled backup script is missing: {source}")
-    BACKUP_PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
-    BACKUP_STATE_DIR.mkdir(parents=True, exist_ok=True)
-    BACKUP_LOCKS_DIR.mkdir(parents=True, exist_ok=True)
-    BACKUP_SCHEDULER_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_managed_directory(BACKUP_TASK_DIR, 0o700)
+    ensure_managed_directory(BACKUP_PROJECTS_DIR, 0o700)
+    ensure_managed_directory(BACKUP_STATE_DIR, 0o700)
+    ensure_managed_directory(BACKUP_LOCKS_DIR, 0o700)
+    ensure_managed_directory(BACKUP_SCHEDULER_DIR, 0o750)
     migrate_legacy_backup_runtime()
     if BACKUP_SCRIPT_PATH.exists():
         existing_header = BACKUP_SCRIPT_PATH.read_text(
@@ -1368,8 +1401,8 @@ def configure_scheduled_backup(project, env=None, *, enabled=True, kind="daily",
     config_text = "# Generated and maintained by GLPI Builder.\n" + "".join(
         f"{key}={value}\n" for key, value in values.items()
     )
-    BACKUP_PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
-    BACKUP_STATE_DIR.mkdir(parents=True, exist_ok=True)
+    ensure_managed_directory(BACKUP_PROJECTS_DIR, 0o700)
+    ensure_managed_directory(BACKUP_STATE_DIR, 0o700)
     atomic_write_text(backup_schedule_path(project), config_text, 0o600)
     messages = [
         f"Backup configuration: {project}",
@@ -2932,6 +2965,40 @@ def fix_permissions(project):
     return msg
 
 
+def prepare_db_directory(project):
+    """Make a Synology bind mount writable for first-time DB initialization.
+
+    Container Manager creates host folders as root with a restrictive umask.
+    MariaDB may already be running as its unprivileged image user when it
+    attempts to create ddl_recovery.log, so the image entrypoint cannot always
+    repair the host directory itself.
+    """
+    db_folder = project_dir(project) / "db"
+    if db_folder.is_symlink():
+        raise RuntimeError(f"Refusing to use a symlink as database directory: {db_folder}")
+    db_folder.mkdir(parents=True, exist_ok=True)
+    os.chmod(db_folder, 0o777)
+    return db_folder
+
+
+def finalize_db_directory_permissions(project):
+    """Replace bootstrap permissions with the UID/GID MariaDB initialized."""
+    db_folder = project_dir(project) / "db"
+    ownership_source = next(
+        (path for path in (db_folder / "mysql", db_folder / "ibdata1") if path.exists()),
+        None,
+    )
+    if ownership_source is None:
+        return "Database directory bootstrap permissions remain active; MariaDB ownership was not detected."
+    stat = ownership_source.stat()
+    try:
+        os.chown(db_folder, stat.st_uid, stat.st_gid)
+        os.chmod(db_folder, 0o750)
+    except OSError as exc:
+        return f"MariaDB is running, but database directory permissions could not be tightened: {exc}"
+    return "Database directory permissions were tightened after MariaDB initialization."
+
+
 def create_db_container(project, env, clean_db):
     cli = docker_client()
 
@@ -2941,7 +3008,8 @@ def create_db_container(project, env, clean_db):
         db_folder = project_dir(project) / "db"
         if db_folder.exists():
             shutil.rmtree(db_folder)
-        db_folder.mkdir(parents=True, exist_ok=True)
+
+    prepare_db_directory(project)
 
     existing = get_container(f"{project}-db")
     if existing:
@@ -3120,6 +3188,7 @@ def create_or_restore(
     messages.append(msg)
     if not ok:
         raise RuntimeError(msg)
+    messages.append(finalize_db_directory_permissions(project))
 
     if db_backup:
         report(57, "Restoring database", "Importing the selected database backup. This can take several minutes.")
@@ -4082,17 +4151,13 @@ def setup():
         except ValueError as exc:
             login_rate_record_failure(key)
             error = str(exc)
-    dispatcher = read_simple_env_file(BACKUP_STATE_DIR / "dispatcher.env")
-    dispatcher_epoch = safe_int(dispatcher.get("LAST_HEARTBEAT"), 0, 0)
     return render_template_string(
         SETUP_HTML,
         error=error,
         totp_secret=secret,
         preview_only=False,
         dispatcher_command=f"/bin/bash {BACKUP_DISPATCHER_PATH}",
-        dispatcher_healthy=bool(
-            dispatcher_epoch and time.time() - dispatcher_epoch < 1200
-        ),
+        dispatcher_healthy=dispatcher_is_healthy(),
     )
 
 
@@ -4743,8 +4808,6 @@ def backups_page():
         backup_choices["files"],
         demo=test_demo_is_active(),
     )
-    dispatcher = read_simple_env_file(BACKUP_STATE_DIR / "dispatcher.env")
-    dispatcher_epoch = int(dispatcher.get("LAST_HEARTBEAT", "0") or 0)
     return render_professional_page(
         BACKUPS,
         "Backups",
@@ -4768,8 +4831,7 @@ def backups_page():
         stale_days=BACKUP_STALE_DAYS,
         dispatcher_command=f"/bin/bash {BACKUP_DISPATCHER_PATH}",
         dispatcher_healthy=bool(
-            test_demo_is_active()
-            or (dispatcher_epoch and time.time() - dispatcher_epoch < 1200)
+            test_demo_is_active() or dispatcher_is_healthy()
         ),
         legacy_backup_config=(
             not test_demo_is_active()

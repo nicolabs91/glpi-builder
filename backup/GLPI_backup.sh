@@ -30,6 +30,8 @@ GLPI_PLUGINS_DIR="$PROJECT_DIR/plugins"
 [ -f "$MYSQL_CNF" ] || fail "Credential file not found: $MYSQL_CNF"
 [ -d "$GLPI_DATA_DIR" ] || fail "GLPI data folder not found: $GLPI_DATA_DIR"
 [ -d "$GLPI_PLUGINS_DIR" ] || fail "GLPI plugins folder not found: $GLPI_PLUGINS_DIR"
+[ -r "$GLPI_DATA_DIR" ] && [ -x "$GLPI_DATA_DIR" ] || fail "GLPI data folder is not readable: $GLPI_DATA_DIR"
+[ -r "$GLPI_PLUGINS_DIR" ] && [ -x "$GLPI_PLUGINS_DIR" ] || fail "GLPI plugins folder is not readable: $GLPI_PLUGINS_DIR"
 
 if docker info >/dev/null 2>&1; then
   DOCKER=(docker)
@@ -44,9 +46,14 @@ RUNNING=$("${DOCKER[@]}" inspect --format '{{.State.Running}}' "$DB_CONTAINER")
 [ "$RUNNING" = "true" ] || fail "Database container is not running: $DB_CONTAINER"
 
 PROJECT_BACKUP_ROOT="$BACKUP_ROOT/$PROJECT_NAME"
+[ ! -L "$PROJECT_BACKUP_ROOT" ] || fail "Project backup folder must not be a symlink: $PROJECT_BACKUP_ROOT"
 mkdir -p "$PROJECT_BACKUP_ROOT"
+chmod 0750 "$PROJECT_BACKUP_ROOT"
+[ -w "$PROJECT_BACKUP_ROOT" ] && [ -x "$PROJECT_BACKUP_ROOT" ] || fail "Project backup folder is not writable: $PROJECT_BACKUP_ROOT"
 LOCKS_DIR="$SCRIPT_DIR/locks"
+[ ! -L "$LOCKS_DIR" ] || fail "Backup locks folder must not be a symlink: $LOCKS_DIR"
 mkdir -p "$LOCKS_DIR"
+chmod 0700 "$LOCKS_DIR"
 LOCK_DIR="$LOCKS_DIR/backup.lock"
 mkdir "$LOCK_DIR" 2>/dev/null || fail "Another GLPI backup is already running"
 

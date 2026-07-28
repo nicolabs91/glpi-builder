@@ -10,21 +10,37 @@ STATE_DIR="$BACKUP_TASK_DIR/state"
 LOCKS_DIR="$BACKUP_TASK_DIR/locks"
 BACKUP_SCRIPT="$BACKUP_TASK_DIR/GLPI_backup.sh"
 HEARTBEAT="$STATE_DIR/dispatcher.env"
+FALLBACK_HEARTBEAT="$SCRIPT_DIR/.dispatcher.env"
 LOCK_DIR="$LOCKS_DIR/dispatcher.lock"
 
-mkdir -p "$PROJECTS_DIR" "$STATE_DIR" "$LOCKS_DIR"
+for DIRECTORY in "$PROJECTS_DIR" "$STATE_DIR" "$LOCKS_DIR"; do
+  [ ! -L "$DIRECTORY" ] || {
+    echo "Unsafe symlink used for managed backup directory: $DIRECTORY" >&2
+    exit 1
+  }
+  mkdir -p "$DIRECTORY"
+  chmod 0700 "$DIRECTORY"
+done
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
   echo "Another dispatcher run is already active; exiting safely."
   exit 0
 fi
 trap 'rmdir "$LOCK_DIR" >/dev/null 2>&1 || true' EXIT INT TERM
 
+write_heartbeat() {
+  STATUS_VALUE=$1
+  HEARTBEAT_EPOCH=$(date +%s)
+  printf 'LAST_HEARTBEAT=%s\nSTATUS=%s\n' "$HEARTBEAT_EPOCH" "$STATUS_VALUE" > "$HEARTBEAT.tmp"
+  mv "$HEARTBEAT.tmp" "$HEARTBEAT"
+  printf 'LAST_HEARTBEAT=%s\nSTATUS=%s\n' "$HEARTBEAT_EPOCH" "$STATUS_VALUE" > "$FALLBACK_HEARTBEAT.tmp"
+  mv "$FALLBACK_HEARTBEAT.tmp" "$FALLBACK_HEARTBEAT"
+}
+
 NOW=$(date +%s)
 TODAY=$(date +%Y-%m-%d)
 WEEKDAY=$(date +%u)
 CURRENT_HM=$(date +%H:%M)
-printf 'LAST_HEARTBEAT=%s\nSTATUS=running\n' "$NOW" > "$HEARTBEAT.tmp"
-mv "$HEARTBEAT.tmp" "$HEARTBEAT"
+write_heartbeat running
 
 for CONFIG in "$PROJECTS_DIR"/*.env; do
   [ -f "$CONFIG" ] || continue
@@ -76,5 +92,4 @@ for CONFIG in "$PROJECTS_DIR"/*.env; do
   mv "$LOG.tmp" "$LOG"
 done
 
-printf 'LAST_HEARTBEAT=%s\nSTATUS=idle\n' "$(date +%s)" > "$HEARTBEAT.tmp"
-mv "$HEARTBEAT.tmp" "$HEARTBEAT"
+write_heartbeat idle
