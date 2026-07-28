@@ -39,7 +39,7 @@ class BackupConfigurationTest(unittest.TestCase):
         (project_path / "glpi").mkdir()
         (project_path / "plugins").mkdir()
         (project_path / ".env").write_text(
-            "PROJECT_NAME=glpi-production\nGLPI_DB_NAME=glpi\n",
+            "PROJECT_NAME=glpi-production\nGLPI_DB_NAME=glpi\nMARIADB_ROOT_PASSWORD=production-secret\n",
             encoding="utf-8",
         )
         source = Path(module.__file__).resolve().parent / "backup" / "GLPI_backup.sh"
@@ -58,6 +58,7 @@ class BackupConfigurationTest(unittest.TestCase):
             patch.object(module, "BACKUP_DISPATCHER_SOURCE", dispatcher_source),
             patch.object(module, "BACKUP_DISPATCHER_PATH", self.scheduler_dir / "GLPI_backup_dispatcher.sh"),
             patch.object(module, "BACKUP_PROJECTS_DIR", self.task_dir / "projects"),
+            patch.object(module, "BACKUP_CREDENTIALS_DIR", self.task_dir / "credentials"),
             patch.object(module, "BACKUP_STATE_DIR", self.task_dir / "state"),
             patch.object(module, "BACKUP_LOCKS_DIR", self.task_dir / "locks"),
             patch.object(module, "database_container_for_project", return_value="glpi-prod-mdb1222"),
@@ -82,6 +83,14 @@ class BackupConfigurationTest(unittest.TestCase):
         self.assertEqual(config["DB_NAME"], "glpi")
         self.assertEqual(config["RETENTION_DAYS"], "60")
         self.assertEqual(config["BACKUP_ROOT"], str(self.data_root))
+        self.assertEqual(
+            config["MYSQL_CNF"],
+            str(module.BACKUP_CREDENTIALS_DIR / f"{self.project}.cnf"),
+        )
+        self.assertEqual(
+            os.stat(config["MYSQL_CNF"]).st_mode & 0o777,
+            0o600,
+        )
         self.assertEqual(module.current_backup_source_project(), self.project)
         self.assertEqual(os.stat(module.backup_schedule_path(self.project)).st_mode & 0o777, 0o600)
         self.assertEqual(os.stat(module.BACKUP_SCRIPT_PATH).st_mode & 0o777, 0o750)
@@ -89,6 +98,7 @@ class BackupConfigurationTest(unittest.TestCase):
         for directory in (
             module.BACKUP_TASK_DIR,
             module.BACKUP_PROJECTS_DIR,
+            module.BACKUP_CREDENTIALS_DIR,
             module.BACKUP_STATE_DIR,
             module.BACKUP_LOCKS_DIR,
         ):
@@ -161,7 +171,10 @@ class BackupConfigurationTest(unittest.TestCase):
 
         migrated = module.read_simple_env_file(module.backup_schedule_path(self.project))
         self.assertEqual(migrated["BACKUP_ROOT"], str(self.data_root))
-        self.assertEqual(migrated["MYSQL_CNF"], str(module.BACKUP_CNF_PATH))
+        self.assertEqual(
+            migrated["MYSQL_CNF"],
+            str(module.project_backup_credential_path(self.project)),
+        )
         self.assertEqual(
             (module.BACKUP_STATE_DIR / legacy_log.name).read_bytes(),
             b"legacy state\\xff",
@@ -172,7 +185,6 @@ class BackupConfigurationTest(unittest.TestCase):
 
     def test_backup_status_reports_readiness_and_latest_verified_backup(self):
         module.configure_scheduled_backup(self.project)
-        module.BACKUP_CNF_PATH.write_text("[client]\nuser=root\n", encoding="utf-8")
         backup = self.data_root / self.project / "2026-07-11_120000"
         backup.mkdir(parents=True)
         (backup / "manifest.json").write_text(
@@ -197,14 +209,86 @@ class BackupConfigurationTest(unittest.TestCase):
         self.assertTrue(status["latest"]["checksum_manifest"])
 
     def test_backup_status_explains_missing_credentials(self):
+        (self.base_path / self.project / ".env").write_text(
+            "PROJECT_NAME=glpi-production\nGLPI_DB_NAME=glpi\n",
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ValueError, "root password"):
+            module.configure_scheduled_backup(self.project)
+
+    def test_projects_receive_distinct_private_credentials(self):
+        second = "glpi-test"
+        second_path = self.base_path / second
+        (second_path / "db").mkdir(parents=True)
+        (second_path / "glpi").mkdir()
+        (second_path / "plugins").mkdir()
+        (second_path / ".env").write_text(
+            "PROJECT_NAME=glpi-test\nGLPI_DB_NAME=glpi\nMARIADB_ROOT_PASSWORD=test-secret\n",
+            encoding="utf-8",
+        )
+
         module.configure_scheduled_backup(self.project)
+        module.configure_scheduled_backup(second)
+        first_config = module.read_simple_env_file(module.backup_schedule_path(self.project))
+        second_config = module.read_simple_env_file(module.backup_schedule_path(second))
+        first_cnf = Path(first_config["MYSQL_CNF"])
+        second_cnf = Path(second_config["MYSQL_CNF"])
+        self.assertNotEqual(first_cnf, second_cnf)
+        self.assertIn('password="production-secret"', first_cnf.read_text(encoding="utf-8"))
+        self.assertIn('password="test-secret"', second_cnf.read_text(encoding="utf-8"))
+        self.assertEqual(os.stat(first_cnf).st_mode & 0o777, 0o600)
+        self.assertEqual(os.stat(second_cnf).st_mode & 0o777, 0o600)
         database = type("Database", (), {"status": "running", "reload": lambda self: None})()
         with patch.object(module, "get_container", return_value=database):
-            status = module.scheduled_backup_status(self.project)
+            self.assertTrue(module.scheduled_backup_status(self.project)["ready"])
+            self.assertTrue(module.scheduled_backup_status(second)["ready"])
 
-        self.assertTrue(status["selected"])
-        self.assertFalse(status["ready"])
-        self.assertTrue(any("credential file" in issue.lower() for issue in status["issues"]))
+    def test_existing_schedule_migrates_from_global_to_project_credential(self):
+        module.install_backup_runtime()
+        legacy_global = self.task_dir / "GLPI_mysql_backup.cnf"
+        legacy_global.write_text("[client]\npassword=old-shared-secret\n", encoding="utf-8")
+        schedule = module.backup_schedule_path(self.project)
+        schedule.write_text(
+            "\n".join(
+                [
+                    f"PROJECT_NAME={self.project}",
+                    f"PROJECT_DIR={self.base_path / self.project}",
+                    "DB_CONTAINER=glpi-prod-mdb1222",
+                    "DB_NAME=glpi",
+                    f"BACKUP_ROOT={self.data_root}",
+                    f"MYSQL_CNF={legacy_global}",
+                    "CONTAINER_CNF=/tmp/GLPI_mysql_backup.cnf",
+                    "RETENTION_DAYS=60",
+                    "SCHEDULE_ENABLED=yes",
+                    "SCHEDULE_KIND=daily",
+                    "SCHEDULE_TIME=02:00",
+                    "SCHEDULE_WEEKDAYS=7",
+                    "INTERVAL_HOURS=24",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        migrated = module.migrate_project_backup_credentials()
+
+        configured = module.read_simple_env_file(schedule)
+        credential = module.project_backup_credential_path(self.project)
+        self.assertEqual(migrated, [str(schedule)])
+        self.assertEqual(configured["MYSQL_CNF"], str(credential))
+        self.assertIn('password="production-secret"', credential.read_text(encoding="utf-8"))
+        self.assertEqual(os.stat(credential).st_mode & 0o777, 0o600)
+        self.assertIn("old-shared-secret", legacy_global.read_text(encoding="utf-8"))
+
+    def test_project_credential_rejects_symlinked_environment(self):
+        environment = self.base_path / self.project / ".env"
+        outside = self.root / "outside.env"
+        outside.write_text("MARIADB_ROOT_PASSWORD=outside-secret\n", encoding="utf-8")
+        environment.unlink()
+        environment.symlink_to(outside)
+
+        with self.assertRaisesRegex(ValueError, "symlink"):
+            module.ensure_project_backup_credential(self.project)
 
     def test_dispatcher_detection_accepts_scheduler_fallback_heartbeat(self):
         fallback = self.scheduler_dir / ".dispatcher.env"

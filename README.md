@@ -398,26 +398,18 @@ locks, and the managed backup script live separately below
 copied safely from the former `Restore_Scripts/GLPI` location when their new
 equivalent does not exist; the old location is never deleted automatically.
 
-The Builder does not create or modify `GLPI_mysql_backup.cnf`. Ensure that this
-file already exists:
+The Builder creates a separate private MariaDB option file for every project
+from that project's `.env`:
 
 ```text
-/volume1/docker/_BACKUPS/GLPI_backup/_system/GLPI_mysql_backup.cnf
+/volume1/docker/_BACKUPS/GLPI_backup/_system/credentials/<project>.cnf
 ```
 
-Minimal example:
-
-```ini
-[client]
-user=root
-password=<database-root-password>
-```
-
-Restrict access to this file:
-
-```sh
-sudo chmod 600 /volume1/docker/_BACKUPS/GLPI_backup/_system/GLPI_mysql_backup.cnf
-```
+The credentials directory is mode `0700` and each option file is mode `0600`.
+Saving or verifying an existing schedule migrates it away from the former
+shared `GLPI_mysql_backup.cnf` automatically. This is required because projects
+have independent MariaDB root passwords. Do not copy one project's option file
+to another project.
 
 When a project's backup configuration reports **Backup ready**, **Run backup
 now** starts the managed backup script as a monitored background task. The

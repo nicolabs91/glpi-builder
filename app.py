@@ -66,6 +66,7 @@ BACKUP_SCRIPT_PATH = BACKUP_TASK_DIR / "GLPI_backup.sh"
 BACKUP_DISPATCHER_PATH = BACKUP_SCHEDULER_DIR / "GLPI_backup_dispatcher.sh"
 BACKUP_ENV_PATH = BACKUP_TASK_DIR / "GLPI_backup.env"
 BACKUP_PROJECTS_DIR = BACKUP_TASK_DIR / "projects"
+BACKUP_CREDENTIALS_DIR = BACKUP_TASK_DIR / "credentials"
 BACKUP_STATE_DIR = BACKUP_TASK_DIR / "state"
 BACKUP_LOCKS_DIR = BACKUP_TASK_DIR / "locks"
 BACKUP_CNF_PATH = BACKUP_TASK_DIR / "GLPI_mysql_backup.cnf"
@@ -1330,10 +1331,12 @@ def install_backup_runtime():
             raise ValueError(f"Bundled backup script is missing: {source}")
     ensure_managed_directory(BACKUP_TASK_DIR, 0o700)
     ensure_managed_directory(BACKUP_PROJECTS_DIR, 0o700)
+    ensure_managed_directory(BACKUP_CREDENTIALS_DIR, 0o700)
     ensure_managed_directory(BACKUP_STATE_DIR, 0o700)
     ensure_managed_directory(BACKUP_LOCKS_DIR, 0o700)
     ensure_managed_directory(BACKUP_SCHEDULER_DIR, 0o750)
     migrate_legacy_backup_runtime()
+    migrate_project_backup_credentials()
     if BACKUP_SCRIPT_PATH.exists():
         existing_header = BACKUP_SCRIPT_PATH.read_text(
             encoding="utf-8", errors="replace"
@@ -1362,6 +1365,73 @@ def install_backup_dispatcher():
     install_backup_runtime()
 
 
+def project_backup_credential_path(project):
+    """Return the managed credential path for exactly one validated project."""
+    project = validate_project(project)
+    return BACKUP_CREDENTIALS_DIR / f"{project}.cnf"
+
+
+def ensure_project_backup_credential(project, env=None):
+    """Atomically create/update a private MariaDB option file for one project."""
+    project = validate_project(project)
+    folder = project_dir(project)
+    environment_path = folder / ".env"
+    try:
+        folder.resolve().relative_to(BASE_PATH.resolve())
+        BACKUP_CREDENTIALS_DIR.resolve().relative_to(BACKUP_TASK_DIR.resolve())
+    except Exception:
+        raise ValueError("Managed project or credential path escaped its configured root.")
+    if folder.is_symlink() or environment_path.is_symlink():
+        raise ValueError(f"Project environment must not use symlinks: {environment_path}")
+    env = dict(env or read_env(project))
+    password = str(env.get("MARIADB_ROOT_PASSWORD") or "")
+    if not password:
+        raise ValueError(f"MariaDB root password is missing from {project}/.env.")
+    if any(character in password for character in ("\r", "\n", "\x00")):
+        raise ValueError("MariaDB root password contains unsupported control characters.")
+    ensure_managed_directory(BACKUP_CREDENTIALS_DIR, 0o700)
+    destination = project_backup_credential_path(project)
+    if destination.is_symlink():
+        raise ValueError(f"Managed backup credential must not be a symlink: {destination}")
+    escaped = password.replace("\\", "\\\\").replace('"', '\\"')
+    atomic_write_text(
+        destination,
+        f'[client]\nuser=root\npassword="{escaped}"\n',
+        0o600,
+    )
+    return destination
+
+
+def migrate_project_backup_credentials():
+    """Safely rewrite existing schedules to their own derived credential file."""
+    if not BACKUP_PROJECTS_DIR.is_dir() or BACKUP_PROJECTS_DIR.is_symlink():
+        return []
+    migrated = []
+    for schedule_path in BACKUP_PROJECTS_DIR.glob("*.env"):
+        if schedule_path.is_symlink() or not schedule_path.is_file():
+            continue
+        try:
+            project = validate_project(schedule_path.stem)
+            configured = read_simple_env_file(schedule_path)
+            if configured.get("PROJECT_NAME") != project:
+                continue
+            credential = ensure_project_backup_credential(project)
+            if configured.get("MYSQL_CNF") == str(credential):
+                continue
+            configured["MYSQL_CNF"] = str(credential)
+            atomic_write_text(
+                schedule_path,
+                "# Generated and maintained by GLPI Builder.\n"
+                + "".join(f"{key}={value}\n" for key, value in configured.items()),
+                0o600,
+            )
+            migrated.append(str(schedule_path))
+        except (OSError, ValueError):
+            # Invalid projects remain untouched and visibly fail readiness checks.
+            continue
+    return migrated
+
+
 def configure_scheduled_backup(project, env=None, *, enabled=True, kind="daily", schedule_time="02:00", weekdays="7", interval_hours="24", retention_days="60"):
     project = validate_project(project)
     install_backup_runtime()
@@ -1386,7 +1456,7 @@ def configure_scheduled_backup(project, env=None, *, enabled=True, kind="daily",
     previous = read_simple_env_file(backup_schedule_path(project))
     if not previous:
         previous = read_simple_env_file(BACKUP_ENV_PATH)
-    mysql_cnf = previous.get("MYSQL_CNF") or str(BACKUP_CNF_PATH)
+    mysql_cnf = str(ensure_project_backup_credential(project, env))
     container_cnf = previous.get("CONTAINER_CNF") or "/tmp/GLPI_mysql_backup.cnf"
     values = {
         "PROJECT_NAME": project,
@@ -1423,8 +1493,6 @@ def configure_scheduled_backup(project, env=None, *, enabled=True, kind="daily",
         f"Backup environment: {backup_schedule_path(project)}",
         f"Task Scheduler command: /bin/bash {BACKUP_DISPATCHER_PATH}",
     ]
-    if not Path(mysql_cnf).is_file():
-        messages.append(f"Warning: MariaDB credential file is not present yet: {mysql_cnf}")
     return messages
 
 
@@ -1527,9 +1595,29 @@ def scheduled_backup_status(project):
         status["issues"].append("Managed backup script is missing.")
     if not backup_schedule_path(project).is_file() and not BACKUP_ENV_PATH.is_file():
         status["issues"].append("Backup environment file is missing.")
-    mysql_cnf = Path(configured.get("MYSQL_CNF") or BACKUP_CNF_PATH)
+    try:
+        mysql_cnf = ensure_project_backup_credential(project)
+    except ValueError as error:
+        mysql_cnf = project_backup_credential_path(project)
+        status["issues"].append(str(error))
     if not mysql_cnf.is_file():
         status["issues"].append(f"MariaDB credential file is missing: {mysql_cnf}")
+    elif mysql_cnf.is_symlink():
+        status["issues"].append(f"MariaDB credential file must not be a symlink: {mysql_cnf}")
+    elif mysql_cnf.stat().st_mode & 0o077:
+        status["issues"].append(f"MariaDB credential file permissions are not private: {mysql_cnf}")
+    elif configured.get("MYSQL_CNF") != str(mysql_cnf):
+        schedule_path = backup_schedule_path(project)
+        if schedule_path.is_file() and not schedule_path.is_symlink():
+            configured["MYSQL_CNF"] = str(mysql_cnf)
+            atomic_write_text(
+                schedule_path,
+                "# Generated and maintained by GLPI Builder.\n"
+                + "".join(f"{key}={value}\n" for key, value in configured.items()),
+                0o600,
+            )
+        else:
+            status["issues"].append("Backup schedule uses legacy credentials; save the schedule once to migrate it.")
     if not (project_dir(project) / "glpi").is_dir():
         status["issues"].append("GLPI data directory is missing.")
     if not (project_dir(project) / "plugins").is_dir():
