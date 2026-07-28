@@ -2,6 +2,8 @@
 
 ## 0.3.2
 
+- Recognize ISO 8601 backup-manifest timestamps with `T`, `Z`, and numeric
+  timezone offsets so valid backups no longer show `Unknown age`.
 - Preserve existing Builder credentials and TOTP enrollment during normal
   Container Manager upgrades.
 - Explain invalid authentication-file states in the browser and container log,

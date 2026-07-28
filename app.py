@@ -1643,16 +1643,27 @@ def backup_age(created_at):
     """Return backup age metadata without trusting locale-specific parsing."""
     if not created_at:
         return {"days": None, "label": "Unknown age", "stale": True}
+    value = str(created_at).strip()
     parsed = None
+    try:
+        # Backup manifests use ISO 8601, commonly with a T separator and a
+        # numeric timezone such as +0200.  fromisoformat also keeps legacy
+        # space-separated timestamps working.
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        pass
     for pattern in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        if parsed is not None:
+            break
         try:
-            parsed = datetime.strptime(str(created_at), pattern)
+            parsed = datetime.strptime(value, pattern)
             break
         except ValueError:
             continue
     if parsed is None:
         return {"days": None, "label": "Unknown age", "stale": True}
-    days = max(0, int((datetime.now() - parsed).total_seconds() // 86400))
+    now = datetime.now(parsed.tzinfo) if parsed.tzinfo is not None else datetime.now()
+    days = max(0, int((now - parsed).total_seconds() // 86400))
     return {
         "days": days,
         "label": "Today" if days == 0 else f"{days} day{'s' if days != 1 else ''} old",
