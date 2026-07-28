@@ -227,6 +227,31 @@ while keeping the same `config` directory, rebuild, and start it again. Project
 data and backups below `/volume1/docker/<project>` and
 `/volume1/docker/_BACKUPS` are not replaced by this Builder upgrade.
 
+### Recover or reset Container Manager authentication
+
+An upgrade preserves `config/builder-auth.json`, so the existing administrator
+password and TOTP enrollment continue to work. If that file exists but has
+invalid contents or unsafe permissions, Builder deliberately does not create a
+new setup token. The browser and container log explain this state instead of
+silently treating the installation as new.
+
+First try preserving the account: stop the project, set `config` to mode 700
+and `config/builder-auth.json` to mode 600, then restart it.
+
+To explicitly replace the administrator and TOTP enrollment:
+
+1. Stop the `glpi-builder` project.
+2. Create a temporary root task in DSM Task Scheduler with:
+   `/bin/sh /volume1/docker/glpi-builder/reset_setup_on_synology.sh --confirm-reset`
+3. Run it once. The script moves the old auth file and TOTP replay state to
+   `config/recovery-backups/<timestamp>/`, using private permissions.
+4. Start the project, copy the new token from the container log, and complete
+   `/setup`.
+5. Remove the temporary DSM task after setup succeeds.
+
+The reset requires the explicit `--confirm-reset` flag, refuses symbolic links
+and unexpected install paths, and does not modify GLPI projects or backups.
+
 For HTTPS behind Synology Reverse Proxy, change
 `BUILDER_SESSION_COOKIE_SECURE` to `true` in the project environment and
 recreate the Builder container. Never expose port 5055 directly to the

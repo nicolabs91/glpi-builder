@@ -92,6 +92,17 @@ class BrowserSetupTest(unittest.TestCase):
         response = self.client.head("/setup")
         self.assertEqual(response.status_code, 200)
 
+    def test_invalid_existing_auth_explains_safe_recovery_and_has_no_setup_token(self):
+        self.config_path.write_text("{broken", encoding="utf-8")
+        with patch.object(module, "AUTH_CONFIG_ERROR", "Unable to load persisted authentication configuration"):
+            response = self.client.get("/setup")
+            login = self.client.get("/login")
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(login.status_code, 503)
+        self.assertIn(b"did not generate a setup token", response.data)
+        self.assertIn(b"reset_setup_on_synology.sh --confirm-reset", response.data)
+        self.assertIn(b"timestamped backup", response.data)
+
     def test_setup_rejects_bad_csrf_password_confirmation_and_totp(self):
         self.client.get("/setup")
         with self.client.session_transaction() as setup_session:

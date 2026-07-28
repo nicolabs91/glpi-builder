@@ -40,7 +40,7 @@ from app_ui import (
     page_template,
 )
 
-APP_VERSION = "0.3.1"
+APP_VERSION = "0.3.2"
 BUILDER_TEST_PREVIEW_MODE = os.environ.get(
     "BUILDER_TEST_PREVIEW_MODE", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
@@ -239,6 +239,7 @@ def read_persisted_auth():
 
 def atomic_write_persisted_auth(data):
     AUTH_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(AUTH_CONFIG_PATH.parent, 0o700)
     descriptor, temporary_name = tempfile.mkstemp(prefix=".builder-auth-", dir=AUTH_CONFIG_PATH.parent)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
@@ -282,6 +283,15 @@ if AUTH_CONFIG is None and not AUTH_CONFIG_PATH.exists() and not PERSISTED_AUTH_
     SETUP_TOKEN = secrets.token_urlsafe(24)
     print(
         f"GLPI Builder first-time setup token: {SETUP_TOKEN}",
+        flush=True,
+    )
+elif PERSISTED_AUTH_ERROR:
+    print(
+        "GLPI Builder authentication recovery required: "
+        f"{PERSISTED_AUTH_ERROR} "
+        "No setup token was generated because an authentication file still exists. "
+        "Preserve credentials by correcting its permissions, or stop the project and "
+        "run reset_setup_on_synology.sh --confirm-reset for a backed-up fresh setup.",
         flush=True,
     )
 
@@ -4045,6 +4055,20 @@ LOGIN_HTML = r"""<!doctype html>
 {% if test_preview_enabled %}<aside class="test-preview"><strong>Local test preview</strong><p>Inspect the interface without credentials. Builder changes remain disabled.</p><div class="preview-actions"><a class="preview-button" href="{{ url_for('test_preview_enter') }}">View Builder</a><a class="preview-button" href="{{ url_for('test_preview_setup') }}">View setup</a></div></aside>{% endif %}
 </section></main></div></body></html>"""
 
+AUTH_RECOVERY_HTML = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Authentication recovery · GLPI Builder</title>
+<style>
+body{margin:0;background:#f4f7fb;color:#172033;font:15px/1.55 system-ui,sans-serif}.card{width:min(720px,calc(100% - 32px));margin:64px auto;padding:34px;border:1px solid #dce3ec;border-radius:18px;background:#fff;box-shadow:0 20px 60px #16345f1c}h1{margin:0 0 10px;color:#12233f;font-size:27px}h2{margin:26px 0 8px;font-size:17px}p{color:#526176}.notice{padding:13px 15px;border:1px solid #f0c4bf;border-radius:10px;background:#fff6f5;color:#8f251c;font-weight:650}code{display:block;padding:12px;border:1px solid #d6deea;border-radius:8px;background:#f8fafc;color:#233b5d;overflow-wrap:anywhere;user-select:all}li+li{margin-top:7px}.foot{margin-top:24px;font-size:12px;color:#7b8798}
+</style></head><body><main class="card"><h1>Authentication recovery required</h1>
+<p class="notice">The existing administrator file could not be loaded. For safety, GLPI Builder did not generate a setup token and did not overwrite your credentials.</p>
+<h2>First preserve the existing account</h2><p>Stop the project and correct the permissions of <strong>config</strong> to 700 and <strong>config/builder-auth.json</strong> to 600. Then start the project again.</p>
+<h2>Start a completely new setup</h2><ol><li>Stop the <strong>glpi-builder</strong> project.</li><li>Run the included script once as <strong>root</strong> in DSM Task Scheduler:</li></ol>
+<code>/bin/sh /volume1/docker/glpi-builder/reset_setup_on_synology.sh --confirm-reset</code>
+<ol start="3"><li>Start the project.</li><li>Copy the new setup token from the container log and open <strong>/setup</strong>.</li></ol>
+<p>The reset script moves the previous authentication and TOTP replay state into a private timestamped backup. It does not change GLPI projects or backups.</p>
+<p class="foot">Diagnostic detail: {{ diagnostic }}</p></main></body></html>"""
+
 SETUP_HTML = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Secure setup · GLPI Builder</title>
@@ -4090,8 +4114,13 @@ button{display:flex;align-items:center;justify-content:center;width:100%;height:
 def setup():
     global AUTH_CONFIG, AUTH_CONFIG_ERROR
 
-    if AUTH_CONFIG is not None or AUTH_CONFIG_PATH.exists():
+    if AUTH_CONFIG is not None:
         abort(404)
+    if AUTH_CONFIG_PATH.exists():
+        return render_template_string(
+            AUTH_RECOVERY_HTML,
+            diagnostic=AUTH_CONFIG_ERROR or "The authentication file exists but setup is already disabled.",
+        ), 503
     key = "setup:" + login_rate_key()
     if login_rate_is_blocked(key):
         return ("Too many setup attempts. Try again later.", 429, {"Retry-After": str(LOGIN_RATE_BLOCK_SECONDS)})
@@ -4196,9 +4225,12 @@ def test_preview_exit():
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if AUTH_CONFIG_ERROR or not AUTH_CONFIG:
-        return redirect(url_for("setup")) if not AUTH_CONFIG_PATH.exists() else (
-            "Authentication configuration is invalid.", 503
-        )
+        if not AUTH_CONFIG_PATH.exists():
+            return redirect(url_for("setup"))
+        return render_template_string(
+            AUTH_RECOVERY_HTML,
+            diagnostic=AUTH_CONFIG_ERROR or "The authentication file exists but could not be used.",
+        ), 503
     next_path = safe_internal_next(request.values.get("next"))
     if request.method in {"GET", "HEAD"}:
         if authenticated_session_is_current():
