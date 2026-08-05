@@ -1,12 +1,13 @@
 #!/bin/sh
 set -eu
 
-APP_DIR="${1:-/volume1/docker/glpi-builder}"
-IMAGE="glpi-builder:latest"
-CONTAINER="glpi-builder"
-COMPOSE_PROJECT="glpi-builder"
+APP_DIR="${1:-/volume1/docker/docker-app-manager}"
+IMAGE="docker-app-manager:latest"
+CONTAINER="docker-app-manager"
+COMPOSE_PROJECT="docker-app-manager"
 COMPOSE_FILE="$APP_DIR/docker-compose.app.yml"
-LEGACY_CONTAINER="glpi-project-builder-full-restore"
+LEGACY_CONTAINER="glpi-builder"
+OLDER_LEGACY_CONTAINER="glpi-project-builder-full-restore"
 STATE_FILE="$APP_DIR/.last-install-state"
 BACKUP_TASK_DIR="/volume1/docker/_BACKUPS/GLPI_backup/_system"
 BACKUP_SCHEDULER_DIR="/volume1/docker/_BACKUPS/Synology_task_scheduler"
@@ -47,8 +48,10 @@ case "$HASH_LINE" in
 esac
 
 # Migrate the pre-rename replay-state path without changing credentials.
-if grep -q '^BUILDER_AUTH_STATE_PATH=/volume1/docker/.glpi-project-builder-auth-state$' .env; then
-  sed -i 's|^BUILDER_AUTH_STATE_PATH=/volume1/docker/.glpi-project-builder-auth-state$|BUILDER_AUTH_STATE_PATH=/volume1/docker/.glpi-builder-auth-state|' .env
+if grep -q '^BUILDER_AUTH_STATE_PATH=/volume1/docker/.glpi-project-builder-auth-state$' .env ||
+   grep -q '^BUILDER_AUTH_STATE_PATH=/volume1/docker/.glpi-builder-auth-state$' .env; then
+  sed -i 's|^BUILDER_AUTH_STATE_PATH=/volume1/docker/.glpi-project-builder-auth-state$|BUILDER_AUTH_STATE_PATH=/volume1/docker/.docker-app-manager-auth-state|' .env
+  sed -i 's|^BUILDER_AUTH_STATE_PATH=/volume1/docker/.glpi-builder-auth-state$|BUILDER_AUTH_STATE_PATH=/volume1/docker/.docker-app-manager-auth-state|' .env
 fi
 
 if ! python3 "$APP_DIR/scripts/provision_admin.py" --env "$APP_DIR/.env" --check; then
@@ -64,7 +67,7 @@ fi
 
 sudo mkdir -p "$BACKUP_TASK_DIR/projects" "$BACKUP_TASK_DIR/state" \
   "$BACKUP_TASK_DIR/locks" "$BACKUP_SCHEDULER_DIR"
-if [ -f "$BACKUP_SCRIPT" ] && ! sudo grep -Eq "Managed by GLPI (Project )?Builder" "$BACKUP_SCRIPT"; then
+if [ -f "$BACKUP_SCRIPT" ] && ! sudo grep -Eq "Managed by (GLPI (Project )?Builder|Docker App Manager)" "$BACKUP_SCRIPT"; then
   if [ ! -f "$BACKUP_TASK_DIR/GLPI_backup.pre-builder.sh" ]; then
     sudo cp -p "$BACKUP_SCRIPT" "$BACKUP_TASK_DIR/GLPI_backup.pre-builder.sh"
     sudo chmod 700 "$BACKUP_TASK_DIR/GLPI_backup.pre-builder.sh"
@@ -91,6 +94,10 @@ elif sudo docker container inspect "$LEGACY_CONTAINER" >/dev/null 2>&1; then
   OLD_NAME="${CONTAINER}-pre-rename-$(date +%Y%m%d-%H%M%S)"
   sudo docker stop "$LEGACY_CONTAINER" >/dev/null 2>&1 || true
   sudo docker rename "$LEGACY_CONTAINER" "$OLD_NAME"
+elif sudo docker container inspect "$OLDER_LEGACY_CONTAINER" >/dev/null 2>&1; then
+  OLD_NAME="${CONTAINER}-pre-rename-$(date +%Y%m%d-%H%M%S)"
+  sudo docker stop "$OLDER_LEGACY_CONTAINER" >/dev/null 2>&1 || true
+  sudo docker rename "$OLDER_LEGACY_CONTAINER" "$OLD_NAME"
 fi
 printf 'OLD_CONTAINER=%s\nIMAGE=%s\n' "$OLD_NAME" "$IMAGE" > "$STATE_FILE"
 

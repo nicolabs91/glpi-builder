@@ -9,12 +9,12 @@ class SetupResetScriptTest(unittest.TestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
         self.volume = Path(self.temporary_directory.name) / "volume1"
-        self.app_dir = self.volume / "docker/glpi-builder"
+        self.app_dir = self.volume / "docker/docker-app-manager"
         self.config_dir = self.app_dir / "config"
         self.config_dir.mkdir(parents=True)
         self.auth_file = self.config_dir / "builder-auth.json"
         self.auth_file.write_text('{"secret":"preserve-me"}\n', encoding="utf-8")
-        self.state_file = self.volume / "docker/.glpi-builder-auth-state"
+        self.state_file = self.volume / "docker/.docker-app-manager-auth-state"
         self.state_file.write_text("123\n", encoding="utf-8")
         self.script = Path(__file__).parents[1] / "reset_setup_on_synology.sh"
 
@@ -24,7 +24,7 @@ class SetupResetScriptTest(unittest.TestCase):
     def run_script(self, *arguments):
         environment = os.environ.copy()
         environment.update(
-            GLPI_BUILDER_APP_DIR=str(self.app_dir),
+            DOCKER_APP_MANAGER_APP_DIR=str(self.app_dir),
             GLPI_BUILDER_TESTING="1",
             BUILDER_AUTH_STATE_PATH=str(self.state_file),
         )

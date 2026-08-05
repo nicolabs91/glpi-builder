@@ -55,7 +55,7 @@ from app_profiles import (
     validate_project_name as validate_application_project,
 )
 
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.4.1"
 BUILDER_TEST_PREVIEW_MODE = os.environ.get(
     "BUILDER_TEST_PREVIEW_MODE", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
@@ -338,7 +338,7 @@ LOGIN_RATE_MAX_FAILURES = 5
 LOGIN_RATE_BLOCK_SECONDS = 15 * 60
 LOGIN_RATE_GLOBAL_MAX_FAILURES = 25
 TOTP_REPLAY_LOCK = threading.Lock()
-AUTH_STATE_PATH = Path(os.environ.get("BUILDER_AUTH_STATE_PATH", "/volume1/docker/.glpi-builder-auth-state"))
+AUTH_STATE_PATH = Path(os.environ.get("BUILDER_AUTH_STATE_PATH", "/volume1/docker/.docker-app-manager-auth-state"))
 
 
 def docker_client():
@@ -1074,7 +1074,7 @@ def migrate_legacy_backup_config():
             "INTERVAL_HOURS": "24",
             "RETENTION_DAYS": values.get("RETENTION_DAYS", "60"),
         })
-        text = "# Migrated and maintained by GLPI Builder.\n" + "".join(
+        text = "# Migrated and maintained by Docker App Manager.\n" + "".join(
             f"{key}={value}\n" for key, value in values.items()
             if re.fullmatch(r"[A-Z0-9_]+", key)
             and re.fullmatch(r"[A-Za-z0-9_./,:-]+", str(value))
@@ -1443,7 +1443,7 @@ def migrate_project_backup_credentials():
             configured["MYSQL_CNF"] = str(credential)
             atomic_write_text(
                 schedule_path,
-                "# Generated and maintained by GLPI Builder.\n"
+                "# Generated and maintained by Docker App Manager.\n"
                 + "".join(f"{key}={value}\n" for key, value in configured.items()),
                 0o600,
             )
@@ -1500,7 +1500,7 @@ def configure_scheduled_backup(project, env=None, *, enabled=True, kind="daily",
         for value in values.values()
     ):
         raise ValueError("Backup configuration contains unsupported characters.")
-    config_text = "# Generated and maintained by GLPI Builder.\n" + "".join(
+    config_text = "# Generated and maintained by Docker App Manager.\n" + "".join(
         f"{key}={value}\n" for key, value in values.items()
     )
     ensure_managed_directory(BACKUP_PROJECTS_DIR, 0o700)
@@ -1634,7 +1634,7 @@ def scheduled_backup_status(project):
             configured["MYSQL_CNF"] = str(mysql_cnf)
             atomic_write_text(
                 schedule_path,
-                "# Generated and maintained by GLPI Builder.\n"
+                "# Generated and maintained by Docker App Manager.\n"
                 + "".join(f"{key}={value}\n" for key, value in configured.items()),
                 0o600,
             )
@@ -2627,7 +2627,7 @@ def write_action_log(project, action, messages):
     filename = datetime.now().strftime("%Y%m%d-%H%M%S") + f"-{action}.log"
     path = folder / filename
     content = [
-        f"GLPI Builder {APP_VERSION}",
+        f"Docker App Manager {APP_VERSION}",
         f"Project: {project}",
         f"Action: {action}",
         f"Time: {datetime.now().isoformat(timespec='seconds')}",
@@ -4190,8 +4190,8 @@ body{margin:0;background:#f4f7fb;color:#172033;font:15px/1.55 system-ui,sans-ser
 </style></head><body><main class="card"><h1>Authentication recovery required</h1>
 <p class="notice">The existing administrator file could not be loaded. For safety, Docker App Manager did not generate a setup token and did not overwrite your credentials.</p>
 <h2>First preserve the existing account</h2><p>Stop the project and correct the permissions of <strong>config</strong> to 700 and <strong>config/builder-auth.json</strong> to 600. Then start the project again.</p>
-<h2>Start a completely new setup</h2><ol><li>Stop the <strong>glpi-builder</strong> project.</li><li>Run the included script once as <strong>root</strong> in DSM Task Scheduler:</li></ol>
-<code>/bin/sh /volume1/docker/glpi-builder/reset_setup_on_synology.sh --confirm-reset</code>
+<h2>Start a completely new setup</h2><ol><li>Stop the <strong>docker-app-manager</strong> project.</li><li>Run the included script once as <strong>root</strong> in DSM Task Scheduler:</li></ol>
+<code>/bin/sh /volume1/docker/docker-app-manager/reset_setup_on_synology.sh --confirm-reset</code>
 <ol start="3"><li>Start the project.</li><li>Copy the new setup token from the container log and open <strong>/setup</strong>.</li></ol>
 <p>The reset script moves the previous authentication and TOTP replay state into a private timestamped backup. It does not change GLPI projects or backups.</p>
 <p class="foot">Diagnostic detail: {{ diagnostic }}</p></main></body></html>"""

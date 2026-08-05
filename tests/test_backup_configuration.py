@@ -121,7 +121,7 @@ class BackupConfigurationTest(unittest.TestCase):
             0o750,
         )
         self.assertIn(
-            "Managed by GLPI Builder",
+            "Managed by Docker App Manager",
             module.BACKUP_DISPATCHER_PATH.read_text(encoding="utf-8"),
         )
 
@@ -142,7 +142,7 @@ class BackupConfigurationTest(unittest.TestCase):
         legacy = self.task_dir / "GLPI_backup.pre-builder.sh"
 
         self.assertIn("echo legacy", legacy.read_text(encoding="utf-8"))
-        self.assertIn("Managed by GLPI Builder", module.BACKUP_SCRIPT_PATH.read_text(encoding="utf-8"))
+        self.assertIn("Managed by Docker App Manager", module.BACKUP_SCRIPT_PATH.read_text(encoding="utf-8"))
 
     def test_legacy_runtime_is_copied_and_rewritten_without_deletion(self):
         legacy_projects = self.legacy_task_dir / "projects"

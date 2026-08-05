@@ -1,4 +1,4 @@
-# Docker App Manager 0.4.0 for Synology
+# Docker App Manager 0.4.1 for Synology
 
 Docker Application Manager creates and manages supported internal Docker
 applications on a Synology NAS. Existing GLPI Builder projects remain fully
@@ -102,14 +102,44 @@ sudo docker pull mariadb:<tag>
 Extract the release so that this directory exists:
 
 ```text
-/volume1/docker/glpi-builder
+/volume1/docker/docker-app-manager
 ```
 
 Then connect over SSH and enter the directory:
 
 ```sh
-cd /volume1/docker/glpi-builder
+cd /volume1/docker/docker-app-manager
 ```
+
+### Rename an existing GLPI Builder installation
+
+Version 0.4.1 changes the Synology directory, Compose project, service,
+container, image and authentication replay-state name from `glpi-builder` to
+`docker-app-manager`. Existing managed GLPI application directories are not
+renamed or modified.
+
+For the safest migration, extract the new release into
+`/volume1/docker/docker-app-manager` while keeping the existing
+`/volume1/docker/glpi-builder` directory, then run:
+
+```sh
+sudo sh /volume1/docker/docker-app-manager/migrate_to_docker_app_manager.sh
+```
+
+The migration refuses to merge existing configuration in the new directory.
+It stops the legacy Builder, copies `.env`, `config` and the TOTP replay state,
+starts the new Compose project, and requires the normal authenticated health
+check to pass. Keep `/volume1/docker/glpi-builder` and the stopped pre-upgrade
+container until login, application discovery and backup-source verification
+have all succeeded. The old Container Manager project can be removed only
+after that verification; do not select an option that deletes project files.
+
+If SSH is unavailable, stop the old project, make a backup of its `config`
+directory, create `/volume1/docker/docker-app-manager` from the new release,
+copy the old `config` directory into it, and create a new Container Manager
+project from `docker-compose.container-manager.yml`. The SSH migration is
+preferred because it also preserves `.env`, the replay counter and a tested
+container rollback path.
 
 ### Option A: local access on the NAS only
 
@@ -167,10 +197,10 @@ The installer:
 3. validates the session key, password hash, TOTP secret, timeouts, and mode
    600 on `.env`;
 4. installs the managed Synology backup script;
-5. builds the `glpi-builder:latest` image;
+5. builds the `docker-app-manager:latest` image;
 6. verifies the locked YAML contract and static security checks;
 7. preserves an existing Builder container under a timestamped name;
-8. starts the new `glpi-builder` as a Compose project, so Synology Container
+8. starts the new `docker-app-manager` as a Compose project, so Synology Container
    Manager shows its live state and provides working Start/Stop controls;
 9. leaves the previous container stopped if the health check fails, preventing
    rollback to an older unauthenticated management interface.
@@ -188,15 +218,15 @@ configuration keys are rejected before Docker is allowed to publish a port.
 The release also includes `docker-compose.container-manager.yml` for a fully
 graphical first installation:
 
-1. Download the release ZIP and extract its `glpi-builder` directory to
-   `/volume1/docker/glpi-builder` with File Station.
+1. Download the release ZIP and extract its `docker-app-manager` directory to
+   `/volume1/docker/docker-app-manager` with File Station.
 2. Open **Container Manager → Project → Create**.
-3. Select `/volume1/docker/glpi-builder` as the project path and choose
+3. Select `/volume1/docker/docker-app-manager` as the project path and choose
    `docker-compose.container-manager.yml`.
 4. Review the project. By default port `5055` is published on every NAS IPv4
    interface. Restrict this port in DSM Firewall to the administration PC or
    management VLAN before starting the project.
-5. Build and start the project. Open the `glpi-builder` container log in
+5. Build and start the project. Open the `docker-app-manager` container log in
    Container Manager and copy the one-time setup token.
 6. Open `http://NAS-IP:5055/setup`, enter the setup token, create the
    administrator password, add the displayed Base32 secret to an authenticator
@@ -216,19 +246,19 @@ directory during upgrades.
 
 ### Upgrade an existing Container Manager installation
 
-1. Download the new release ZIP and stop the `glpi-builder` project in
+1. Download the new release ZIP and stop the `docker-app-manager` project in
    Container Manager.
 2. In File Station, make a safety copy of
-   `/volume1/docker/glpi-builder/config`. This directory contains the existing
+   `/volume1/docker/docker-app-manager/config`. This directory contains the existing
    administrator and TOTP enrollment.
 3. Extract the release and copy its files over
-   `/volume1/docker/glpi-builder`, replacing the application files. Do not
+   `/volume1/docker/docker-app-manager`, replacing the application files. Do not
    delete or replace the existing `config` directory.
-4. In **Container Manager → Project → glpi-builder**, choose **Action → Build**
+4. In **Container Manager → Project → docker-app-manager**, choose **Action → Build**
    (or recreate/update the project with the existing
    `docker-compose.container-manager.yml`) so the image is rebuilt from the
    new source.
-5. Start the project and wait until the `glpi-builder` container is healthy.
+5. Start the project and wait until the `docker-app-manager` container is healthy.
    Sign in with the existing administrator and TOTP code; `/setup` should not
    appear again.
 6. Run the existing root DSM Task Scheduler task once, open **Backups**, and
@@ -253,9 +283,9 @@ and `config/builder-auth.json` to mode 600, then restart it.
 
 To explicitly replace the administrator and TOTP enrollment:
 
-1. Stop the `glpi-builder` project.
+1. Stop the `docker-app-manager` project.
 2. Create a temporary root task in DSM Task Scheduler with:
-   `/bin/sh /volume1/docker/glpi-builder/reset_setup_on_synology.sh --confirm-reset`
+   `/bin/sh /volume1/docker/docker-app-manager/reset_setup_on_synology.sh --confirm-reset`
 3. Run it once. The script moves the old auth file and TOTP replay state to
    `config/recovery-backups/<timestamp>/`, using private permissions.
 4. Start the project, copy the new token from the container log, and complete
@@ -268,7 +298,7 @@ and unexpected install paths, and does not modify GLPI projects or backups.
 If the fresh setup cannot be completed, keep the project stopped and restore
 the previous account from the timestamped recovery directory. Move its
 `builder-auth.json` back to `config/builder-auth.json` and, when present, move
-`totp-replay-state` back to `/volume1/docker/.glpi-builder-auth-state`. Set
+`totp-replay-state` back to `/volume1/docker/.docker-app-manager-auth-state`. Set
 `config` to mode 700 and both restored files to mode 600 before starting the
 project. Do not overwrite a newly created authentication file: move that file
 aside first so the reset remains reversible.
@@ -283,27 +313,27 @@ internet.
 Check status and published port:
 
 ```sh
-sudo docker ps --filter name=glpi-builder
-sudo docker port glpi-builder
+sudo docker ps --filter name=docker-app-manager
+sudo docker port docker-app-manager
 ```
 
 View logs:
 
 ```sh
-sudo docker logs --tail 100 glpi-builder
+sudo docker logs --tail 100 docker-app-manager
 ```
 
 Stop and start the Builder:
 
 ```sh
-sudo docker compose --project-name glpi-builder --env-file .env -f docker-compose.app.yml stop
-sudo docker compose --project-name glpi-builder --env-file .env -f docker-compose.app.yml start
+sudo docker compose --project-name docker-app-manager --env-file .env -f docker-compose.app.yml stop
+sudo docker compose --project-name docker-app-manager --env-file .env -f docker-compose.app.yml start
 ```
 
 Test the health endpoint inside the container:
 
 ```sh
-sudo docker exec glpi-builder python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8080/healthz').read().decode())"
+sudo docker exec docker-app-manager python -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8080/healthz').read().decode())"
 ```
 
 After changing `.env`, run the installer again to replace the active container.
@@ -452,7 +482,7 @@ After a successful installation, restore the Builder container preserved
 immediately before it with:
 
 ```sh
-cd /volume1/docker/glpi-builder
+cd /volume1/docker/docker-app-manager
 sudo sh rollback_on_synology.sh
 ```
 
@@ -477,7 +507,7 @@ recover deleted data, or restore the backup script or `.env`.
 | `BUILDER_SESSION_COOKIE_SECURE` | `true` | Send the login cookie only over HTTPS; use `false` only for loopback HTTP/SSH-tunnel testing |
 | `BUILDER_SESSION_TIMEOUT_SECONDS` | `900` | Idle session timeout, allowed range 300-86400 seconds |
 | `BUILDER_SESSION_ABSOLUTE_TIMEOUT_SECONDS` | `28800` | Absolute session timeout, at least the idle timeout |
-| `BUILDER_AUTH_STATE_PATH` | `/volume1/docker/.glpi-builder-auth-state` | Persistent mode-600 TOTP replay counter |
+| `BUILDER_AUTH_STATE_PATH` | `/volume1/docker/.docker-app-manager-auth-state` | Persistent mode-600 TOTP replay counter |
 | `ALLOWED_GLPI_IMAGES` | `glpi/glpi:` | Comma-separated allowed image prefixes |
 | `ALLOWED_DB_IMAGES` | `mariadb:,mysql:` | Comma-separated allowed database-image prefixes |
 | `MAX_SCAN_ENTRIES` | `500` | Maximum number of backup choices shown; traversal is bounded to protect responsiveness |

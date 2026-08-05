@@ -1,5 +1,5 @@
 #!/bin/bash
-# Managed by GLPI Builder. Project-specific values live in GLPI_backup.env.
+# Managed by Docker App Manager. Project-specific values live in GLPI_backup.env.
 set -Eeuo pipefail
 umask 077
 

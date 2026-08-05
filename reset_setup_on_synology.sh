@@ -1,25 +1,25 @@
 #!/bin/sh
 set -eu
 
-APP_DIR="${GLPI_BUILDER_APP_DIR:-/volume1/docker/glpi-builder}"
+APP_DIR="${DOCKER_APP_MANAGER_APP_DIR:-${GLPI_BUILDER_APP_DIR:-/volume1/docker/docker-app-manager}}"
 CONFIG_DIR="$APP_DIR/config"
 AUTH_FILE="$CONFIG_DIR/builder-auth.json"
-AUTH_STATE="${BUILDER_AUTH_STATE_PATH:-/volume1/docker/.glpi-builder-auth-state}"
+AUTH_STATE="${BUILDER_AUTH_STATE_PATH:-/volume1/docker/.docker-app-manager-auth-state}"
 RECOVERY_ROOT="$CONFIG_DIR/recovery-backups"
 
 if [ "${1:-}" != "--confirm-reset" ]; then
   echo "Refusing to reset authentication without --confirm-reset." >&2
-  echo "Stop the glpi-builder project, then run: $0 --confirm-reset" >&2
+  echo "Stop the docker-app-manager project, then run: $0 --confirm-reset" >&2
   exit 2
 fi
 
 case "$APP_DIR" in
-  /volume*/docker/glpi-builder) ;;
+  /volume*/docker/docker-app-manager) ;;
   *)
     if [ "${GLPI_BUILDER_TESTING:-}" = "1" ]; then
       :
     else
-      echo "Refusing unexpected GLPI Builder directory: $APP_DIR" >&2
+      echo "Refusing unexpected Docker App Manager directory: $APP_DIR" >&2
       exit 2
     fi
     ;;
@@ -55,4 +55,4 @@ fi
 
 echo "Authentication was reset safely."
 echo "Backup: $RECOVERY_DIR"
-echo "Start glpi-builder and copy the new setup token from the container log."
+echo "Start docker-app-manager and copy the new setup token from the container log."

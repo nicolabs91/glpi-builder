@@ -48,17 +48,17 @@ class RollbackSafetyTest(unittest.TestCase):
             published_run = max(index for index, call in enumerate(calls) if call.startswith("run "))
             remove_failed = next(
                 index for index, call in enumerate(calls)
-                if index > published_run and call == "rm -f glpi-builder"
+                if index > published_run and call == "rm -f docker-app-manager"
             )
             restore_name = next(
                 index for index, call in enumerate(calls)
                 if index > remove_failed
-                and call.startswith("rename glpi-builder-pre-rollback-")
-                and call.endswith(" glpi-builder")
+                and call.startswith("rename docker-app-manager-pre-rollback-")
+                and call.endswith(" docker-app-manager")
             )
             restart = next(
                 index for index, call in enumerate(calls)
-                if index > restore_name and call == "start glpi-builder"
+                if index > restore_name and call == "start docker-app-manager"
             )
             self.assertLess(published_run, remove_failed)
             self.assertLess(remove_failed, restore_name)

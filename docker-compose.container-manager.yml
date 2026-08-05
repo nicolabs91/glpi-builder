@@ -1,8 +1,8 @@
 services:
-  glpi-builder:
+  docker-app-manager:
     build: .
-    image: glpi-builder:container-manager
-    container_name: glpi-builder
+    image: docker-app-manager:container-manager
+    container_name: docker-app-manager
     restart: unless-stopped
     ports:
       - "${BUILDER_BIND_IP:-0.0.0.0}:${BUILDER_PORT:-5055}:8080"

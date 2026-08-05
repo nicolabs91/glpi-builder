@@ -6,7 +6,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 EXPECTED_GENERATOR_SHA256 = "166049b97670f522755a3877cefa3dff470d4f33eca637bb4bcb27729ef36006"
-EXPECTED_BUILDER_COMPOSE_SHA256 = "ba87dd6a1ec19c380af53b63f2ee97805e27112467f16a2082c03d5a450a4894"
+EXPECTED_BUILDER_COMPOSE_SHA256 = "8d904e44fecc15e3b87cfa77393d0159ef350d3a5fb490deea5d9ffa51496807"
 
 source = (ROOT / "app.py").read_text(encoding="utf-8")
 tree = ast.parse(source)

@@ -1,9 +1,9 @@
 #!/bin/sh
 set -eu
 
-APP_DIR="${1:-/volume1/docker/glpi-builder}"
-CONTAINER="glpi-builder"
-COMPOSE_PROJECT="glpi-builder"
+APP_DIR="${1:-/volume1/docker/docker-app-manager}"
+CONTAINER="docker-app-manager"
+COMPOSE_PROJECT="docker-app-manager"
 COMPOSE_FILE="$APP_DIR/docker-compose.app.yml"
 STATE_FILE="$APP_DIR/.last-install-state"
 CANDIDATE=""
@@ -19,7 +19,7 @@ trap cleanup EXIT INT TERM
 python3 "$APP_DIR/scripts/provision_admin.py" --env "$APP_DIR/.env" --check
 
 OLD_IMAGE_ID=$(sudo docker inspect --format '{{.Image}}' "$OLD_CONTAINER")
-CANDIDATE="glpi-builder-rollback-proof-$(date +%Y%m%d-%H%M%S)"
+CANDIDATE="docker-app-manager-rollback-proof-$(date +%Y%m%d-%H%M%S)"
 
 # Prove the old image in isolation. It gets no published port, but otherwise
 # receives the current secure environment and the same required mounts.
@@ -64,7 +64,7 @@ CURRENT_SAFE="${CONTAINER}-pre-rollback-$(date +%Y%m%d-%H%M%S)"
 sudo docker stop "$CONTAINER" >/dev/null 2>&1 || true
 sudo docker rename "$CONTAINER" "$CURRENT_SAFE"
 
-if ! sudo env GLPI_BUILDER_IMAGE="$OLD_IMAGE_ID" docker compose \
+if ! sudo env DOCKER_APP_MANAGER_IMAGE="$OLD_IMAGE_ID" docker compose \
   --project-name "$COMPOSE_PROJECT" --env-file "$APP_DIR/.env" \
   -f "$COMPOSE_FILE" up -d --no-build --force-recreate >/dev/null; then
   # Compose can fail after creating a container in Created state. Remove that

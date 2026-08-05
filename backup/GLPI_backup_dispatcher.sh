@@ -1,5 +1,5 @@
 #!/bin/bash
-# Managed by GLPI Builder. Run this single dispatcher from Synology Task Scheduler.
+# Managed by Docker App Manager. Run this single dispatcher from Synology Task Scheduler.
 set -Eeuo pipefail
 umask 077
 

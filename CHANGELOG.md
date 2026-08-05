@@ -1,10 +1,22 @@
 # Changelog
 
+## 0.4.1
+
+- Rename the Synology application directory, Compose project, service,
+  container, image and authentication replay-state file to
+  `docker-app-manager`.
+- Add a guarded migration script that copies the existing administrator
+  configuration and TOTP replay state from a `glpi-builder` installation,
+  stops the legacy service, and starts the renamed application.
+- Preserve the complete legacy installation directory and pre-upgrade
+  container until the administrator has verified login, applications and
+  backups, providing a recoverable rollback path.
+
 ## 0.4.0
 
 - Rename the product interface and documentation to Docker App Manager while
-  retaining the existing `glpi-builder` repository, container, install path,
-  authentication state and GLPI project contract for seamless upgrades.
+  initially retaining the existing `glpi-builder` repository and NAS identity,
+  as well as the authentication state and GLPI project contract.
 - Add an extensible, fail-closed application profile catalog with explicit
   `.builder-app.json` ownership manifests.
 - Add review-first fresh deployment for n8n with PostgreSQL and Team Password

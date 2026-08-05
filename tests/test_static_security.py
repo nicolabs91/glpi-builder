@@ -6,6 +6,7 @@ auth_source = (Path(__file__).resolve().parents[1] / "auth_security.py").read_te
 provision_source = (Path(__file__).resolve().parents[1] / "scripts" / "provision_admin.py").read_text(encoding="utf-8")
 installer_source = (Path(__file__).resolve().parents[1] / "install_on_synology.sh").read_text(encoding="utf-8")
 rollback_source = (Path(__file__).resolve().parents[1] / "rollback_on_synology.sh").read_text(encoding="utf-8")
+migration_source = (Path(__file__).resolve().parents[1] / "migrate_to_docker_app_manager.sh").read_text(encoding="utf-8")
 required = [
     "path_under_backup_root(backup_path)",
     "path_under_backup_root(source)",
@@ -72,7 +73,7 @@ missing_installer = [item for item in installer_required if item not in installe
 if missing_installer:
     raise SystemExit("Missing installer security controls: " + ", ".join(missing_installer))
 rollback_required = [
-    'CANDIDATE="glpi-builder-rollback-proof-',
+    'CANDIDATE="docker-app-manager-rollback-proof-',
     '[ -z "$(sudo docker port "$CANDIDATE")" ]',
     "unauthenticated dashboard access was not denied",
     "login page proof failed",
@@ -83,4 +84,15 @@ rollback_required = [
 missing_rollback = [item for item in rollback_required if item not in rollback_source]
 if missing_rollback:
     raise SystemExit("Missing authenticated rollback proof: " + ", ".join(missing_rollback))
+migration_required = [
+    'OLD_DIR="${GLPI_BUILDER_OLD_DIR:-/volume1/docker/glpi-builder}"',
+    'NEW_DIR="${DOCKER_APP_MANAGER_APP_DIR:-/volume1/docker/docker-app-manager}"',
+    'refusing to overwrite configuration',
+    'as_root cp -pR "$OLD_DIR/config" "$NEW_DIR/config"',
+    'as_root cp -p "$OLD_AUTH_STATE" "$NEW_AUTH_STATE"',
+    'as_root sh "$NEW_DIR/install_on_synology.sh" "$NEW_DIR"',
+]
+missing_migration = [item for item in migration_required if item not in migration_source]
+if missing_migration:
+    raise SystemExit("Missing guarded NAS migration controls: " + ", ".join(missing_migration))
 print("OK: static security controls are present")

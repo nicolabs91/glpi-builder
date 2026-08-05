@@ -1,8 +1,8 @@
 services:
-  glpi-builder:
+  docker-app-manager:
     build: .
-    image: ${GLPI_BUILDER_IMAGE:-glpi-builder:latest}
-    container_name: glpi-builder
+    image: ${DOCKER_APP_MANAGER_IMAGE:-docker-app-manager:latest}
+    container_name: docker-app-manager
     restart: unless-stopped
     env_file:
       - .env
