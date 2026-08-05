@@ -1,4 +1,4 @@
-# Development loop for GLPI Builder
+# Development loop for Docker App Manager
 
 ## Non-negotiable YAML contract
 

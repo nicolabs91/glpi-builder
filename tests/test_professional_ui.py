@@ -62,7 +62,7 @@ class ProfessionalUiTest(unittest.TestCase):
     def test_primary_pages_render_shared_navigation(self):
         for path, heading in (
             ("/", "Infrastructure overview"),
-            ("/projects", "Projects"),
+            ("/projects", "Applications"),
             ("/projects/new", "New project or restore"),
             ("/backups", "Backups"),
             ("/activity", "Activity"),

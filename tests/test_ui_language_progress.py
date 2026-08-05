@@ -26,7 +26,7 @@ class UiLanguageAndProgressTest(unittest.TestCase):
         authenticate(self.client, module)
 
     def test_dashboard_is_english(self):
-        self.assertEqual(module.APP_VERSION, "0.3.2")
+        self.assertEqual(module.APP_VERSION, "0.4.0")
         with patch.object(module, "discover_projects", return_value=[]), \
              patch.object(module, "scan_backup_choices", return_value={"database": [], "files": []}), \
              patch.object(module, "suggest_free_host_port", return_value=18888), \
@@ -35,16 +35,16 @@ class UiLanguageAndProgressTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertIn(b"Infrastructure overview", response.data)
-        self.assertIn(b"Projects", response.data)
+        self.assertIn(b"Applications", response.data)
         self.assertIn(b"Backups", response.data)
         self.assertIn(b"Activity", response.data)
         self.assertIn(b"Settings", response.data)
         self.assertIn(b'href="/projects/new"', response.data)
-        self.assertIn(b"New project", response.data)
+        self.assertIn(b"Add application", response.data)
         self.assertIn(b'aria-label="Primary"', response.data)
         self.assertIn(b'aria-label="Mobile navigation"', response.data)
         self.assertIn(b"font:inherit", response.data)
-        self.assertIn(b'class="version">0.3.2</span>', response.data)
+        self.assertIn(b'class="version">0.4.0</span>', response.data)
         self.assertIn(b'<html lang="en">', response.data)
 
     def test_project_management_is_moved_to_project_detail(self):
@@ -122,7 +122,7 @@ class UiLanguageAndProgressTest(unittest.TestCase):
         self.assertIn(b'http-equiv="refresh"', response.data)
         self.assertIn(b"Restoring database", response.data)
         self.assertIn(b"57%", response.data)
-        self.assertIn(b"<div>0.3.2</div>", response.data)
+        self.assertIn(b"<div>0.4.0</div>", response.data)
         self.assertNotIn(b"0.2 \xc2\xb7 project", response.data)
 
     def test_obsolete_local_ui_preview_button_is_absent(self):

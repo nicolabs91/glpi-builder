@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.4.0
+
+- Rename the product interface and documentation to Docker App Manager while
+  retaining the existing `glpi-builder` repository, container, install path,
+  authentication state and GLPI project contract for seamless upgrades.
+- Add an extensible, fail-closed application profile catalog with explicit
+  `.builder-app.json` ownership manifests.
+- Add review-first fresh deployment for n8n with PostgreSQL and Team Password
+  Manager with the vendor-documented MySQL 5.7 database.
+- Generate private per-project secrets, isolated networks and persistent bind
+  mounts, with application-specific image allowlists and health checks.
+- Add application status, sanitized Compose views and start, stop, restart and
+  pull-and-apply update actions.
+- Reserve ports from both legacy GLPI projects and new profile-managed apps,
+  and refuse to adopt or overwrite unrelated Compose directories.
+- Keep automated n8n and Team Password Manager backup/restore and arbitrary
+  custom Compose import disabled until application-specific recovery tests are
+  proven.
+- Expand the regression suite to cover profiles, private files, ownership,
+  lifecycle actions and route authorization.
+
 ## 0.3.2
 
 - Recognize ISO 8601 backup-manifest timestamps with `T`, `Z`, and numeric

@@ -48,7 +48,7 @@ def select_bind_ip(path, requested=None, allow_all_interfaces=False, input_func=
         entered = input_func(f"Builder bind IPv4 address [{current}]: ").strip()
         selected = validate_bind_ip(entered or current)
         if selected == "0.0.0.0":
-            print("WARNING: 0.0.0.0 exposes GLPI Builder on every IPv4 interface. Use HTTPS and firewall rules.")
+            print("WARNING: 0.0.0.0 exposes Docker App Manager on every IPv4 interface. Use HTTPS and firewall rules.")
             if input_func("Type EXPOSE to confirm: ").strip() != "EXPOSE":
                 raise ValueError("Binding to every interface was not confirmed.")
         elif not ipaddress.ip_address(selected).is_loopback:
@@ -117,7 +117,7 @@ def check_configuration(path):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Provision GLPI Builder login and TOTP MFA.")
+    parser = argparse.ArgumentParser(description="Provision Docker App Manager login and TOTP MFA.")
     parser.add_argument("--env", default=".env", help="Builder environment file (default: .env)")
     parser.add_argument("--username", help="Single administrator username")
     parser.add_argument("--bind-ip", help="IPv4 address on which Docker publishes the Builder port")
@@ -144,7 +144,7 @@ def main():
     password = getpass.getpass("Administrator password (minimum 14 characters): ")
     confirmation = getpass.getpass("Repeat administrator password: ")
     secret = generate_totp_secret()
-    issuer = "GLPI Builder"
+    issuer = "Docker App Manager"
     uri = f"otpauth://totp/{quote(issuer)}:{quote(username)}?secret={secret}&issuer={quote(issuer)}&algorithm=SHA1&digits=6&period=30"
     print("Add this Base32 secret to the administrator authenticator app:")
     print(secret)

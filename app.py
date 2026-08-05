@@ -30,6 +30,9 @@ from auth_security import (
 )
 from app_ui import (
     ACTIVITY,
+    APPLICATION_PREVIEW,
+    APPLICATION_DETAIL,
+    APPLICATION_WIZARD,
     BACKUPS,
     COMPOSE_VIEW,
     OVERVIEW,
@@ -39,8 +42,20 @@ from app_ui import (
     WIZARD,
     page_template,
 )
+from app_profiles import (
+    MANIFEST_NAME,
+    build_environment as build_application_environment,
+    get_profile,
+    manifest as build_application_manifest,
+    profile_catalog,
+    read_manifest as read_application_manifest,
+    render_compose as render_application_compose,
+    validate_image as validate_application_image,
+    validate_port as validate_application_port,
+    validate_project_name as validate_application_project,
+)
 
-APP_VERSION = "0.3.2"
+APP_VERSION = "0.4.0"
 BUILDER_TEST_PREVIEW_MODE = os.environ.get(
     "BUILDER_TEST_PREVIEW_MODE", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
@@ -139,6 +154,13 @@ UI_JAVASCRIPT = r"""
     };
     frequency?.addEventListener('change', update);
     update();
+  });
+  document.querySelectorAll('[data-default-image]').forEach((choice) => {
+    choice.addEventListener('change', () => {
+      if (!choice.checked) return;
+      const image = choice.closest('form')?.querySelector('[name="image"]');
+      if (image) image.value = choice.dataset.defaultImage || '';
+    });
   });
   document.querySelectorAll('[data-copy-command]').forEach((button) => {
     button.addEventListener('click', async () => {
@@ -283,12 +305,12 @@ SETUP_TOKEN = ""
 if AUTH_CONFIG is None and not AUTH_CONFIG_PATH.exists() and not PERSISTED_AUTH_ERROR:
     SETUP_TOKEN = secrets.token_urlsafe(24)
     print(
-        f"GLPI Builder first-time setup token: {SETUP_TOKEN}",
+        f"Docker App Manager first-time setup token: {SETUP_TOKEN}",
         flush=True,
     )
 elif PERSISTED_AUTH_ERROR:
     print(
-        "GLPI Builder authentication recovery required: "
+        "Docker App Manager authentication recovery required: "
         f"{PERSISTED_AUTH_ERROR} "
         "No setup token was generated because an authentication file still exists. "
         "Preserve credentials by correcting its permissions, or stop the project and "
@@ -1774,7 +1796,7 @@ def enrich_project_operational_metadata(project, available_images):
         drift.append("Cookie SameSite differs from the current Builder default.")
     if project.get("cookie_secure") != DEFAULT_SESSION_COOKIE_SECURE:
         drift.append("Cookie Secure differs from the current Builder default.")
-    if not project.get("simulated"):
+    if not project.get("simulated") and not project.get("profile_managed"):
         drift.extend(managed_project_issues(project["name"])[:4])
     project["configuration_drift"] = drift
     project["contract_status"] = "Review" if drift else "Current"
@@ -2057,7 +2079,13 @@ def configured_project_ports(exclude_projects=None):
         for index, folder in enumerate(BASE_PATH.iterdir()):
             if index >= MAX_SCAN_ENTRIES:
                 break
-            if folder.name in exclude_projects or not is_managed_glpi_project(folder.name):
+            if folder.name in exclude_projects:
+                continue
+            application_manifest = read_application_manifest(folder)
+            if application_manifest:
+                reservations.setdefault(int(application_manifest["port"]), folder.name)
+                continue
+            if not is_managed_glpi_project(folder.name):
                 continue
             try:
                 if not folder.is_dir() or folder.is_symlink():
@@ -3771,7 +3799,7 @@ def discover_unmanaged_glpi_projects(containers=None, managed_projects=None):
 
 CREATE_PREVIEW_HTML = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Execution plan · GLPI Builder</title>
+<title>Execution plan · Docker App Manager</title>
 <style>
 :root{--bg:#f4f7fb;--card:#fff;--line:#dce4ee;--ink:#172033;--muted:#64748b;--brand:#2364d2;--danger:#b42318}
 *{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 10% 0,#eaf1ff 0,transparent 30%),var(--bg);color:var(--ink);font:15px system-ui,-apple-system,"Segoe UI",sans-serif}
@@ -3794,7 +3822,7 @@ dl{display:grid;grid-template-columns:minmax(170px,240px) 1fr;gap:0;border-top:1
 PROGRESS_HTML = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 {% if job.status in ['queued', 'running'] %}<meta http-equiv="refresh" content="2">{% endif %}
-<title>{{ job.title }} progress · {{ job.project }} · GLPI Builder</title>
+<title>{{ job.title }} progress · {{ job.project }} · Docker App Manager</title>
 <style>
 :root{--bg:#f4f7fb;--card:#fff;--line:#dce4ee;--ink:#172033;--muted:#64748b;--brand:#2364d2;--danger:#b42318;--wait:#a15c00}
 *{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 10% 0,#eaf1ff 0,transparent 30%),var(--bg);color:var(--ink);font:15px system-ui,-apple-system,"Segoe UI",sans-serif}
@@ -4133,7 +4161,7 @@ a {{ color: #1f6feb; }}
 
 LOGIN_HTML = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Sign in · GLPI Builder</title>
+<title>Sign in · Docker App Manager</title>
 <style>
 :root{color-scheme:light;--navy:#12233f;--blue:#2364d2;--blue-dark:#184da8;--ink:#172033;--muted:#64748b;--line:#dce3ec;--danger:#b42318}
 *{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(circle at 15% 0,#eaf1ff 0,transparent 36%),#f4f7fb;color:var(--ink);font:15px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}.shell{width:min(960px,calc(100% - 32px));margin:48px auto}.brand{display:flex;align-items:center;gap:12px;margin-bottom:22px;color:var(--navy);font-weight:750;letter-spacing:-.01em}.brand-mark{display:grid;place-items:center;width:38px;height:38px;border-radius:11px;background:linear-gradient(145deg,#2e71df,#174ca7);box-shadow:0 8px 22px #1d5ecb3b;color:#fff;font-size:18px}.brand small{display:block;color:var(--muted);font-size:12px;font-weight:550;letter-spacing:.02em}
@@ -4142,9 +4170,9 @@ LOGIN_HTML = r"""<!doctype html>
 .field{margin-top:16px}label{display:flex;justify-content:space-between;gap:10px;margin-bottom:7px;color:#29364a;font-size:13px;font-weight:700}.hint{color:#8491a4;font-weight:500}input{width:100%;height:44px;padding:0 13px;border:1px solid #cbd5e1;border-radius:9px;background:#fff;color:var(--ink);font:inherit;outline:none;transition:border-color .15s,box-shadow .15s}input:focus{border-color:var(--blue);box-shadow:0 0 0 3px #2364d21c}input::placeholder{color:#a1adbd}button{display:flex;align-items:center;justify-content:center;width:100%;height:46px;margin-top:24px;border:0;border-radius:10px;background:linear-gradient(180deg,var(--blue),var(--blue-dark));box-shadow:0 8px 20px #205fc332;color:#fff;font:700 14px system-ui;cursor:pointer}button:hover{filter:brightness(1.04)}button:focus-visible{outline:3px solid #2364d23d;outline-offset:2px}.footnote{margin:14px 0 0;text-align:center;color:#8491a4;font-size:12px}
 .test-preview{margin-top:24px;padding:16px;border:1px solid #cfe0fb;border-radius:12px;background:#f4f8ff}.test-preview strong{display:block;color:#294369}.test-preview p{margin:4px 0 12px;color:#657994;font-size:12px}.preview-actions{display:grid;grid-template-columns:1fr 1fr;gap:9px}.preview-button{display:flex;align-items:center;justify-content:center;height:39px;border:1px solid #aac6ef;border-radius:9px;background:#fff;color:#24569f;font-size:12px;font-weight:750;text-decoration:none}.preview-button:hover{background:#edf5ff;text-decoration:none}.preview-button:focus-visible{outline:3px solid #2364d23d;outline-offset:2px}
 @media(max-width:760px){.shell{margin:20px auto}.layout{grid-template-columns:1fr}.visual{min-height:auto;padding:30px}.visual h1{font-size:28px}.security{grid-template-columns:1fr 1fr}.visual-foot{display:none}.panel{padding:34px}}@media(max-width:520px){.shell{width:min(100% - 20px,960px);margin:10px auto}.brand{margin:15px 4px}.layout{border-radius:15px}.visual{padding:25px 22px}.visual h1{font-size:25px}.security{grid-template-columns:1fr}.panel{padding:30px 21px}}
-</style></head><body><div class="shell"><div class="brand"><div class="brand-mark">G</div><div>GLPI Builder<small>Infrastructure deployment console</small></div></div>
+</style></head><body><div class="shell"><div class="brand"><div class="brand-mark">D</div><div>Docker App Manager<small>Synology deployment console</small></div></div>
 <main class="layout"><section class="visual"><div><span class="eyebrow">● Administrator access</span><h1>Welcome back.</h1><p>Sign in to manage deployments, restores and backups.</p><div class="security"><div class="security-item"><span class="icon">✓</span><span>Password-protected administration</span></div><div class="security-item"><span class="icon">⌁</span><span>Time-based two-factor authentication</span></div><div class="security-item"><span class="icon">◈</span><span>Short-lived secure sessions</span></div></div></div><div class="visual-foot">Authorized administrators only. Authentication attempts are rate-limited and audited.</div></section>
-<section class="panel"><div class="panel-head"><h2>Sign in to GLPI Builder</h2><p>Enter your administrator credentials to continue.</p></div>
+<section class="panel"><div class="panel-head"><h2>Sign in to Docker App Manager</h2><p>Enter your administrator credentials to continue.</p></div>
 {% if error %}<div class="error" role="alert">Unable to sign in. Check the credentials and try again.</div>{% endif %}
 <form method="post" action="{{ url_for('login') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="next" value="{{ next_path }}">
 <div class="field"><label for="username">Username</label><input id="username" name="username" autocomplete="username" placeholder="Your administrator username" required autofocus></div>
@@ -4156,11 +4184,11 @@ LOGIN_HTML = r"""<!doctype html>
 
 AUTH_RECOVERY_HTML = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Authentication recovery · GLPI Builder</title>
+<title>Authentication recovery · Docker App Manager</title>
 <style>
 body{margin:0;background:#f4f7fb;color:#172033;font:15px/1.55 system-ui,sans-serif}.card{width:min(720px,calc(100% - 32px));margin:64px auto;padding:34px;border:1px solid #dce3ec;border-radius:18px;background:#fff;box-shadow:0 20px 60px #16345f1c}h1{margin:0 0 10px;color:#12233f;font-size:27px}h2{margin:26px 0 8px;font-size:17px}p{color:#526176}.notice{padding:13px 15px;border:1px solid #f0c4bf;border-radius:10px;background:#fff6f5;color:#8f251c;font-weight:650}code{display:block;padding:12px;border:1px solid #d6deea;border-radius:8px;background:#f8fafc;color:#233b5d;overflow-wrap:anywhere;user-select:all}li+li{margin-top:7px}.foot{margin-top:24px;font-size:12px;color:#7b8798}
 </style></head><body><main class="card"><h1>Authentication recovery required</h1>
-<p class="notice">The existing administrator file could not be loaded. For safety, GLPI Builder did not generate a setup token and did not overwrite your credentials.</p>
+<p class="notice">The existing administrator file could not be loaded. For safety, Docker App Manager did not generate a setup token and did not overwrite your credentials.</p>
 <h2>First preserve the existing account</h2><p>Stop the project and correct the permissions of <strong>config</strong> to 700 and <strong>config/builder-auth.json</strong> to 600. Then start the project again.</p>
 <h2>Start a completely new setup</h2><ol><li>Stop the <strong>glpi-builder</strong> project.</li><li>Run the included script once as <strong>root</strong> in DSM Task Scheduler:</li></ol>
 <code>/bin/sh /volume1/docker/glpi-builder/reset_setup_on_synology.sh --confirm-reset</code>
@@ -4170,7 +4198,7 @@ body{margin:0;background:#f4f7fb;color:#172033;font:15px/1.55 system-ui,sans-ser
 
 SETUP_HTML = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Secure setup · GLPI Builder</title>
+<title>Secure setup · Docker App Manager</title>
 <style>
 :root{color-scheme:light;--navy:#12233f;--blue:#2364d2;--blue-dark:#184da8;--ink:#172033;--muted:#64748b;--line:#dce3ec;--soft:#f5f8fc;--danger:#b42318}
 *{box-sizing:border-box}body{margin:0;min-height:100vh;background:radial-gradient(circle at 15% 0,#eaf1ff 0,transparent 36%),#f4f7fb;color:var(--ink);font:15px/1.5 Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
@@ -4182,7 +4210,7 @@ SETUP_HTML = r"""<!doctype html>
 .scheduler{margin:22px 0 4px;padding:16px;border:1px solid #dce3ec;border-radius:12px;background:#fbfcfe}.scheduler-head{display:flex;align-items:flex-start;justify-content:space-between;gap:14px}.scheduler h3{margin:0 0 4px;color:#23324a;font-size:15px}.scheduler p{margin:0;color:#65748a;font-size:12px}.scheduler-status{flex:0 0 auto;padding:4px 8px;border-radius:999px;background:#fff0d8;color:#8a5200;font-size:11px;font-weight:750}.scheduler-status.ready{background:#e7f7ed;color:#176b3a}.scheduler ol{margin:13px 0;padding-left:20px;color:#425169;font-size:12px}.scheduler li+li{margin-top:4px}.command-wrap{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:stretch}.command{min-width:0;padding:10px 11px;border:1px solid #d6deea;border-radius:8px;background:#fff;color:#233b5d;font:600 11px/1.45 ui-monospace,SFMono-Regular,Menlo,monospace;overflow-wrap:anywhere;user-select:all}.copy-command{width:auto;height:auto;min-height:38px;margin:0;padding:0 12px;border:1px solid #aac6ef;border-radius:8px;background:#fff;box-shadow:none;color:#24569f;font-size:12px}.copy-command:hover{background:#edf5ff;filter:none}.scheduler-foot{display:flex;justify-content:space-between;gap:12px;margin-top:9px}.scheduler-foot a{color:#24569f;font-size:12px;font-weight:700}.scheduler-foot span{color:#8491a4;font-size:11px}
 button{display:flex;align-items:center;justify-content:center;width:100%;height:46px;margin-top:23px;border:0;border-radius:10px;background:linear-gradient(180deg,var(--blue),var(--blue-dark));box-shadow:0 8px 20px #205fc332;color:#fff;font:700 14px system-ui;cursor:pointer}button:hover{filter:brightness(1.04)}button:focus-visible{outline:3px solid #2364d23d;outline-offset:2px}.footnote{margin:14px 0 0;text-align:center;color:#8491a4;font-size:12px}.preview-banner{margin:0 0 18px;padding:12px 14px;border:1px solid #eed09b;border-radius:10px;background:#fff8e8;color:#805000;font-size:13px}.preview-back{display:block;margin-top:12px;text-align:center;font-weight:700}fieldset{min-width:0;margin:0;padding:0;border:0}fieldset:disabled{opacity:.72}fieldset:disabled button{cursor:not-allowed;box-shadow:none}
 @media(max-width:820px){.shell{margin:20px auto}.layout{grid-template-columns:1fr}.intro{padding:30px}.intro h1{font-size:28px}.steps{grid-template-columns:1fr 1fr}.privacy{display:none}.panel{padding:30px}}@media(max-width:560px){.shell{width:min(100% - 20px,1040px);margin:10px auto}.brand{margin:15px 4px}.layout{border-radius:15px}.intro{padding:25px 22px}.intro h1{font-size:25px}.steps{grid-template-columns:1fr;gap:14px;margin-top:24px}.panel{padding:26px 20px}.row{grid-template-columns:1fr}.scheduler-head,.scheduler-foot{display:block}.scheduler-status{display:inline-block;margin-top:9px}.command-wrap{grid-template-columns:1fr}.copy-command{min-height:40px}.scheduler-foot span{display:block;margin-top:5px}}
-</style></head><body><div class="shell"><div class="brand"><div class="brand-mark">G</div><div>GLPI Builder<small>Infrastructure deployment console</small></div></div>
+</style></head><body><div class="shell"><div class="brand"><div class="brand-mark">D</div><div>Docker App Manager<small>Synology deployment console</small></div></div>
 <main class="layout"><section class="intro"><span class="eyebrow">● Secure onboarding</span><h1>Let’s secure your Builder.</h1>
 <p>Complete this one-time setup before managing GLPI environments.</p>
 <div class="steps"><div class="step"><div class="step-number">1</div><div><strong>Verify this instance</strong><span>Use the token shown in the container log.</span></div></div>
@@ -4717,6 +4745,49 @@ services:
 """
 
 
+def discover_profile_applications():
+    """Discover only projects carrying a valid Builder application manifest."""
+    applications = []
+    if not BASE_PATH.is_dir():
+        return applications
+    try:
+        folders = list(BASE_PATH.iterdir())[:MAX_SCAN_ENTRIES]
+    except OSError:
+        return applications
+    for folder in folders:
+        if folder.is_symlink() or not folder.is_dir():
+            continue
+        data = read_application_manifest(folder)
+        if not data:
+            continue
+        app_container = get_container(data["project"])
+        db_container = get_container(f"{data['project']}-db")
+        app_status = getattr(app_container, "status", "missing") if app_container else "missing"
+        db_status = getattr(db_container, "status", "missing") if db_container else "missing"
+        applications.append({
+            "name": data["project"],
+            "app_type": data["type"],
+            "app_label": data["name"],
+            "env_port": str(data["port"]),
+            "active_port": str(data["port"]),
+            "glpi_status": app_status,
+            "db_status": db_status,
+            "glpi_image": data["image"],
+            "mariadb_image": data.get("database", "Managed database"),
+            "tz": read_env(data["project"]).get("TZ", TZ_DEFAULT),
+            "cookie_samesite": DEFAULT_SESSION_COOKIE_SAMESITE,
+            "cookie_secure": DEFAULT_SESSION_COOKIE_SECURE,
+            "path": str(folder),
+            "mappings": f"{data['port']} → {data['internal_port']}/tcp",
+            "latest_log": None,
+            "logs": list_logs(data["project"]),
+            "backup_source": False,
+            "backup_status": {"selected": False, "ready": False, "issues": [], "latest": None, "schedule": backup_schedule_status(data["project"])},
+            "profile_managed": True,
+        })
+    return applications
+
+
 def professional_ui_snapshot():
     docker_snapshot = dashboard_docker_snapshot()
     projects = []
@@ -4745,6 +4816,11 @@ def professional_ui_snapshot():
                 ("backup_status", {"selected": False, "ready": False, "issues": [], "latest": None}),
             )
         })
+    known_profile_names = {item["name"] for item in projects}
+    projects.extend(
+        item for item in discover_profile_applications()
+        if item["name"] not in known_profile_names
+    )
     if test_demo_is_active():
         docker_snapshot = dict(docker_snapshot)
         docker_snapshot["image_tags"] = tuple(sorted(set(
@@ -4843,7 +4919,7 @@ def projects_page():
     docker_snapshot, projects = professional_ui_snapshot()
     return render_professional_page(
         PROJECTS,
-        "Projects",
+        "Applications",
         "projects",
         projects=projects,
         unmanaged_projects=discover_unmanaged_glpi_projects(
@@ -4881,6 +4957,191 @@ def new_project_page():
     )
 
 
+@app.route("/applications/new", methods=["GET"])
+def new_application_page():
+    docker_snapshot, _projects = professional_ui_snapshot()
+    return render_professional_page(
+        APPLICATION_WIZARD,
+        "Add application",
+        "projects",
+        profiles=profile_catalog(),
+        suggested_host_port=suggest_free_host_port(
+            containers=docker_snapshot["containers"]
+        ),
+        tz_default=TZ_DEFAULT,
+    )
+
+
+def validate_application_request(source):
+    profile = get_profile(source.get("app_type"))
+    project = validate_application_project(source.get("project"))
+    host_port = validate_application_port(source.get("host_port"))
+    image = validate_application_image(profile, source.get("image"))
+    timezone = str(source.get("timezone") or TZ_DEFAULT).strip()
+    if project_dir(project).exists():
+        raise ValueError(
+            f"Project directory already exists: {project_dir(project)}. "
+            "Existing projects are never adopted or overwritten."
+        )
+    assert_docker_port_free(host_port)
+    build_application_environment(profile, project, host_port, image, timezone)
+    return {
+        "app_type": profile.key,
+        "project": project,
+        "host_port": host_port,
+        "image": image,
+        "timezone": timezone,
+    }
+
+
+@app.route("/applications/create", methods=["POST"])
+def create_application():
+    try:
+        require_csrf()
+        data = validate_application_request(request.form)
+        token = secrets.token_urlsafe(32)
+        session["pending_application_preview"] = {
+            "token": token,
+            "created_at": int(time.time()),
+            "data": data,
+        }
+        session.modified = True
+        return render_professional_page(
+            APPLICATION_PREVIEW,
+            "Review application",
+            "projects",
+            data=data,
+            profile=get_profile(data["app_type"]),
+            preview_token=token,
+        )
+    except Exception as exc:
+        flash(str(exc), "err")
+        return redirect(url_for("new_application_page"))
+
+
+def consume_application_preview(token):
+    pending = session.pop("pending_application_preview", None)
+    session.modified = True
+    if not pending or not hmac.compare_digest(str(pending.get("token", "")), str(token or "")):
+        raise ValueError("The application preview is missing or invalid.")
+    if int(pending.get("created_at") or 0) < int(time.time()) - CREATE_PREVIEW_TTL_SECONDS:
+        raise ValueError("The application preview expired; review the deployment again.")
+    return validate_application_request(pending["data"])
+
+
+def write_private_application_files(data):
+    profile = get_profile(data["app_type"])
+    project = data["project"]
+    folder = project_dir(project)
+    if folder.exists():
+        raise ValueError(f"Project directory already exists: {folder}")
+    environment = build_application_environment(
+        profile, project, data["host_port"], data["image"], data["timezone"]
+    )
+    folder.mkdir(mode=0o700, parents=False, exist_ok=False)
+    for volume in profile.volumes:
+        (folder / volume).mkdir(mode=0o700)
+    env_text = "# Generated by Docker Application Manager. Keep private.\n" + "".join(
+        f"{key}={value}\n" for key, value in environment.items()
+    )
+    atomic_write_text(folder / ".env", env_text, 0o600)
+    atomic_write_text(
+        folder / "docker-compose.yml",
+        render_application_compose(profile, environment),
+        0o600,
+    )
+    atomic_write_text(
+        folder / MANIFEST_NAME,
+        json.dumps(build_application_manifest(profile, environment), indent=2) + "\n",
+        0o600,
+    )
+    return profile
+
+
+@app.route("/applications/create/execute", methods=["POST"])
+def execute_application():
+    project = None
+    try:
+        require_csrf()
+        data = consume_application_preview(request.form.get("preview_token"))
+        project = data["project"]
+        assert_docker_port_free(data["host_port"])
+        profile = write_private_application_files(data)
+        validation = subprocess.run(
+            ["docker", "compose", "-f", "docker-compose.yml", "config", "--quiet"],
+            cwd=project_dir(project), capture_output=True, text=True, timeout=60,
+        )
+        if validation.returncode:
+            raise RuntimeError("Compose validation failed: " + tail_text(validation.stderr, 2000))
+        deployment = subprocess.run(
+            ["docker", "compose", "-f", "docker-compose.yml", "up", "-d"],
+            cwd=project_dir(project), capture_output=True, text=True, timeout=600,
+        )
+        if deployment.returncode:
+            raise RuntimeError("Application deployment failed: " + tail_text(deployment.stderr, 3000))
+        write_action_log(project, "application-deploy", [
+            f"Application profile: {profile.name}",
+            f"Image: {data['image']}",
+            f"Web port: {data['host_port']}",
+            "Compose validation passed and containers were started.",
+        ])
+        invalidate_dashboard_cache()
+        flash(f"{profile.name} project {project} was deployed.", "ok")
+        return redirect(url_for("project_detail_page", project=project))
+    except Exception as exc:
+        if project and project_dir(project).is_dir():
+            try:
+                write_action_log(project, "application-deploy-failed", [tail_text(exc, 3000)])
+            except Exception:
+                pass
+        flash(str(exc), "err")
+        return redirect(url_for("new_application_page"))
+
+
+@app.route("/applications/action", methods=["POST"])
+def application_lifecycle():
+    project = None
+    try:
+        require_csrf()
+        project = validate_application_project(request.form.get("project"))
+        action = str(request.form.get("action") or "").strip().lower()
+        commands = {
+            "start": (["docker", "compose", "start"], "started"),
+            "stop": (["docker", "compose", "stop"], "stopped"),
+            "restart": (["docker", "compose", "restart"], "restarted"),
+        }
+        folder = project_dir(project)
+        data = read_application_manifest(folder)
+        if not data:
+            raise ValueError("This is not a valid profile-managed application.")
+        if action == "update":
+            pull = subprocess.run(
+                ["docker", "compose", "pull"], cwd=folder,
+                capture_output=True, text=True, timeout=600,
+            )
+            if pull.returncode:
+                raise RuntimeError("Image pull failed: " + tail_text(pull.stderr, 3000))
+            command, past = ["docker", "compose", "up", "-d"], "updated"
+        elif action in commands:
+            command, past = commands[action]
+        else:
+            raise ValueError("Unsupported application lifecycle action.")
+        result = subprocess.run(
+            command, cwd=folder, capture_output=True, text=True, timeout=600,
+        )
+        if result.returncode:
+            raise RuntimeError(f"Application {action} failed: " + tail_text(result.stderr, 3000))
+        write_action_log(project, f"application-{action}", [
+            f"Profile-managed application {past}.",
+            f"Application type: {data['name']}",
+        ])
+        invalidate_dashboard_cache()
+        flash(f"{data['name']} project {project} was {past}.", "ok")
+    except Exception as exc:
+        flash(str(exc), "err")
+    return redirect(url_for("project_detail_page", project=project)) if project else redirect(url_for("projects_page"))
+
+
 @app.route("/projects/<project>", methods=["GET"])
 def project_detail_page(project):
     project = validate_project(project)
@@ -4888,6 +5149,14 @@ def project_detail_page(project):
     selected = next((item for item in projects if item["name"] == project), None)
     if not selected:
         abort(404)
+    if selected.get("profile_managed"):
+        return render_professional_page(
+            APPLICATION_DETAIL,
+            project,
+            "projects",
+            project=selected,
+            profile=get_profile(selected["app_type"]),
+        )
     return render_professional_page(
         PROJECT_DETAIL,
         project,

@@ -232,6 +232,8 @@ class AuthenticationTest(unittest.TestCase):
             "projects_page", "new_project_page", "project_detail_page", "backups_page",
             "project_compose_page", "activity_page", "settings_page", "test_preview_enter",
             "test_preview_setup", "test_preview_exit", "status_snapshot",
+            "new_application_page", "create_application", "execute_application",
+            "application_lifecycle",
         }
         self.assertEqual(management, expected)
 

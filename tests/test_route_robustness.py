@@ -124,7 +124,7 @@ class RouteRobustnessTest(unittest.TestCase):
             response = self.client.get("/")
 
         self.assertEqual(response.status_code, 200)
-        self.assertIn(b"No managed projects yet", response.data)
+        self.assertIn(b"No managed applications yet", response.data)
         self.assertIn(b"Available images", response.data)
         self.assertNotIn(b"Internal Server Error", response.data)
 

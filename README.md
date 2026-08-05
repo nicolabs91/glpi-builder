@@ -1,7 +1,9 @@
-# GLPI Builder 0.3 for Synology
+# Docker App Manager 0.4.0 for Synology
 
-GLPI Builder creates and restores internal GLPI Docker projects on a
-Synology NAS. This version was developed for a Synology RS822RP+ with projects
+Docker Application Manager creates and manages supported internal Docker
+applications on a Synology NAS. Existing GLPI Builder projects remain fully
+compatible and retain their proven create, restore and backup paths. This
+version was developed for a Synology RS822RP+ with projects
 stored below `/volume1/docker`. The proven v7 structure of every generated
 `docker-compose.yml` is intentionally unchanged and protected by regression
 tests and SHA-256 checks.
@@ -30,7 +32,18 @@ rate limited per source address and globally.
 
 ## Features
 
-- professional multi-page console with Overview, Projects, Backups, Activity,
+- an extensible application-profile catalog alongside the unchanged legacy
+  GLPI project contract;
+- fresh deployments of n8n with PostgreSQL and Team Password Manager with
+  the vendor-documented MySQL 5.7 database, each using an isolated network
+  and persistent bind mounts;
+- explicit `.builder-app.json` ownership manifests, so arbitrary Compose
+  projects are never silently adopted or mutated;
+- profile-specific image allowlists, health checks and recovery guidance;
+- generated secrets kept only in a mode-600 `.env`; sanitized Compose output
+  exposes placeholders rather than credential values;
+
+- professional multi-page console with Overview, Applications, Backups, Activity,
   Settings, project details, and a guided create/restore wizard;
 - read-only discovery and rejection reasons for existing GLPI Compose projects;
 - strict GLPI project discovery: unrelated Docker directories and generic
@@ -351,7 +364,7 @@ outside that directory are rejected.
 The database and GLPI files selectors show only backups whose relative path
 contains `glpi` (case-insensitive), including the managed project backup
 folders. Backups for other applications may remain below `_BACKUPS`, but are
-not offered by GLPI Builder.
+not offered by Docker App Manager.
 
 ## Scheduled Synology backup
 

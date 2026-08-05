@@ -18,7 +18,7 @@ RUN apt-get update \
     && . /etc/os-release \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian $VERSION_CODENAME stable" > /etc/apt/sources.list.d/docker.list \
     && apt-get update \
-    && apt-get install -y --no-install-recommends docker-ce-cli \
+    && apt-get install -y --no-install-recommends docker-ce-cli docker-compose-plugin \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
@@ -26,6 +26,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app.py .
 COPY app_ui.py .
+COPY app_profiles.py .
 COPY auth_security.py .
 COPY docker-compose.app.yml .
 COPY install_on_synology.sh .
