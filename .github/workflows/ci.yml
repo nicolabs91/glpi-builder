@@ -14,6 +14,8 @@ jobs:
   test-and-build:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      BUILDER_AUTH_STATE_PATH: /tmp/docker-app-manager-ci/auth-state/totp-replay-state
     steps:
       - uses: actions/checkout@v4
 
