@@ -11,6 +11,7 @@ from app_profiles import (
     build_environment,
     get_profile,
     manifest,
+    postgres_data_mount_target,
     profile_catalog,
     read_manifest,
     render_compose,
@@ -82,6 +83,22 @@ class ApplicationProfileTests(unittest.TestCase):
         )
         with self.assertRaises(ValueError):
             validate_database_image(get_profile("n8n"), "mysql:8.0")
+
+    def test_postgres_data_mount_tracks_image_layout_change(self):
+        self.assertEqual(postgres_data_mount_target("postgres:17-alpine"), "/var/lib/postgresql/data")
+        self.assertEqual(postgres_data_mount_target("postgres:18"), "/var/lib/postgresql")
+        self.assertEqual(postgres_data_mount_target("postgres:18-alpine"), "/var/lib/postgresql")
+
+    @patch("app_profiles._secret", side_effect=["db-secret", "encryption-secret"])
+    def test_n8n_postgres_18_compose_mounts_versioned_parent(self, _secret):
+        profile = get_profile("n8n")
+        env = build_environment(
+            profile, "n8n-pg18", 5678, profile.default_image, "Europe/Brussels",
+            database_image="postgres:18-alpine",
+        )
+        compose = render_compose(profile, env)
+        self.assertIn("/volume1/docker/n8n-pg18/database:/var/lib/postgresql:rw", compose)
+        self.assertNotIn("/volume1/docker/n8n-pg18/database:/var/lib/postgresql/data:rw", compose)
 
     def test_manifest_is_fail_closed(self):
         profile = get_profile("n8n")

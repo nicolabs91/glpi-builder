@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.0-rc.6
+
+- Generate the n8n PostgreSQL data mount according to the selected local image:
+  PostgreSQL 18 and newer mount the persistent directory at
+  `/var/lib/postgresql`, while PostgreSQL 17 and older retain
+  `/var/lib/postgresql/data`.
+- Add regression coverage for both PostgreSQL storage layouts.
+
 ## 0.5.0-rc.5
 
 - Make newly created n8n and TPM bind-mount directories writable for their

@@ -106,6 +106,14 @@ def validate_database_image(profile: AppProfile, image: str) -> str:
     return image
 
 
+def postgres_data_mount_target(image: str) -> str:
+    """Return the persistent-data mount expected by the selected Postgres image."""
+    match = re.match(r"^postgres:(\d+)(?:$|[.@-])", str(image or "").strip())
+    if match and int(match.group(1)) >= 18:
+        return "/var/lib/postgresql"
+    return "/var/lib/postgresql/data"
+
+
 def validate_port(value) -> int:
     try:
         port = int(str(value).strip())
@@ -173,6 +181,7 @@ def render_compose(profile: AppProfile, env: dict, base_path: str = "/volume1/do
     pids_limit: 256
     mem_limit: 1g''' if quarantine else ""
     if profile.key == "n8n":
+        postgres_mount = postgres_data_mount_target(env.get("DATABASE_IMAGE", ""))
         return f'''services:
   {project}-db:
     image: ${{DATABASE_IMAGE}}
@@ -184,7 +193,7 @@ def render_compose(profile: AppProfile, env: dict, base_path: str = "/volume1/do
       POSTGRES_USER: ${{POSTGRES_USER}}
       POSTGRES_PASSWORD: ${{POSTGRES_PASSWORD}}
     volumes:
-      - {root}/database:/var/lib/postgresql/data:rw
+      - {root}/database:{postgres_mount}:rw
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${{POSTGRES_USER}} -d $${{POSTGRES_DB}}"]
       interval: 10s

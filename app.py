@@ -59,7 +59,7 @@ from app_profiles import (
     validate_project_name as validate_application_project,
 )
 
-APP_VERSION = "0.5.0-rc.5"
+APP_VERSION = "0.5.0-rc.6"
 TPM_BACKUP_MANIFEST = "tpm-backup.json"
 QUARANTINE_REPORT = "quarantine-report.json"
 QUARANTINE_DEFAULT_DAYS = 14
