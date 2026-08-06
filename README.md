@@ -1,4 +1,4 @@
-# Docker App Manager 0.4.1 for Synology
+# Docker App Manager 0.5.0-rc.1 for Synology
 
 Docker Application Manager creates and manages supported internal Docker
 applications on a Synology NAS. Existing GLPI Builder projects remain fully
@@ -37,6 +37,17 @@ rate limited per source address and globally.
 - fresh deployments of n8n with PostgreSQL and Team Password Manager with
   the vendor-documented MySQL 5.7 database, each using an isolated network
   and persistent bind mounts;
+- isolated Team Password Manager `.sql` and `.sql.gz` test restores into a
+  new database on an internal Docker network without an external route;
+- optional checksum-backed TPM backup-set manifests, uploads archives,
+  post-restore proof reports, expiry and recoverable quarantine archiving
+  (see `docs/TPM_QUARANTINE_RESTORE.md`);
+- read-only NAS preflight checks for architecture, writable storage, free
+  space, Docker and Compose, followed by image/platform proof before writing a
+  project;
+- exact backup/image version matching and fail-closed SQL validation before a
+  test restore is allowed to start;
+- backup intervals shown as days, weeks and months instead of raw hours;
 - explicit `.builder-app.json` ownership manifests, so arbitrary Compose
   projects are never silently adopted or mutated;
 - profile-specific image allowlists, health checks and recovery guidance;
@@ -492,6 +503,22 @@ is denied, and `/login` is available. The current authenticated container is
 not stopped until that proof passes and is preserved for automatic recovery if
 the published rollback fails. Rollback does not reverse GLPI project changes,
 recover deleted data, or restore the backup script or `.env`.
+
+## Unified application and backup management
+
+`Add application` is the single entry point for GLPI, n8n and Team Password
+Manager. The visible flow is shared, while each application keeps its own
+validated deployment and restore adapter. Legacy GLPI links remain supported.
+
+The Backups workspace and one Synology dispatcher manage all three profiles:
+
+- GLPI: MariaDB dump plus GLPI data and plugins;
+- n8n: PostgreSQL dump plus its persistent `.n8n` data directory;
+- Team Password Manager: MySQL dump plus its persistent application directory.
+
+Each set contains an application-labelled manifest and SHA-256 checksums.
+Secrets remain in the container/private `.env` and are not copied into the
+schedule file or manifest.
 
 ## Configuration reference
 

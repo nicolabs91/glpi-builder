@@ -63,7 +63,7 @@ class ProfessionalUiTest(unittest.TestCase):
         for path, heading in (
             ("/", "Infrastructure overview"),
             ("/projects", "Applications"),
-            ("/projects/new", "New project or restore"),
+            ("/projects/new", "Add application"),
             ("/backups", "Backups"),
             ("/activity", "Activity"),
             ("/settings", "Settings"),
@@ -74,6 +74,40 @@ class ProfessionalUiTest(unittest.TestCase):
                 self.assertIn(heading.encode(), response.data)
                 self.assertIn(b"aria-label=\"Primary\"", response.data)
                 self.assertIn(b"Mobile navigation", response.data)
+
+    def test_glpi_stays_in_shared_application_wizard(self):
+        response = self.get_with_data("/applications/new?app=glpi")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"Add application", response.data)
+        self.assertIn(b"Application profile", response.data)
+        self.assertIn(b"GLPI", response.data)
+        self.assertIn(b"n8n", response.data)
+        self.assertIn(b"Team Password Manager", response.data)
+        self.assertIn(b"NAS preflight", response.data)
+        self.assertIn(b"Deployment guardrails", response.data)
+        self.assertIn(b"Deployment mode", response.data)
+        self.assertIn(b"Application settings", response.data)
+        self.assertNotIn(b"New project or restore", response.data)
+
+    def test_profiles_always_show_isolated_restore_and_fail_closed_when_unverified(self):
+        glpi = self.get_with_data("/applications/new?app=glpi")
+        self.assertEqual(glpi.status_code, 200)
+        self.assertIn(b"Isolated test restore", glpi.data)
+        self.assertIn(b'value="isolated" disabled', glpi.data)
+
+        n8n = self.get_with_data("/applications/new?app=n8n")
+        self.assertEqual(n8n.status_code, 200)
+        self.assertIn(b'name="app_type" value="n8n"', n8n.data)
+        self.assertIn(b'aria-current="true" href="/applications/new?app=n8n"', n8n.data)
+        self.assertIn(b"Isolated test restore", n8n.data)
+        self.assertNotIn(b'value="quarantine" disabled', n8n.data)
+        self.assertIn(b"Verified n8n database backup", n8n.data)
+
+        tpm = self.get_with_data("/applications/new?app=teampasswordmanager")
+        self.assertEqual(tpm.status_code, 200)
+        self.assertIn(b'name="app_type" value="teampasswordmanager"', tpm.data)
+        self.assertIn(b"Isolated test restore", tpm.data)
+        self.assertNotIn(b'value="quarantine" disabled', tpm.data)
 
     def test_project_detail_preserves_existing_safe_actions(self):
         response = self.get_with_data("/projects/glpi-test")
@@ -142,6 +176,27 @@ class ProfessionalUiTest(unittest.TestCase):
             b'pattern="[a-z0-9][a-z0-9_\\-]{2,50}"',
             response.data,
         )
+
+    def test_add_application_is_single_entry_point_and_offers_glpi(self):
+        projects = self.get_with_data("/projects")
+        self.assertEqual(projects.status_code, 200)
+        self.assertEqual(projects.data.count(b">Add application</a>"), 1)
+        self.assertNotIn(b">Add GLPI</a>", projects.data)
+
+        chooser = self.get_with_data("/applications/new")
+        self.assertEqual(chooser.status_code, 200)
+        self.assertIn(b">GLPI</strong>", chooser.data)
+        self.assertIn(b'href="/applications/new?app=glpi"', chooser.data)
+        self.assertIn(b">n8n</strong>", chooser.data)
+        self.assertIn(b">Team Password Manager</strong>", chooser.data)
+
+    def test_overview_and_backups_use_application_wide_language(self):
+        overview = self.get_with_data("/")
+        self.assertIn(b"Review application backups", overview.data)
+        self.assertNotIn(b"Review GLPI backups", overview.data)
+        backups = self.get_with_data("/backups")
+        self.assertIn(b"<th>Application</th>", backups.data)
+        self.assertIn("The shared Synology dispatcher", module.APPLICATION_DETAIL)
 
     def test_navigation_get_routes_do_not_acquire_mutation_lock(self):
         for path in ("/", "/projects", "/projects/new", "/backups", "/activity", "/settings"):

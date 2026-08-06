@@ -45,6 +45,26 @@ class ApplicationProfileTests(unittest.TestCase):
         self.assertIn("image: mysql:5.7", compose)
         self.assertIn("/volume1/docker/passwords/application:/var/www/html:rw", compose)
 
+    @patch("app_profiles._secret", side_effect=["user-secret", "root-secret"])
+    def test_tpm_quarantine_compose_has_no_external_route(self, _secret):
+        profile = get_profile("teampasswordmanager")
+        env = build_environment(
+            profile, "passwords-test", 8781,
+            "teampasswordmanager/teampasswordmanager:12.158.302",
+            "Europe/Brussels", quarantine=True, bind_address="192.0.2.10",
+            expires_at="2026-08-19T12:00:00",
+        )
+        compose = render_compose(profile, env)
+        self.assertIn("internal: true", compose)
+        self.assertIn("${APP_BIND_ADDRESS}:${APP_HTTP_PORT}:80", compose)
+        self.assertIn("no-new-privileges:true", compose)
+        self.assertIn("pids_limit: 256", compose)
+        self.assertIn("mem_limit: 1g", compose)
+        self.assertIn("BUILDER_TEST_ENVIRONMENT: ${BUILDER_QUARANTINE}", compose)
+        self.assertTrue(manifest(profile, env)["quarantine"])
+        self.assertEqual(manifest(profile, env)["bind_address"], "192.0.2.10")
+        self.assertEqual(manifest(profile, env)["expires_at"], "2026-08-19T12:00:00")
+
     def test_rejects_images_outside_profile_allowlist(self):
         with self.assertRaises(ValueError):
             validate_image(get_profile("n8n"), "evil.invalid/n8n:latest")

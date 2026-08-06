@@ -10,6 +10,9 @@ import tarfile
 import stat
 import hmac
 import json
+import gzip
+import hashlib
+import ipaddress
 import threading
 import subprocess
 from datetime import datetime, timedelta
@@ -55,7 +58,10 @@ from app_profiles import (
     validate_project_name as validate_application_project,
 )
 
-APP_VERSION = "0.4.1"
+APP_VERSION = "0.5.0-rc.1"
+TPM_BACKUP_MANIFEST = "tpm-backup.json"
+QUARANTINE_REPORT = "quarantine-report.json"
+QUARANTINE_DEFAULT_DAYS = 14
 BUILDER_TEST_PREVIEW_MODE = os.environ.get(
     "BUILDER_TEST_PREVIEW_MODE", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
@@ -77,8 +83,8 @@ BACKUP_SCHEDULER_DIR = Path(
 )
 BACKUP_SCRIPT_SOURCE = Path(__file__).resolve().parent / "backup" / "GLPI_backup.sh"
 BACKUP_DISPATCHER_SOURCE = Path(__file__).resolve().parent / "backup" / "GLPI_backup_dispatcher.sh"
-BACKUP_SCRIPT_PATH = BACKUP_TASK_DIR / "GLPI_backup.sh"
-BACKUP_DISPATCHER_PATH = BACKUP_SCHEDULER_DIR / "GLPI_backup_dispatcher.sh"
+BACKUP_SCRIPT_PATH = BACKUP_TASK_DIR / "Application_backup.sh"
+BACKUP_DISPATCHER_PATH = BACKUP_SCHEDULER_DIR / "Application_backup_dispatcher.sh"
 BACKUP_ENV_PATH = BACKUP_TASK_DIR / "GLPI_backup.env"
 BACKUP_PROJECTS_DIR = BACKUP_TASK_DIR / "projects"
 BACKUP_CREDENTIALS_DIR = BACKUP_TASK_DIR / "credentials"
@@ -103,6 +109,20 @@ CREATE_PREVIEW_TTL_SECONDS = 10 * 60
 PROGRESS_JOB_TTL_SECONDS = 6 * 60 * 60
 OPERATION_MODES = ("restore", "fresh")
 BACKUP_STALE_DAYS = 30
+
+
+def format_backup_interval(hours):
+    """Present compatible hour-based schedule values in human units."""
+    value = safe_int(hours, 24, 1)
+    if value % (24 * 30) == 0:
+        count, unit = value // (24 * 30), "month"
+    elif value % (24 * 7) == 0:
+        count, unit = value // (24 * 7), "week"
+    elif value % 24 == 0:
+        count, unit = value // 24, "day"
+    else:
+        count, unit = value, "hour"
+    return f"Every {count} {unit}{'' if count == 1 else 's'}"
 
 PROJECT_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{2,50}$")
 CONTAINER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{1,127}$")
@@ -286,6 +306,7 @@ except ValueError as exc:
     PERSISTED_AUTH_ERROR = str(exc)
 
 app = Flask(__name__)
+app.jinja_env.filters["backup_interval"] = format_backup_interval
 configured_flask_secret = (
     os.environ.get("FLASK_SECRET_KEY", "").strip()
     or PERSISTED_AUTH.get("FLASK_SECRET_KEY", "")
@@ -1111,8 +1132,8 @@ def validate_backup_schedule(kind="daily", schedule_time="02:00", weekdays="7", 
         raise ValueError("Backup weekdays must be numbers 1 through 7.")
     interval = int(interval_hours)
     retention = int(retention_days)
-    if interval not in {6, 12, 24, 48, 72, 168}:
-        raise ValueError("Backup interval must be 6, 12, 24, 48, 72 or 168 hours.")
+    if interval not in {6, 12, 24, 48, 72, 168, 336, 720}:
+        raise ValueError("Backup interval must use one of the supported day, week or month presets.")
     if retention < 1 or retention > 3650:
         raise ValueError("Backup retention must be between 1 and 3650 days.")
     return {
@@ -1461,7 +1482,18 @@ def configure_scheduled_backup(project, env=None, *, enabled=True, kind="daily",
     env = dict(env or read_env(project))
     if not env:
         raise ValueError(f"No .env file was found for {project}.")
-    db_name = validate_db_identifier(env.get("GLPI_DB_NAME") or "glpi")
+    manifest = read_application_manifest(project_dir(project))
+    app_type = str((manifest or {}).get("type") or "glpi")
+    if app_type == "n8n":
+        db_name = validate_db_identifier(env.get("POSTGRES_DB") or "n8n")
+        data_paths = "data"
+    elif app_type == "teampasswordmanager":
+        db_name = validate_db_identifier(env.get("MYSQL_DATABASE") or "teampasswordmanager")
+        data_paths = "application"
+    else:
+        app_type = "glpi"
+        db_name = validate_db_identifier(env.get("GLPI_DB_NAME") or "glpi")
+        data_paths = "glpi,plugins"
     db_container = database_container_for_project(project)
     if not CONTAINER_RE.fullmatch(db_container):
         raise ValueError(f"Invalid database container name: {db_container}")
@@ -1478,25 +1510,31 @@ def configure_scheduled_backup(project, env=None, *, enabled=True, kind="daily",
     previous = read_simple_env_file(backup_schedule_path(project))
     if not previous:
         previous = read_simple_env_file(BACKUP_ENV_PATH)
-    mysql_cnf = str(ensure_project_backup_credential(project, env))
+    mysql_cnf = ""
+    if app_type == "glpi":
+        mysql_cnf = str(ensure_project_backup_credential(project, env))
     container_cnf = previous.get("CONTAINER_CNF") or "/tmp/GLPI_mysql_backup.cnf"
     values = {
         "PROJECT_NAME": project,
+        "APP_TYPE": app_type,
         "PROJECT_DIR": str(project_dir(project)),
         "DB_CONTAINER": db_container,
         "DB_NAME": db_name,
         "BACKUP_ROOT": str(BACKUP_DATA_ROOT),
         "MYSQL_CNF": mysql_cnf,
         "CONTAINER_CNF": container_cnf,
+        "DATA_PATHS": data_paths,
         "RETENTION_DAYS": schedule["retention_days"],
         "SCHEDULE_ENABLED": "yes" if enabled else "no",
         "SCHEDULE_KIND": schedule["kind"],
         "SCHEDULE_TIME": schedule["time"],
         "SCHEDULE_WEEKDAYS": schedule["weekdays"],
         "INTERVAL_HOURS": schedule["interval_hours"],
+        "APP_IMAGE": str(env.get("APP_IMAGE") or env.get("GLPI_IMAGE") or "unknown"),
+        "N8N_ENCRYPTION_KEY": str(env.get("N8N_ENCRYPTION_KEY") or "") if app_type == "n8n" else "",
     }
     if any(
-        not re.fullmatch(r"[A-Za-z0-9_./,:-]+", value)
+        value and not re.fullmatch(r"[A-Za-z0-9_./,:-]+", value)
         for value in values.values()
     ):
         raise ValueError("Backup configuration contains unsupported characters.")
@@ -1617,33 +1655,39 @@ def scheduled_backup_status(project):
         status["issues"].append("Managed backup script is missing.")
     if not backup_schedule_path(project).is_file() and not BACKUP_ENV_PATH.is_file():
         status["issues"].append("Backup environment file is missing.")
-    try:
-        mysql_cnf = ensure_project_backup_credential(project)
-    except ValueError as error:
-        mysql_cnf = project_backup_credential_path(project)
-        status["issues"].append(str(error))
-    if not mysql_cnf.is_file():
-        status["issues"].append(f"MariaDB credential file is missing: {mysql_cnf}")
-    elif mysql_cnf.is_symlink():
-        status["issues"].append(f"MariaDB credential file must not be a symlink: {mysql_cnf}")
-    elif mysql_cnf.stat().st_mode & 0o077:
-        status["issues"].append(f"MariaDB credential file permissions are not private: {mysql_cnf}")
-    elif configured.get("MYSQL_CNF") != str(mysql_cnf):
-        schedule_path = backup_schedule_path(project)
-        if schedule_path.is_file() and not schedule_path.is_symlink():
-            configured["MYSQL_CNF"] = str(mysql_cnf)
-            atomic_write_text(
-                schedule_path,
-                "# Generated and maintained by Docker App Manager.\n"
-                + "".join(f"{key}={value}\n" for key, value in configured.items()),
-                0o600,
-            )
-        else:
-            status["issues"].append("Backup schedule uses legacy credentials; save the schedule once to migrate it.")
-    if not (project_dir(project) / "glpi").is_dir():
-        status["issues"].append("GLPI data directory is missing.")
-    if not (project_dir(project) / "plugins").is_dir():
-        status["issues"].append("GLPI plugins directory is missing.")
+    app_type = configured.get("APP_TYPE", "glpi")
+    if app_type == "glpi":
+        try:
+            mysql_cnf = ensure_project_backup_credential(project)
+        except ValueError as error:
+            mysql_cnf = project_backup_credential_path(project)
+            status["issues"].append(str(error))
+        if not mysql_cnf.is_file():
+            status["issues"].append(f"MariaDB credential file is missing: {mysql_cnf}")
+        elif mysql_cnf.is_symlink():
+            status["issues"].append(f"MariaDB credential file must not be a symlink: {mysql_cnf}")
+        elif mysql_cnf.stat().st_mode & 0o077:
+            status["issues"].append(f"MariaDB credential file permissions are not private: {mysql_cnf}")
+        elif configured.get("MYSQL_CNF") != str(mysql_cnf):
+            schedule_path = backup_schedule_path(project)
+            if schedule_path.is_file() and not schedule_path.is_symlink():
+                configured["MYSQL_CNF"] = str(mysql_cnf)
+                atomic_write_text(
+                    schedule_path,
+                    "# Generated and maintained by Docker App Manager.\n"
+                    + "".join(f"{key}={value}\n" for key, value in configured.items()),
+                    0o600,
+                )
+    required_paths = {
+        "glpi": ("glpi", "plugins"),
+        "n8n": ("data",),
+        "teampasswordmanager": ("application",),
+    }.get(app_type, ())
+    if not required_paths:
+        status["issues"].append(f"Unsupported backup adapter: {app_type}")
+    for relative in required_paths:
+        if not (project_dir(project) / relative).is_dir():
+            status["issues"].append(f"Required {app_type} data directory is missing: {relative}")
 
     db_name = configured.get("DB_CONTAINER") or database_container_for_project(project)
     database = get_container(db_name) if CONTAINER_RE.fullmatch(db_name or "") else None
@@ -1712,6 +1756,24 @@ def backup_inventory(db_backups, file_backups, *, demo=False):
                 except OSError:
                     pass
             name = path.name.lower()
+            lowered_path = str(path).lower()
+            manifest_application = ""
+            inventory_manifest = path.parent / "manifest.json"
+            if inventory_manifest.is_file() and not inventory_manifest.is_symlink():
+                try:
+                    manifest_application = str(json.loads(
+                        inventory_manifest.read_text(encoding="utf-8")
+                    ).get("application") or "").lower()
+                except (OSError, ValueError, json.JSONDecodeError):
+                    manifest_application = ""
+            if manifest_application == "n8n" or "n8n" in lowered_path:
+                application = "n8n"
+            elif manifest_application == "teampasswordmanager" or "tpm" in lowered_path or "teampassword" in lowered_path or (path.parent / TPM_BACKUP_MANIFEST).is_file():
+                application = "Team Password Manager"
+            elif manifest_application == "glpi":
+                application = "GLPI"
+            else:
+                application = "GLPI / unclassified"
             pair_key = re.sub(
                 r"(?:[-_.]?(?:database|db|sql|files?|glpi-files?))?(?:\.(?:sql|dump|tar|gz|tgz|zip|bz2|xz))+$",
                 "",
@@ -1719,6 +1781,7 @@ def backup_inventory(db_backups, file_backups, *, demo=False):
             ).strip("-_.") or path.parent.name.lower()
             rows.append({
                 "kind": kind,
+                "application": application,
                 "value": value,
                 "label": label,
                 "size_label": format_size(size_bytes) if size_bytes else "Directory / unknown",
@@ -4764,6 +4827,22 @@ def discover_profile_applications():
         db_container = get_container(f"{data['project']}-db")
         app_status = getattr(app_container, "status", "missing") if app_container else "missing"
         db_status = getattr(db_container, "status", "missing") if db_container else "missing"
+        report = None
+        report_path = folder / QUARANTINE_REPORT
+        if report_path.is_file() and not report_path.is_symlink():
+            try:
+                report = json.loads(report_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                report = None
+        expires_at = str(data.get("expires_at") or "")
+        expired = False
+        if expires_at:
+            try:
+                expired = datetime.fromisoformat(expires_at) <= datetime.now()
+            except ValueError:
+                expired = True
+        scheduled = data["project"] in set(scheduled_backup_projects())
+        backup_state = scheduled_backup_status(data["project"])
         applications.append({
             "name": data["project"],
             "app_type": data["type"],
@@ -4781,9 +4860,13 @@ def discover_profile_applications():
             "mappings": f"{data['port']} → {data['internal_port']}/tcp",
             "latest_log": None,
             "logs": list_logs(data["project"]),
-            "backup_source": False,
-            "backup_status": {"selected": False, "ready": False, "issues": [], "latest": None, "schedule": backup_schedule_status(data["project"])},
+            "backup_source": scheduled,
+            "backup_status": backup_state,
             "profile_managed": True,
+            "quarantine": bool(data.get("quarantine")),
+            "quarantine_report": report,
+            "expires_at": expires_at,
+            "expired": expired,
         })
     return applications
 
@@ -4854,8 +4937,8 @@ def overview_findings(projects, unmanaged_projects):
     for project in projects:
         if project["glpi_status"] != "running":
             findings.append({
-                "title": f"{project['name']}: GLPI is {project['glpi_status']}",
-                "detail": "Open the project to run diagnostics or recreate the GLPI container.",
+                "title": f"{project['name']}: {project.get('app_label') or 'application'} is {project['glpi_status']}",
+                "detail": "Open the application to inspect its status and lifecycle controls.",
             })
         if project["db_status"] != "running":
             findings.append({
@@ -4936,6 +5019,7 @@ def new_project_page():
         else scan_backup_choices(BACKUP_ROOT, include_dirs=True)
     )
     docker_snapshot, _projects = professional_ui_snapshot()
+    preflight = synology_preflight()
     return render_professional_page(
         WIZARD,
         "New project",
@@ -4952,24 +5036,284 @@ def new_project_page():
         suggested_host_port=suggest_free_host_port(
             containers=docker_snapshot["containers"]
         ),
+        profiles=profile_catalog(),
         tz_default=TZ_DEFAULT,
         demo_mode=test_demo_is_active(),
+        preflight=preflight,
     )
 
 
 @app.route("/applications/new", methods=["GET"])
 def new_application_page():
     docker_snapshot, _projects = professional_ui_snapshot()
+    backup_choices = scan_backup_choices(BACKUP_ROOT, include_dirs=False)
+    preflight = synology_preflight()
+    requested_app = request.args.get("app", "").strip().lower()
+    if requested_app == "glpi":
+        glpi_choices = (
+            demo_backup_choices() if test_demo_is_active()
+            else scan_backup_choices(BACKUP_ROOT, include_dirs=True)
+        )
+        return render_professional_page(
+            WIZARD, "Add application", "projects",
+            backup_root="/demo-only/backups" if test_demo_is_active() else str(BACKUP_ROOT),
+            db_backups=glpi_choices["database"], file_backups=glpi_choices["files"],
+            glpi_images=local_image_tags("glpi", docker_snapshot["image_tags"]),
+            db_images=local_image_tags("database", docker_snapshot["image_tags"]),
+            suggested_host_port=suggest_free_host_port(containers=docker_snapshot["containers"]),
+            profiles=profile_catalog(),
+            tz_default=TZ_DEFAULT, demo_mode=test_demo_is_active(), preflight=preflight,
+        )
+    profiles = profile_catalog()
+    selected_profile = next(
+        (profile for profile in profiles if profile.key == requested_app),
+        profiles[0],
+    )
     return render_professional_page(
         APPLICATION_WIZARD,
         "Add application",
         "projects",
-        profiles=profile_catalog(),
+        profiles=profiles,
+        selected_app=selected_profile.key,
+        selected_image=selected_profile.default_image,
+        db_backups=backup_choices["database"],
+        tpm_backups=classify_tpm_backup_choices(backup_choices["database"]),
         suggested_host_port=suggest_free_host_port(
             containers=docker_snapshot["containers"]
         ),
+        suggested_bind_address=suggested_management_address(),
+        quarantine_default_days=QUARANTINE_DEFAULT_DAYS,
+        preflight=preflight,
         tz_default=TZ_DEFAULT,
     )
+
+
+def suggested_management_address():
+    host = request.host.split(":", 1)[0] if has_request_context() else ""
+    try:
+        address = ipaddress.ip_address(host)
+        if not address.is_unspecified:
+            return str(address)
+    except ValueError:
+        pass
+    return "127.0.0.1"
+
+
+def validate_bind_address(value, *, quarantine=False):
+    value = str(value or ("127.0.0.1" if quarantine else "0.0.0.0")).strip()
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError as exc:
+        raise ValueError("Management bind address must be one IPv4 or IPv6 address.") from exc
+    if quarantine and address.is_unspecified:
+        raise ValueError("Quarantine may not bind to every NAS interface; choose a management IP or 127.0.0.1.")
+    return str(address)
+
+
+def synology_preflight():
+    """Read-only host checks; image architecture is finally proven by Docker pull."""
+    checks = []
+    machine = getattr(os.uname(), "machine", "unknown")
+    checks.append({"name": "Host architecture", "status": "pass", "detail": machine})
+    checks.append({
+        "name": "Application root", "status": "pass" if BASE_PATH.is_dir() and os.access(BASE_PATH, os.W_OK) else "fail",
+        "detail": str(BASE_PATH),
+    })
+    try:
+        free = shutil.disk_usage(BASE_PATH if BASE_PATH.exists() else BASE_PATH.parent).free
+        checks.append({
+            "name": "Free storage", "status": "pass" if free >= 2 * 1024**3 else "fail",
+            "detail": format_size(free) + " available",
+        })
+    except OSError as exc:
+        checks.append({"name": "Free storage", "status": "fail", "detail": str(exc)})
+    for name, command in (
+        ("Docker engine", ["docker", "info", "--format", "{{.ServerVersion}}/{{.Architecture}}"]),
+        ("Docker Compose", ["docker", "compose", "version", "--short"]),
+    ):
+        try:
+            result = subprocess.run(command, capture_output=True, text=True, timeout=15)
+            checks.append({
+                "name": name, "status": "pass" if result.returncode == 0 else "fail",
+                "detail": tail_text(result.stdout or result.stderr, 200).strip() or "Unavailable",
+            })
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            checks.append({"name": name, "status": "fail", "detail": str(exc)})
+    return {"ready": all(item["status"] == "pass" for item in checks), "checks": checks}
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _safe_backup_member(root, name):
+    candidate = Path(root) / str(name or "")
+    if candidate.is_symlink():
+        raise ValueError("Backup manifest may not reference symlinks.")
+    target = candidate.resolve()
+    try:
+        target.relative_to(Path(root).resolve())
+    except ValueError as exc:
+        raise ValueError("Backup manifest references a file outside its backup set.") from exc
+    if target.is_symlink() or not target.is_file() or not path_under_backup_root(target):
+        raise ValueError("Backup manifest references a missing or unsafe file.")
+    return target
+
+
+def inspect_tpm_backup(value):
+    path = Path(str(value or "").strip())
+    if not path_under_backup_root(path) or path.is_symlink() or not path.is_file():
+        raise ValueError("Select a database backup below the configured backup root.")
+    if not path.name.lower().endswith((".sql", ".sql.gz")):
+        raise ValueError("The TPM test restore adapter accepts only .sql or .sql.gz backups.")
+    opener = gzip.open if path.name.lower().endswith(".gz") else open
+    forbidden = re.compile(
+        rb"\b(?:CREATE\s+USER|ALTER\s+USER|CREATE\s+DATABASE|DROP\s+DATABASE|USE\s+[`\w-]+|GRANT\s+|REVOKE\s+|INTO\s+OUTFILE|INTO\s+DUMPFILE|LOAD\s+DATA|INSTALL\s+PLUGIN|SHUTDOWN)\b",
+        re.IGNORECASE,
+    )
+    create_tables, inserted_tables = set(), set()
+    header = bytearray()
+    carry = b""
+    try:
+        with opener(path, "rb") as stream:
+            for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                if len(header) < 65536:
+                    header.extend(chunk[:65536 - len(header)])
+                inspected = carry + chunk
+                if b"\x00" in chunk or forbidden.search(inspected):
+                    raise ValueError("The SQL backup contains binary or server-level statements that quarantine restore refuses.")
+                create_tables.update(name.decode("utf-8", "replace") for name in re.findall(rb"CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?\s+`?([A-Za-z0-9_]+)`?", inspected, re.I))
+                inserted_tables.update(name.decode("utf-8", "replace") for name in re.findall(rb"INSERT\s+INTO\s+`?([A-Za-z0-9_]+)`?", inspected, re.I))
+                carry = inspected[-256:]
+    except (OSError, EOFError) as exc:
+        raise ValueError("The database backup cannot be read safely.") from exc
+    if not create_tables or not inserted_tables:
+        raise ValueError("The SQL dump must contain both table definitions and restored data.")
+    header_text = bytes(header).decode("utf-8", "replace")
+    server_match = re.search(r"(?:Server version|Database server version:)\s*([^\r\n]+)", header_text, re.I)
+    manifest_path = path.parent / TPM_BACKUP_MANIFEST
+    manifest_data = None
+    files = []
+    if manifest_path.is_file() and not manifest_path.is_symlink():
+        try:
+            manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError("The TPM backup manifest is unreadable or invalid JSON.") from exc
+        if manifest_data.get("schema") != 1 or manifest_data.get("application") != "teampasswordmanager":
+            raise ValueError("Unsupported TPM backup manifest contract.")
+        database = manifest_data.get("database") or {}
+        manifest_db = _safe_backup_member(path.parent, database.get("file"))
+        if manifest_db != path.resolve():
+            raise ValueError("The selected SQL file does not match the TPM backup manifest.")
+        if not hmac.compare_digest(str(database.get("sha256") or "").lower(), sha256_file(path)):
+            raise ValueError("The TPM database checksum does not match its manifest.")
+        if str(database.get("engine") or "").lower() != "mysql":
+            raise ValueError("This TPM adapter currently verifies only MySQL backup sets.")
+        database_version = str(database.get("version") or "").strip()
+        if not re.fullmatch(r"5\.7(?:\.\d+)?(?:[-+._A-Za-z0-9]*)?", database_version):
+            raise ValueError("This TPM adapter currently verifies only MySQL 5.7 backup sets.")
+        if server_match and not server_match.group(1).strip().startswith(database_version.split("-", 1)[0]):
+            raise ValueError("SQL source server version does not match the TPM backup manifest.")
+        expected_tables = set(manifest_data.get("tables") or [])
+        if not expected_tables or not expected_tables.issubset(create_tables):
+            raise ValueError("The SQL dump is missing tables declared by the TPM backup manifest.")
+        for item in manifest_data.get("files") or []:
+            extra = _safe_backup_member(path.parent, item.get("file"))
+            role = str(item.get("role") or "").strip().lower()
+            if role not in {"uploads"}:
+                raise ValueError("Unsupported TPM application-file role in backup manifest.")
+            if not extra.name.lower().endswith((".tar", ".tar.gz", ".tgz")):
+                raise ValueError("TPM uploads must be supplied as a tar archive.")
+            if not hmac.compare_digest(str(item.get("sha256") or "").lower(), sha256_file(extra)):
+                raise ValueError("A TPM application-file checksum does not match its manifest.")
+            files.append({"role": role, "path": str(extra), "sha256": sha256_file(extra)})
+    return {
+        "path": str(path.resolve()), "sha256": sha256_file(path),
+        "tables": sorted(create_tables), "inserted_tables": sorted(inserted_tables),
+        "server_version": server_match.group(1).strip() if server_match else "Unknown",
+        "manifest": manifest_data, "manifest_path": str(manifest_path) if manifest_data else "",
+        "files": files, "complete_set": bool(manifest_data),
+    }
+
+
+def inspect_n8n_backup(value):
+    """Validate one complete Builder-generated n8n backup set."""
+    selected = Path(str(value or "").strip())
+    if not path_under_backup_root(selected) or selected.is_symlink() or not selected.is_file():
+        raise ValueError("Select an n8n database backup below the configured backup root.")
+    folder = selected.parent
+    manifest_path = folder / "manifest.json"
+    checksums_path = folder / "SHA256SUMS"
+    try:
+        metadata = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("n8n isolated restore requires a valid Builder backup manifest.") from exc
+    if metadata.get("schema") != 2 or metadata.get("application") != "n8n":
+        raise ValueError("n8n isolated restore requires backup manifest schema 2.")
+    database = _safe_backup_member(folder, metadata.get("database"))
+    files = _safe_backup_member(folder, metadata.get("files"))
+    secrets_file = _safe_backup_member(folder, metadata.get("secrets"))
+    if database != selected.resolve() or not database.name.endswith(".sql.gz"):
+        raise ValueError("Selected n8n database dump does not match its manifest.")
+    try:
+        expected = {}
+        for line in checksums_path.read_text(encoding="utf-8").splitlines():
+            digest, name = line.split(None, 1)
+            expected[name.lstrip(" *")] = digest.lower()
+    except (OSError, ValueError) as exc:
+        raise ValueError("n8n backup checksum inventory is missing or invalid.") from exc
+    for member in (database, files, secrets_file):
+        if not hmac.compare_digest(expected.get(member.name, ""), sha256_file(member)):
+            raise ValueError(f"n8n backup checksum mismatch for {member.name}.")
+    secret_values = read_simple_env_file(secrets_file)
+    if not secret_values.get("N8N_ENCRYPTION_KEY"):
+        raise ValueError("n8n backup set is missing its encryption key.")
+    application_version = str(metadata.get("application_version") or "").strip()
+    if not re.fullmatch(r"[0-9]+(?:\.[0-9]+){1,3}", application_version):
+        raise ValueError("n8n backup manifest has no supported fixed application version.")
+    return {
+        "path": str(database), "sha256": sha256_file(database), "complete_set": True,
+        "tables": [], "server_version": str(metadata.get("database_version") or "PostgreSQL 16"),
+        "manifest": metadata, "files": [{"role": "n8n-data", "path": str(files)}],
+        "secrets_path": str(secrets_file), "application_version": application_version,
+    }
+
+
+def classify_tpm_backup_choices(choices):
+    result = []
+    for value, label in choices:
+        path = Path(value)
+        if not path.name.lower().endswith((".sql", ".sql.gz")):
+            continue
+        text = f"{path.name} {path.parent.name}".lower()
+        verified = (path.parent / TPM_BACKUP_MANIFEST).is_file()
+        likely = "tpm" in text or "team" in text
+        prefix = "Verified TPM set" if verified else ("TPM candidate" if likely else "Unclassified SQL")
+        result.append((value, f"{prefix} · {label}"))
+    return result
+
+
+def ensure_application_images_available(profile, image):
+    required = [image, "postgres:16-alpine" if profile.key == "n8n" else "mysql:5.7"]
+    for required_image in required:
+        present = subprocess.run(
+            ["docker", "image", "inspect", required_image],
+            capture_output=True, text=True, timeout=30,
+        )
+        if present.returncode == 0:
+            continue
+        pulled = subprocess.run(
+            ["docker", "pull", required_image],
+            capture_output=True, text=True, timeout=900,
+        )
+        if pulled.returncode:
+            raise RuntimeError(
+                f"Image/platform preflight failed for {required_image}: " + tail_text(pulled.stderr, 2000)
+            )
 
 
 def validate_application_request(source):
@@ -4978,20 +5322,60 @@ def validate_application_request(source):
     host_port = validate_application_port(source.get("host_port"))
     image = validate_application_image(profile, source.get("image"))
     timezone = str(source.get("timezone") or TZ_DEFAULT).strip()
+    deployment_mode = str(source.get("deployment_mode") or "fresh").strip().lower()
+    if deployment_mode not in {"fresh", "quarantine"}:
+        raise ValueError("Deployment mode must be Fresh installation or Isolated test restore.")
+    quarantine = deployment_mode == "quarantine"
+    database_backup = ""
+    backup_version = ""
+    backup_inspection = None
+    bind_address = validate_bind_address(source.get("bind_address"), quarantine=quarantine)
+    expires_at = ""
+    if quarantine:
+        if not profile.quarantine_restore:
+            raise ValueError(f"{profile.name} has no verified isolated restore adapter yet.")
+        database_backup = str(source.get("database_backup") or "").strip()
+        backup_version = str(source.get("backup_version") or "").strip()
+        backup_inspection = inspect_tpm_backup(database_backup) if profile.key == "teampasswordmanager" else inspect_n8n_backup(database_backup)
+        if not re.fullmatch(r"[0-9]+(?:\.[0-9]+){1,3}", backup_version):
+            raise ValueError("Enter the exact application version recorded with the backup.")
+        image_tag = image.rpartition(":")[2]
+        if image_tag == "latest" or backup_version != image_tag:
+            raise ValueError("Test restore requires a fixed image tag exactly matching the backup application version.")
+        if backup_inspection["manifest"] and backup_inspection["manifest"].get("application_version") != backup_version:
+            raise ValueError(f"{profile.name} image version does not match the backup manifest application version.")
+        try:
+            expiry_days = int(str(source.get("expiry_days") or QUARANTINE_DEFAULT_DAYS))
+        except ValueError as exc:
+            raise ValueError("Quarantine expiry must be a number of days.") from exc
+        if not 1 <= expiry_days <= 90:
+            raise ValueError("Quarantine expiry must be between 1 and 90 days.")
+        expires_at = (datetime.now() + timedelta(days=expiry_days)).replace(microsecond=0).isoformat()
     if project_dir(project).exists():
         raise ValueError(
             f"Project directory already exists: {project_dir(project)}. "
             "Existing projects are never adopted or overwritten."
         )
     assert_docker_port_free(host_port)
-    build_application_environment(profile, project, host_port, image, timezone)
+    build_application_environment(profile, project, host_port, image, timezone, quarantine=quarantine, bind_address=bind_address, expires_at=expires_at)
     return {
         "app_type": profile.key,
         "project": project,
         "host_port": host_port,
         "image": image,
         "timezone": timezone,
+        "quarantine": quarantine,
+        "deployment_mode": deployment_mode,
+        "database_backup": database_backup,
+        "backup_version": backup_version,
+        "backup_inspection": backup_inspection,
+        "bind_address": bind_address,
+        "expires_at": expires_at,
     }
+
+
+def validate_quarantine_database_backup(value):
+    return Path(inspect_tpm_backup(value)["path"])
 
 
 @app.route("/applications/create", methods=["POST"])
@@ -5036,7 +5420,10 @@ def write_private_application_files(data):
     if folder.exists():
         raise ValueError(f"Project directory already exists: {folder}")
     environment = build_application_environment(
-        profile, project, data["host_port"], data["image"], data["timezone"]
+        profile, project, data["host_port"], data["image"], data["timezone"],
+        quarantine=bool(data.get("quarantine")),
+        bind_address=data.get("bind_address") or "0.0.0.0",
+        expires_at=data.get("expires_at") or "",
     )
     folder.mkdir(mode=0o700, parents=False, exist_ok=False)
     for volume in profile.volumes:
@@ -5052,10 +5439,142 @@ def write_private_application_files(data):
     )
     atomic_write_text(
         folder / MANIFEST_NAME,
-        json.dumps(build_application_manifest(profile, environment), indent=2) + "\n",
+        json.dumps({
+            **build_application_manifest(profile, environment),
+            "backup": ({
+                "sha256": data["backup_inspection"]["sha256"],
+                "complete_set": data["backup_inspection"]["complete_set"],
+                "table_count": len(data["backup_inspection"]["tables"]),
+                "source_server": data["backup_inspection"]["server_version"],
+            } if data.get("backup_inspection") else None),
+        }, indent=2) + "\n",
         0o600,
     )
     return profile
+
+
+def restore_quarantine_database(data):
+    """Restore a validated SQL dump after its isolated database is healthy."""
+    project = data["project"]
+    folder = project_dir(project)
+    database_service = f"{project}-db"
+    started = subprocess.run(
+        ["docker", "compose", "up", "-d", database_service], cwd=folder,
+        capture_output=True, text=True, timeout=600,
+    )
+    if started.returncode:
+        raise RuntimeError("Quarantine database start failed: " + tail_text(started.stderr, 3000))
+    deadline = time.monotonic() + 180
+    while time.monotonic() < deadline:
+        health = subprocess.run(
+            ["docker", "inspect", "--format={{.State.Health.Status}}", database_service],
+            capture_output=True, text=True, timeout=15,
+        )
+        if health.returncode == 0 and health.stdout.strip() == "healthy":
+            break
+        time.sleep(2)
+    else:
+        raise RuntimeError("Quarantine database did not become healthy within 180 seconds.")
+    backup = Path(data["backup_inspection"]["path"])
+    opener = gzip.open if backup.name.lower().endswith(".gz") else open
+    shell = ('exec psql -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB"'
+             if data["app_type"] == "n8n" else
+             'exec mysql -uroot -p"$MYSQL_ROOT_PASSWORD" "$MYSQL_DATABASE"')
+    command = ["docker", "compose", "exec", "-T", database_service, "sh", "-c", shell]
+    process = subprocess.Popen(command, cwd=folder, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        with opener(backup, "rb") as source:
+            shutil.copyfileobj(source, process.stdin, length=1024 * 1024)
+        process.stdin.close()
+        process.stdin = None
+        stdout, stderr = process.communicate(timeout=900)
+    except Exception:
+        process.kill()
+        process.wait()
+        raise
+    if process.returncode:
+        raise RuntimeError("Quarantine database restore failed: " + tail_text(stderr.decode("utf-8", "replace"), 3000))
+
+
+def restore_quarantine_application_files(data):
+    inspection = data.get("backup_inspection") or {}
+    for item in inspection.get("files") or []:
+        if item.get("role") not in {"uploads", "n8n-data"}:
+            raise RuntimeError("Unsupported application-file role reached restore execution.")
+        destination = (project_dir(data["project"]) / "data" if item["role"] == "n8n-data"
+                       else project_dir(data["project"]) / "application" / "site" / "uploads")
+        destination.mkdir(mode=0o700, parents=True, exist_ok=True)
+        safe_extract_tar(Path(item["path"]), destination)
+    if data["app_type"] == "n8n":
+        restored = read_simple_env_file(Path(inspection["secrets_path"]))
+        environment_path = project_dir(data["project"]) / ".env"
+        environment = read_simple_env_file(environment_path)
+        environment["N8N_ENCRYPTION_KEY"] = restored["N8N_ENCRYPTION_KEY"]
+        atomic_write_text(environment_path, "# Generated by Docker Application Manager. Keep private.\n" + "".join(f"{key}={value}\n" for key, value in environment.items()), 0o600)
+
+
+def verify_quarantine_restore(data):
+    project = data["project"]
+    folder = project_dir(project)
+    network = f"{project}-network"
+    internal = subprocess.run(
+        ["docker", "network", "inspect", network, "--format", "{{.Internal}}"],
+        capture_output=True, text=True, timeout=30,
+    )
+    if internal.returncode or internal.stdout.strip().lower() != "true":
+        raise RuntimeError("Quarantine proof failed: Docker network is not internal.")
+    attached = subprocess.run(
+        ["docker", "inspect", project, "--format", "{{json .NetworkSettings.Networks}}"],
+        capture_output=True, text=True, timeout=30,
+    )
+    try:
+        networks = json.loads(attached.stdout) if attached.returncode == 0 else {}
+    except json.JSONDecodeError:
+        networks = {}
+    if set(networks) != {network}:
+        raise RuntimeError("Quarantine proof failed: application is attached to an unexpected Docker network.")
+    database_service = f"{project}-db"
+    count_shell = ('exec psql -At -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=\'public\'"'
+                   if data["app_type"] == "n8n" else
+                   'exec mysql -N -uroot -p"$MYSQL_ROOT_PASSWORD" "$MYSQL_DATABASE" -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=DATABASE()"')
+    table_count = subprocess.run(
+        ["docker", "compose", "exec", "-T", database_service, "sh", "-c", count_shell],
+        cwd=folder, capture_output=True, text=True, timeout=60,
+    )
+    try:
+        restored_tables = int(table_count.stdout.strip()) if table_count.returncode == 0 else 0
+    except ValueError:
+        restored_tables = 0
+    expected_tables = len((data.get("backup_inspection") or {}).get("tables") or [])
+    if not restored_tables or (expected_tables and restored_tables < expected_tables):
+        raise RuntimeError("Quarantine proof failed: restored table count is incomplete.")
+    inspection = data.get("backup_inspection") or {}
+    report = {
+        "schema": 1,
+        "application": data["app_type"],
+        "project": project,
+        "created_at": datetime.now().replace(microsecond=0).isoformat(),
+        "expires_at": data.get("expires_at") or "",
+        "management_bind_address": data.get("bind_address"),
+        "backup_sha256": inspection.get("sha256"),
+        "backup_complete_set": bool(inspection.get("complete_set")),
+        "source_server": inspection.get("server_version"),
+        "source_tables": expected_tables,
+        "restored_tables": restored_tables,
+        "verified_application_archives": len(inspection.get("files") or []),
+        "proof": {
+            "dedicated_database": True,
+            "new_credentials": True,
+            "internal_network": True,
+            "only_expected_network_attached": True,
+            "management_interface_restricted": data.get("bind_address") not in {"0.0.0.0", "::"},
+            "external_integrations_removed": False,
+            "external_integrations_blocked_by_network": True,
+        },
+        "warning": "This copy still contains sensitive production data and integration settings.",
+    }
+    atomic_write_text(folder / QUARANTINE_REPORT, json.dumps(report, indent=2) + "\n", 0o600)
+    return report
 
 
 @app.route("/applications/create/execute", methods=["POST"])
@@ -5065,6 +5584,12 @@ def execute_application():
         require_csrf()
         data = consume_application_preview(request.form.get("preview_token"))
         project = data["project"]
+        preflight = synology_preflight()
+        if not preflight["ready"]:
+            failed = ", ".join(item["name"] for item in preflight["checks"] if item["status"] != "pass")
+            raise RuntimeError("NAS preflight failed: " + failed)
+        profile = get_profile(data["app_type"])
+        ensure_application_images_available(profile, data["image"])
         assert_docker_port_free(data["host_port"])
         profile = write_private_application_files(data)
         validation = subprocess.run(
@@ -5073,23 +5598,36 @@ def execute_application():
         )
         if validation.returncode:
             raise RuntimeError("Compose validation failed: " + tail_text(validation.stderr, 2000))
+        if data.get("quarantine"):
+            restore_quarantine_database(data)
+            restore_quarantine_application_files(data)
         deployment = subprocess.run(
             ["docker", "compose", "-f", "docker-compose.yml", "up", "-d"],
             cwd=project_dir(project), capture_output=True, text=True, timeout=600,
         )
         if deployment.returncode:
             raise RuntimeError("Application deployment failed: " + tail_text(deployment.stderr, 3000))
+        report = verify_quarantine_restore(data) if data.get("quarantine") else None
         write_action_log(project, "application-deploy", [
             f"Application profile: {profile.name}",
             f"Image: {data['image']}",
             f"Web port: {data['host_port']}",
+            "Mode: isolated test restore; external network blocked." if data.get("quarantine") else "Mode: fresh installation.",
             "Compose validation passed and containers were started.",
+            (f"Quarantine proof passed: {report['restored_tables']} database tables restored." if report else "Fresh deployment preflight passed."),
         ])
         invalidate_dashboard_cache()
         flash(f"{profile.name} project {project} was deployed.", "ok")
         return redirect(url_for("project_detail_page", project=project))
     except Exception as exc:
         if project and project_dir(project).is_dir():
+            try:
+                subprocess.run(
+                    ["docker", "compose", "down"], cwd=project_dir(project),
+                    capture_output=True, text=True, timeout=120,
+                )
+            except Exception:
+                pass
             try:
                 write_action_log(project, "application-deploy-failed", [tail_text(exc, 3000)])
             except Exception:
@@ -5114,7 +5652,17 @@ def application_lifecycle():
         data = read_application_manifest(folder)
         if not data:
             raise ValueError("This is not a valid profile-managed application.")
+        if data.get("quarantine") and action in {"start", "restart"}:
+            try:
+                if not data.get("expires_at") or datetime.fromisoformat(data["expires_at"]) <= datetime.now():
+                    raise ValueError("This quarantine has expired and cannot be started; archive it and create a new test restore.")
+            except ValueError as exc:
+                if "expired" in str(exc):
+                    raise
+                raise ValueError("Quarantine expiry metadata is invalid; start is blocked.") from exc
         if action == "update":
+            if data.get("quarantine"):
+                raise ValueError("Quarantine projects cannot be updated in place; create a new version-matched test restore instead.")
             pull = subprocess.run(
                 ["docker", "compose", "pull"], cwd=folder,
                 capture_output=True, text=True, timeout=600,
@@ -5140,6 +5688,56 @@ def application_lifecycle():
     except Exception as exc:
         flash(str(exc), "err")
     return redirect(url_for("project_detail_page", project=project)) if project else redirect(url_for("projects_page"))
+
+
+@app.route("/applications/quarantine/archive", methods=["POST"])
+def archive_quarantine():
+    project = None
+    try:
+        require_csrf()
+        project = validate_application_project(request.form.get("project"))
+        if not hmac.compare_digest(str(request.form.get("confirm_project") or ""), project):
+            raise ValueError("Type the exact project name to archive this quarantine.")
+        folder = project_dir(project)
+        data = read_application_manifest(folder)
+        if not data or not data.get("quarantine"):
+            raise ValueError("Only a valid quarantine project can be archived here.")
+        stopped = subprocess.run(
+            ["docker", "compose", "down"], cwd=folder,
+            capture_output=True, text=True, timeout=180,
+        )
+        if stopped.returncode:
+            raise RuntimeError("Quarantine containers could not be stopped: " + tail_text(stopped.stderr, 2000))
+        trash_root = BASE_PATH / ".docker-app-manager-trash"
+        trash_root.mkdir(mode=0o700, exist_ok=True)
+        destination = trash_root / f"{project}-{datetime.now().strftime('%Y%m%d-%H%M%S')}"
+        folder.rename(destination)
+        audit = {
+            "project": project, "archived_at": datetime.now().replace(microsecond=0).isoformat(),
+            "recoverable_path": str(destination),
+        }
+        atomic_write_text(destination / "archive.json", json.dumps(audit, indent=2) + "\n", 0o600)
+        invalidate_dashboard_cache()
+        flash(f"Quarantine {project} was stopped and moved to recoverable archive storage.", "ok")
+        return redirect(url_for("projects_page"))
+    except Exception as exc:
+        flash(str(exc), "err")
+        return redirect(url_for("project_detail_page", project=project)) if project else redirect(url_for("projects_page"))
+
+
+@app.route("/applications/<project>/quarantine-proof.json", methods=["GET"])
+def download_quarantine_report(project):
+    project = validate_application_project(project)
+    folder = project_dir(project)
+    manifest = read_application_manifest(folder)
+    report_path = folder / QUARANTINE_REPORT
+    if not manifest or not manifest.get("quarantine") or report_path.is_symlink() or not report_path.is_file():
+        abort(404)
+    response = make_response(report_path.read_text(encoding="utf-8"))
+    response.headers["Content-Type"] = "application/json"
+    response.headers["Content-Disposition"] = f'attachment; filename="{project}-quarantine-proof.json"'
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.route("/projects/<project>", methods=["GET"])

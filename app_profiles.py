@@ -31,6 +31,8 @@ class AppProfile:
     database: str
     volumes: tuple[str, ...]
     backup_note: str
+    quarantine_restore: bool = False
+    quarantine_note: str = "No verified isolated restore adapter is available for this application."
 
 
 PROFILES = {
@@ -44,6 +46,8 @@ PROFILES = {
         database="postgresql",
         volumes=("data", "database"),
         backup_note="Back up PostgreSQL and the n8n data directory together; the encryption key is retained in the private environment file.",
+        quarantine_restore=True,
+        quarantine_note="Restores one manifest-verified PostgreSQL and n8n data backup set into a new private environment. Triggers and external routes remain blocked by the internal Docker network.",
     ),
     "teampasswordmanager": AppProfile(
         key="teampasswordmanager",
@@ -55,6 +59,8 @@ PROFILES = {
         database="mysql:5.7",
         volumes=("application", "database"),
         backup_note="Back up the MariaDB database and application data directory as one consistent set.",
+        quarantine_restore=True,
+        quarantine_note="Restores a TPM SQL backup into a new private MySQL database. External settings remain in the copied data but cannot connect because the application network has no external route.",
     ),
 }
 
@@ -98,7 +104,10 @@ def _secret() -> str:
     return secrets.token_urlsafe(36)
 
 
-def build_environment(profile: AppProfile, project: str, host_port: int, image: str, timezone: str):
+def build_environment(
+    profile: AppProfile, project: str, host_port: int, image: str, timezone: str,
+    *, quarantine=False, bind_address="0.0.0.0", expires_at="",
+):
     project = validate_project_name(project)
     host_port = validate_port(host_port)
     image = validate_image(profile, image)
@@ -112,6 +121,9 @@ def build_environment(profile: AppProfile, project: str, host_port: int, image: 
         "APP_IMAGE": image,
         "APP_HTTP_PORT": str(host_port),
         "TZ": timezone,
+        "BUILDER_QUARANTINE": "1" if quarantine else "0",
+        "APP_BIND_ADDRESS": str(bind_address),
+        "BUILDER_QUARANTINE_EXPIRES_AT": str(expires_at or ""),
     }
     if profile.key == "n8n":
         common.update({
@@ -133,6 +145,13 @@ def build_environment(profile: AppProfile, project: str, host_port: int, image: 
 def render_compose(profile: AppProfile, env: dict, base_path: str = "/volume1/docker") -> str:
     project = validate_project_name(env["PROJECT_NAME"])
     root = f"{base_path.rstrip('/')}/{project}"
+    quarantine = str(env.get("BUILDER_QUARANTINE", "0")) == "1"
+    network_options = "\n    internal: true" if quarantine else ""
+    security_options = '''
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    mem_limit: 1g''' if quarantine else ""
     if profile.key == "n8n":
         return f'''services:
   {project}-db:
@@ -157,7 +176,7 @@ def render_compose(profile: AppProfile, env: dict, base_path: str = "/volume1/do
     container_name: {project}
     restart: unless-stopped
     env_file: [.env]
-    ports: ["${{APP_HTTP_PORT}}:5678"]
+    ports: ["${{APP_BIND_ADDRESS}}:${{APP_HTTP_PORT}}:5678"]{security_options}
     environment:
       DB_TYPE: postgresdb
       DB_POSTGRESDB_HOST: {project}-db
@@ -176,7 +195,7 @@ def render_compose(profile: AppProfile, env: dict, base_path: str = "/volume1/do
 networks:
   {project}-network:
     name: {project}-network
-    driver: bridge
+    driver: bridge{network_options}
 '''
     return f'''services:
   {project}-db:
@@ -202,7 +221,7 @@ networks:
     container_name: {project}
     restart: unless-stopped
     env_file: [.env]
-    ports: ["${{APP_HTTP_PORT}}:80"]
+    ports: ["${{APP_BIND_ADDRESS}}:${{APP_HTTP_PORT}}:80"]{security_options}
     environment:
       TPM_SERVER_TIMEZONE: ${{TZ}}
       TPM_PHP_TIMEZONE: ${{TZ}}
@@ -213,6 +232,7 @@ networks:
       TPM_CONFIG_USERNAME: ${{MYSQL_USER}}
       TPM_CONFIG_PASSWORD: ${{MYSQL_PASSWORD}}
       TPM_UPGRADE: "0"
+      BUILDER_TEST_ENVIRONMENT: ${{BUILDER_QUARANTINE}}
     volumes:
       - {root}/application:/var/www/html:rw
     depends_on:
@@ -222,7 +242,7 @@ networks:
 networks:
   {project}-network:
     name: {project}-network
-    driver: bridge
+    driver: bridge{network_options}
 '''
 
 
@@ -236,6 +256,9 @@ def manifest(profile: AppProfile, env: dict) -> dict:
         "image": validate_image(profile, env["APP_IMAGE"]),
         "internal_port": profile.internal_port,
         "volumes": list(profile.volumes),
+        "quarantine": str(env.get("BUILDER_QUARANTINE", "0")) == "1",
+        "bind_address": str(env.get("APP_BIND_ADDRESS") or "0.0.0.0"),
+        "expires_at": str(env.get("BUILDER_QUARANTINE_EXPIRES_AT") or ""),
     }
 
 

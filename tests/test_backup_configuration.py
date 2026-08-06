@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import json
 import os
 import shutil
 import subprocess
@@ -109,6 +110,29 @@ class BackupConfigurationTest(unittest.TestCase):
             self.backup_root / "Synology_task_scheduler" / "GLPI_backup_dispatcher.sh",
         )
         self.assertTrue(any("Task Scheduler command" in message for message in messages))
+
+    def test_profile_backups_use_application_specific_adapter_without_exporting_secrets(self):
+        for project, app_type, image, env_text, data_folder, expected_db in (
+            ("n8n-test", "n8n", "n8nio/n8n:1.0.0", "POSTGRES_DB=n8n\nPOSTGRES_PASSWORD=secret-value\n", "data", "n8n"),
+            ("tpm-test", "teampasswordmanager", "teampasswordmanager/teampasswordmanager:14.190.309", "MYSQL_DATABASE=teampasswordmanager\nMYSQL_ROOT_PASSWORD=secret-value\n", "application", "teampasswordmanager"),
+        ):
+            folder = self.base_path / project
+            (folder / data_folder).mkdir(parents=True)
+            (folder / ".env").write_text(env_text, encoding="utf-8")
+            (folder / ".builder-app.json").write_text(json.dumps({
+                "schema": 1, "project": project, "type": app_type,
+                "name": app_type, "image": image, "port": 1234,
+                "internal_port": 80, "database": "managed",
+            }), encoding="utf-8")
+
+            module.configure_scheduled_backup(project)
+            config_path = module.backup_schedule_path(project)
+            config = module.read_simple_env_file(config_path)
+            self.assertEqual(config["APP_TYPE"], app_type)
+            self.assertEqual(config["DB_NAME"], expected_db)
+            self.assertEqual(config["DATA_PATHS"], data_folder)
+            self.assertEqual(config["MYSQL_CNF"], "")
+            self.assertNotIn("secret-value", config_path.read_text(encoding="utf-8"))
 
     def test_dispatcher_install_creates_missing_scheduler_directory(self):
         self.assertFalse(self.scheduler_dir.exists())

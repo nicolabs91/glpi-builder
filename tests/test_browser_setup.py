@@ -78,7 +78,7 @@ class BrowserSetupTest(unittest.TestCase):
         self.assertIn(b"every <strong>5 minutes</strong>", response.data)
         self.assertIn(b"Copy command", response.data)
         self.assertIn(
-            b"/bin/bash /volume1/docker/_BACKUPS/Synology_task_scheduler/GLPI_backup_dispatcher.sh",
+            b"/bin/bash /volume1/docker/_BACKUPS/Synology_task_scheduler/Application_backup_dispatcher.sh",
             response.data,
         )
         self.assertIn(b"Optional now", response.data)
