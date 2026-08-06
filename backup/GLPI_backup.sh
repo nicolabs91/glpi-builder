@@ -112,6 +112,8 @@ esac
 EXTRA_CHECKSUM_FILE=""
 MANIFEST_SCHEMA=1
 APP_VERSION=${APP_IMAGE##*:}
+DB_VERSION=${DB_IMAGE:-unknown}
+DB_VERSION=${DB_VERSION##*:}
 if [ "$APP_TYPE" = "n8n" ]; then
   [ -n "${N8N_ENCRYPTION_KEY:-}" ] || fail "n8n encryption key is missing from the private backup configuration"
   printf 'N8N_ENCRYPTION_KEY=%s\n' "$N8N_ENCRYPTION_KEY" > "$TEMP_BACKUP_DIR/secrets.env"
@@ -129,8 +131,8 @@ if [ "$APP_TYPE" = "n8n" ]; then
   printf '{\n  "schema": %s,\n  "application": "%s",\n  "application_version": "%s",\n  "database_version": "PostgreSQL 16",\n  "project": "%s",\n  "created_at": "%s",\n  "database": "database.sql.gz",\n  "files": "files.tar.gz",\n  "secrets": "secrets.env",\n  "checksums": "SHA256SUMS"\n}\n' \
     "$MANIFEST_SCHEMA" "$APP_TYPE" "$APP_VERSION" "$PROJECT_NAME" "$CREATED_AT" > "$TEMP_BACKUP_DIR/manifest.json"
 else
-  printf '{\n  "schema": 1,\n  "application": "%s",\n  "project": "%s",\n  "created_at": "%s",\n  "database": "database.sql.gz",\n  "files": "files.tar.gz",\n  "checksums": "SHA256SUMS"\n}\n' \
-    "$APP_TYPE" "$PROJECT_NAME" "$CREATED_AT" > "$TEMP_BACKUP_DIR/manifest.json"
+  printf '{\n  "schema": 1,\n  "application": "%s",\n  "application_version": "%s",\n  "database_version": "%s",\n  "project": "%s",\n  "created_at": "%s",\n  "database": "database.sql.gz",\n  "files": "files.tar.gz",\n  "checksums": "SHA256SUMS"\n}\n' \
+    "$APP_TYPE" "$APP_VERSION" "$DB_VERSION" "$PROJECT_NAME" "$CREATED_AT" > "$TEMP_BACKUP_DIR/manifest.json"
 fi
 
 mv "$TEMP_BACKUP_DIR" "$BACKUP_DIR"

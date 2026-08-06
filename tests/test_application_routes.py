@@ -133,7 +133,7 @@ class ApplicationRouteTests(unittest.TestCase):
                 module.validate_application_request(payload)
 
     @patch.object(module, "assert_docker_port_free")
-    def test_n8n_quarantine_accepts_complete_checksum_verified_set(self, _port):
+    def test_n8n_quarantine_accepts_different_target_image_for_compatibility_test(self, _port):
         backup_root = self.base / "backups"
         backup_root.mkdir()
         database = backup_root / "database.sql.gz"
@@ -155,11 +155,15 @@ class ApplicationRouteTests(unittest.TestCase):
         }), encoding="utf-8")
         payload = self.payload()
         payload.update({"deployment_mode": "quarantine", "database_backup": str(database),
-                        "backup_version": "1.99.1", "image": "docker.n8n.io/n8nio/n8n:1.99.1"})
+                        "image": "docker.n8n.io/n8nio/n8n:2.0.0",
+                        "database_image": "postgres:15-alpine"})
         with patch.object(module, "BASE_PATH", self.base), patch.object(module, "BACKUP_ROOT", backup_root):
             result = module.validate_application_request(payload)
         self.assertTrue(result["quarantine"])
         self.assertTrue(result["backup_inspection"]["complete_set"])
+        self.assertEqual(result["backup_version"], "1.99.1")
+        self.assertEqual(result["image"], "docker.n8n.io/n8nio/n8n:2.0.0")
+        self.assertEqual(result["database_image"], "postgres:15-alpine")
 
     def test_quarantine_sql_rejects_server_level_statements(self):
         backup_root = self.base / "backups"

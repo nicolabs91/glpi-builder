@@ -62,7 +62,7 @@ class PreviewFlowTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertIn(b"Review the execution plan", response.data)
-        self.assertIn(b"<div>0.5.0-rc.2</div>", response.data)
+        self.assertIn(b"<div>0.5.0-rc.3</div>", response.data)
         self.assertNotIn(b"nothing has been changed yet", response.data)
         self.assertIn(b"glpi-preview-test", response.data)
         self.assertIn(b"Fresh installation", response.data)

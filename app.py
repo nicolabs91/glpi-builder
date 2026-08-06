@@ -54,11 +54,12 @@ from app_profiles import (
     read_manifest as read_application_manifest,
     render_compose as render_application_compose,
     validate_image as validate_application_image,
+    validate_database_image as validate_application_database_image,
     validate_port as validate_application_port,
     validate_project_name as validate_application_project,
 )
 
-APP_VERSION = "0.5.0-rc.2"
+APP_VERSION = "0.5.0-rc.3"
 TPM_BACKUP_MANIFEST = "tpm-backup.json"
 QUARANTINE_REPORT = "quarantine-report.json"
 QUARANTINE_DEFAULT_DAYS = 14
@@ -107,7 +108,7 @@ COOKIE_SAMESITE_CHOICES = ("Lax", "Strict", "None")
 COOKIE_SECURE_CHOICES = ("Off", "On")
 CREATE_PREVIEW_TTL_SECONDS = 10 * 60
 PROGRESS_JOB_TTL_SECONDS = 6 * 60 * 60
-OPERATION_MODES = ("restore", "fresh")
+OPERATION_MODES = ("restore", "fresh", "isolated")
 BACKUP_STALE_DAYS = 30
 
 
@@ -773,12 +774,28 @@ def local_image_tags(kind, available_tags=None):
     return sorted(tag for tag in tags if any(tag.startswith(prefix) for prefix in prefixes))
 
 
+def local_glpi_database_image_tags(available_tags=None):
+    """Return database images supported by the current GLPI restore adapter."""
+    if available_tags is None:
+        available_tags = dashboard_docker_snapshot()["image_tags"]
+    return sorted({tag for tag in available_tags if tag.startswith("mariadb:")})
+
+
 def local_profile_image_tags(profile, available_tags=None):
     if available_tags is None:
         available_tags = dashboard_docker_snapshot()["image_tags"]
     return sorted({
         tag for tag in available_tags
         if any(tag.startswith(prefix) for prefix in profile.image_prefixes)
+    })
+
+
+def local_profile_database_image_tags(profile, available_tags=None):
+    if available_tags is None:
+        available_tags = dashboard_docker_snapshot()["image_tags"]
+    return sorted({
+        tag for tag in available_tags
+        if any(tag.startswith(prefix) for prefix in profile.database_image_prefixes)
     })
 
 
@@ -1540,6 +1557,7 @@ def configure_scheduled_backup(project, env=None, *, enabled=True, kind="daily",
         "SCHEDULE_WEEKDAYS": schedule["weekdays"],
         "INTERVAL_HOURS": schedule["interval_hours"],
         "APP_IMAGE": str(env.get("APP_IMAGE") or env.get("GLPI_IMAGE") or "unknown"),
+        "DB_IMAGE": str(env.get("DATABASE_IMAGE") or env.get("MARIADB_IMAGE") or "unknown"),
         "N8N_ENCRYPTION_KEY": str(env.get("N8N_ENCRYPTION_KEY") or "") if app_type == "n8n" else "",
     }
     if any(
@@ -1719,6 +1737,7 @@ def backup_age(created_at):
     if not created_at:
         return {"days": None, "label": "Unknown age", "stale": True}
     value = str(created_at).strip()
+    value = re.sub(r"([+-]\d{2})(\d{2})$", r"\1:\2", value)
     parsed = None
     try:
         # Backup manifests use ISO 8601, commonly with a T separator and a
@@ -1879,7 +1898,7 @@ def enrich_project_operational_metadata(project, available_images):
     return project
 
 
-def build_env(project, glpi_image, mariadb_image, host_port, container_port, tz, clean_db, cookie_samesite=None, cookie_secure=None):
+def build_env(project, glpi_image, mariadb_image, host_port, container_port, tz, clean_db, cookie_samesite=None, cookie_secure=None, isolated_restore=False):
     old = read_env(project) if env_file(project).exists() and not clean_db else {}
     db_password = old.get("GLPI_DB_PASSWORD") or safe_password()
     root_password = old.get("MARIADB_ROOT_PASSWORD") or safe_password()
@@ -1897,6 +1916,7 @@ def build_env(project, glpi_image, mariadb_image, host_port, container_port, tz,
         "GLPI_DB_USER": old.get("GLPI_DB_USER") or "glpiuser",
         "GLPI_DB_PASSWORD": db_password,
         "TZ": tz,
+        "BUILDER_QUARANTINE": "1" if isolated_restore else "0",
     }
 
 
@@ -1919,6 +1939,7 @@ def write_compose(project, env):
     """
     env = normalize_env_defaults(env)
     entrypoint_script = indent_text(GLPI_ENTRY_COMMAND, 8)
+    network_internal_line = "\n    internal: true" if env.get("BUILDER_QUARANTINE") == "1" else ""
     compose = f"""services:
   {project}-db:
     image: {env["MARIADB_IMAGE"]}
@@ -1994,7 +2015,7 @@ def write_compose(project, env):
 networks:
   {project}-network:
     name: {project}-network
-    driver: bridge
+    driver: bridge{network_internal_line}
 """
     compose_file(project).write_text(compose, encoding="utf-8")
 
@@ -2033,18 +2054,23 @@ def remove_container(name):
     return True
 
 
-def ensure_network(project):
+def ensure_network(project, internal=False):
     cli = docker_client()
     name = f"{project}-network"
     try:
-        return cli.networks.get(name)
+        network = cli.networks.get(name)
+        network.reload()
+        actual = bool(network.attrs.get("Internal"))
+        if actual != bool(internal):
+            raise RuntimeError(f"Docker network {name} has internal={actual}; expected internal={bool(internal)}.")
+        return network
     except NotFound:
-        return cli.networks.create(name, driver="bridge")
+        return cli.networks.create(name, driver="bridge", internal=bool(internal))
 
 
-def ensure_container_network(project, container_name):
+def ensure_container_network(project, container_name, internal=False):
     cli = docker_client()
-    net = ensure_network(project)
+    net = ensure_network(project, internal=internal)
     c = cli.containers.get(container_name)
     c.reload()
     networks = c.attrs.get("NetworkSettings", {}).get("Networks", {}) or {}
@@ -2300,10 +2326,51 @@ def validate_backup_choice(value, extensions, label, allow_dir=False):
     return str(path)
 
 
+def inspect_glpi_backup_set(database_value, files_value):
+    database = Path(database_value).resolve()
+    files = Path(files_value).resolve()
+    if database.parent != files.parent:
+        raise ValueError("GLPI isolated restore requires database and files from the same backup set.")
+    folder = database.parent
+    manifest_path = folder / "manifest.json"
+    checksums_path = folder / "SHA256SUMS"
+    try:
+        manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("GLPI isolated restore requires a valid Builder backup manifest.") from exc
+    if manifest_data.get("application") not in {None, "", "glpi"}:
+        raise ValueError("The selected backup manifest does not belong to GLPI.")
+    manifest_database = _safe_backup_member(folder, manifest_data.get("database"))
+    manifest_files = _safe_backup_member(folder, manifest_data.get("files"))
+    if manifest_database != database or manifest_files != files:
+        raise ValueError("Selected GLPI backup files do not match the backup manifest.")
+    expected = {}
+    try:
+        for line in checksums_path.read_text(encoding="utf-8").splitlines():
+            digest, name = line.strip().split(None, 1)
+            expected[Path(name.lstrip("* ")).name] = digest.lower()
+    except (OSError, ValueError) as exc:
+        raise ValueError("GLPI isolated restore requires a valid SHA256SUMS file.") from exc
+    for member in (database, files):
+        if not hmac.compare_digest(expected.get(member.name, ""), sha256_file(member)):
+            raise ValueError(f"GLPI backup checksum mismatch for {member.name}.")
+    return {
+        "manifest": manifest_data,
+        "database": str(database),
+        "files": str(files),
+        "database_sha256": sha256_file(database),
+        "files_sha256": sha256_file(files),
+        "application_version": str(manifest_data.get("application_version") or "Unknown"),
+        "database_version": str(manifest_data.get("database_version") or "Unknown"),
+    }
+
+
 def validate_create_request(source):
     project = validate_project(source.get("project"))
     glpi_image = validate_local_image(source.get("glpi_image"), "glpi")
     mariadb_image = validate_local_image(source.get("mariadb_image"), "database")
+    if not mariadb_image.startswith("mariadb:"):
+        raise ValueError("The current GLPI restore adapter supports locally installed mariadb:* images.")
     host_port = validate_port(source.get("host_port"), "Host port")
     container_port = validate_port(source.get("container_port"), "Container port")
     if container_port != 8080:
@@ -2319,11 +2386,14 @@ def validate_create_request(source):
     if operation_mode not in OPERATION_MODES:
         raise ValueError("Operation mode must be Full restore or Fresh installation.")
     fresh_install = operation_mode == "fresh"
-    clean_db = fresh_install
+    isolated_restore = operation_mode == "isolated"
+    clean_db = fresh_install or isolated_restore
     force_recreate = True
     restore_everything = not fresh_install
     skip_plugins = fresh_install or form_flag(source, "skip_plugins")
     update_backup_source = form_flag(source, "update_backup_source")
+    if isolated_restore:
+        update_backup_source = False
     db_backup = (
         source.get("db_backup")
         or source.get("db_backup_manual")
@@ -2344,14 +2414,17 @@ def validate_create_request(source):
         allow_dir=True,
     )
 
-    if operation_mode == "restore" and not db_backup:
+    if operation_mode in {"restore", "isolated"} and not db_backup:
         raise ValueError("Full restore requires a database backup.")
-    if operation_mode == "restore" and not file_backup:
+    if operation_mode in {"restore", "isolated"} and not file_backup:
         raise ValueError("Full restore requires a GLPI files/config backup.")
     if fresh_install and (db_backup or file_backup):
         raise ValueError("Fresh installation must not include backup selections. Clear both backup fields first.")
 
     existing_state = project_has_existing_state(project)
+    if isolated_restore and existing_state:
+        raise ValueError("Isolated restore requires a new unused project name.")
+    backup_inspection = inspect_glpi_backup_set(db_backup, file_backup) if isolated_restore else None
     if existing_state and (clean_db or db_backup or file_backup):
         require_destructive_confirmation(project, source)
 
@@ -2376,6 +2449,8 @@ def validate_create_request(source):
         "cookie_secure": cookie_secure,
         "operation_mode": operation_mode,
         "fresh_install": fresh_install,
+        "isolated_restore": isolated_restore,
+        "backup_inspection": backup_inspection,
         "clean_db": clean_db,
         "force_recreate": force_recreate,
         "restore_everything": restore_everything,
@@ -2392,12 +2467,13 @@ def validate_create_request(source):
 
 def build_create_plan(data):
     fresh_install = data["fresh_install"]
+    isolated_restore = bool(data.get("isolated_restore"))
     destructive = bool(data["existing_state"])
-    mode_title = "Fresh installation" if fresh_install else "Full restore"
+    mode_title = "Fresh installation" if fresh_install else ("Isolated test restore" if isolated_restore else "Full restore")
     database_action = "delete all database storage and install an empty GLPI database" if fresh_install else "replace the GLPI database from the selected backup"
     files_action = "use only the original files from the GLPI image" if fresh_install else "restore GLPI config and files from backup"
     plugin_action = "start without plugins" if data["skip_plugins"] else "restore plugins from backup"
-    backup_action = "set this project as the scheduled backup source" if data.get("update_backup_source") else "keep the current scheduled backup source"
+    backup_action = ("disabled for isolated test environments" if isolated_restore else ("set this project as the scheduled backup source" if data.get("update_backup_source") else "keep the current scheduled backup source"))
     steps = [
         "Repeat the preflight checks (images, backups and free port)",
         "Write project folders, .env and the locked compose configuration",
@@ -2419,7 +2495,7 @@ def build_create_plan(data):
         steps.append("Update the scheduled backup script and backup.env for this project")
     return {
         "title": mode_title,
-        "risk": "High - all existing project data will be deleted" if fresh_install else ("High - existing project data will be replaced" if destructive else "Normal - required backups will be restored"),
+        "risk": "High - all existing project data will be deleted" if fresh_install else ("Contained - restored into a new project on an internal Docker network" if isolated_restore else ("High - existing project data will be replaced" if destructive else "Normal - required backups will be restored")),
         "destructive": destructive,
         "rows": [
             ("Project", data["project"]),
@@ -3231,7 +3307,8 @@ def create_db_container(project, env, clean_db):
             pass
         return "The existing database container is being reused."
 
-    cli.images.pull(env["MARIADB_IMAGE"])
+    if env.get("BUILDER_QUARANTINE") != "1":
+        cli.images.pull(env["MARIADB_IMAGE"])
     cli.containers.run(
         env["MARIADB_IMAGE"],
         name=f"{project}-db",
@@ -3291,7 +3368,7 @@ def create_glpi_container(project, env, force_recreate=True, pull_image=True):
         "GLPI_DB_PASSWORD": env["GLPI_DB_PASSWORD"],
         "GLPI_SKIP_AUTOINSTALL": "true",
         "GLPI_SKIP_AUTOUPDATE": "true",
-        "GLPI_CRONTAB_ENABLED": "1",
+        "GLPI_CRONTAB_ENABLED": "0" if env.get("BUILDER_QUARANTINE") == "1" else "1",
         "GLPI_SESSION_COOKIE_SAMESITE": env["GLPI_SESSION_COOKIE_SAMESITE"],
         "GLPI_SESSION_COOKIE_SECURE": env["GLPI_SESSION_COOKIE_SECURE"],
         "TZ": env["TZ"],
@@ -3374,6 +3451,7 @@ def create_or_restore(
     progress=None,
     fresh_install=False,
     skip_plugins=False,
+    isolated_restore=False,
 ):
     messages = []
     report = progress or (lambda _percent, _stage, _message=None: None)
@@ -3385,14 +3463,14 @@ def create_or_restore(
         messages.append(prepare_fresh_install(project))
         messages.append(fix_permissions(project))
     report(26, "Preparing network", "Checking the isolated Docker network.")
-    ensure_network(project)
+    ensure_network(project, internal=isolated_restore)
     messages.append(f"Checked network: {project}-network")
 
     report(36, "Database container", "Checking or rebuilding the database container.")
     messages.append(create_db_container(project, env, clean_db))
 
     report(45, "Waiting for MariaDB", "Waiting until MariaDB accepts connections.")
-    ensure_container_network(project, f"{project}-db")
+    ensure_container_network(project, f"{project}-db", internal=isolated_restore)
     ok, msg = wait_db(project)
     messages.append(msg)
     if not ok:
@@ -3431,10 +3509,62 @@ def create_or_restore(
     ensure_glpi_writable_dirs(project)
     messages.append(fix_permissions(project))
     report(92, "Applying GLPI container", "Creating or updating the GLPI application container.")
-    messages.append(create_glpi_container(project, env, force_recreate=force_recreate))
+    messages.append(create_glpi_container(
+        project, env, force_recreate=force_recreate,
+        pull_image=not isolated_restore,
+    ))
     if fresh_install:
         messages.append("Initial GLPI credentials are glpi / glpi. Change this password immediately after signing in.")
     return messages
+
+
+def verify_glpi_isolated_restore(project, data):
+    network_name = f"{project}-network"
+    network = docker_client().networks.get(network_name)
+    network.reload()
+    if not bool(network.attrs.get("Internal")):
+        raise RuntimeError("GLPI isolated restore proof failed: Docker network is not internal.")
+    for container_name in (project, f"{project}-db"):
+        container = get_container(container_name)
+        if not container:
+            raise RuntimeError(f"GLPI isolated restore proof failed: missing container {container_name}.")
+        container.reload()
+        networks = set((container.attrs.get("NetworkSettings", {}).get("Networks", {}) or {}).keys())
+        if networks != {network_name}:
+            raise RuntimeError(f"GLPI isolated restore proof failed: {container_name} has unexpected networks.")
+        if container.status != "running":
+            raise RuntimeError(f"GLPI isolated restore proof failed: {container_name} is not running.")
+    config_file = project_dir(project) / "glpi" / "config" / "config_db.php"
+    if not config_file.is_file() or f"{project}-db" not in config_file.read_text(encoding="utf-8", errors="replace"):
+        raise RuntimeError("GLPI isolated restore proof failed: config_db.php does not target the isolated database.")
+    count = get_container(f"{project}-db").exec_run(
+        ["sh", "-c", 'mariadb -N -uroot -p"$MARIADB_ROOT_PASSWORD" "$GLPI_DB_NAME" -e "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=DATABASE()"']
+    )
+    if count.exit_code != 0:
+        raise RuntimeError("GLPI isolated restore proof failed: database table check could not be completed.")
+    try:
+        output = count.output.decode("utf-8", "replace") if isinstance(count.output, bytes) else str(count.output)
+        table_count = int(output.strip())
+    except ValueError as exc:
+        raise RuntimeError("GLPI isolated restore proof failed: invalid database table count.") from exc
+    if table_count <= 0:
+        raise RuntimeError("GLPI isolated restore proof failed: restored database has no tables.")
+    report = {
+        "schema": 1,
+        "application": "glpi",
+        "mode": "isolated-test-restore",
+        "network_internal": True,
+        "containers": [project, f"{project}-db"],
+        "restored_tables": table_count,
+        "source_application_version": (data.get("backup_inspection") or {}).get("application_version", "Unknown"),
+        "source_database_version": (data.get("backup_inspection") or {}).get("database_version", "Unknown"),
+        "target_application_image": data["glpi_image"],
+        "target_database_image": data["mariadb_image"],
+        "database_sha256": (data.get("backup_inspection") or {}).get("database_sha256", ""),
+        "files_sha256": (data.get("backup_inspection") or {}).get("files_sha256", ""),
+    }
+    atomic_write_text(project_dir(project) / ".builder-quarantine-report.json", json.dumps(report, indent=2) + "\n", 0o600)
+    return f"Isolated restore verified: internal network, dedicated containers, patched config and {table_count} restored tables."
 
 
 def run_create_job(job_token, data):
@@ -3455,6 +3585,7 @@ def run_create_job(job_token, data):
             data["clean_db"],
             cookie_samesite=data["cookie_samesite"],
             cookie_secure=data["cookie_secure"],
+            isolated_restore=bool(data.get("isolated_restore")),
         )
         validate_db_identifier(env["GLPI_DB_NAME"])
         write_env(project, env)
@@ -3473,7 +3604,11 @@ def run_create_job(job_token, data):
             progress=report,
             fresh_install=data["fresh_install"],
             skip_plugins=data["skip_plugins"],
+            isolated_restore=bool(data.get("isolated_restore")),
         )
+        if data.get("isolated_restore"):
+            report(95, "Verifying isolation", "Checking network, containers, GLPI config and restored database tables.")
+            messages.append(verify_glpi_isolated_restore(project, data))
         if data.get("update_backup_source"):
             report(96, "Updating scheduled backups", "Writing the backup script and backup.env for this project.")
             messages.extend(configure_scheduled_backup(project, env))
@@ -3482,12 +3617,12 @@ def run_create_job(job_token, data):
         messages.append(f"Cookie SameSite: {env['GLPI_SESSION_COOKIE_SAMESITE']}")
         messages.append(f"Cookie Secure: {env['GLPI_SESSION_COOKIE_SECURE']}")
         update_progress_job(job_token, 98, "Saving action log", "Saving the complete action log.")
-        action_name = "fresh-install" if data["fresh_install"] else "full-restore"
+        action_name = "fresh-install" if data["fresh_install"] else ("isolated-restore" if data.get("isolated_restore") else "full-restore")
         log_name = write_action_log(project, action_name, messages)
         completion_message = (
             "Fresh installation completed. Sign in with glpi / glpi and change the password immediately."
             if data["fresh_install"]
-            else "The full GLPI restore completed successfully."
+            else ("The isolated GLPI compatibility test restore completed successfully." if data.get("isolated_restore") else "The full GLPI restore completed successfully.")
         )
         update_progress_job(
             job_token,
@@ -3500,7 +3635,7 @@ def run_create_job(job_token, data):
     except Exception as exc:
         error_text = str(exc)
         try:
-            action_name = "fresh-install-error" if data.get("fresh_install") else "full-restore-error"
+            action_name = "fresh-install-error" if data.get("fresh_install") else ("isolated-restore-error" if data.get("isolated_restore") else "full-restore-error")
             log_name = write_action_log(project, action_name, ["ERROR", error_text] + messages)
         except Exception:
             log_name = ""
@@ -5041,7 +5176,7 @@ def new_project_page():
         db_backups=backup_choices["database"],
         file_backups=backup_choices["files"],
         glpi_images=local_image_tags("glpi", docker_snapshot["image_tags"]),
-        db_images=local_image_tags("database", docker_snapshot["image_tags"]),
+        db_images=local_glpi_database_image_tags(docker_snapshot["image_tags"]),
         suggested_host_port=suggest_free_host_port(
             containers=docker_snapshot["containers"]
         ),
@@ -5068,7 +5203,7 @@ def new_application_page():
             backup_root="/demo-only/backups" if test_demo_is_active() else str(BACKUP_ROOT),
             db_backups=glpi_choices["database"], file_backups=glpi_choices["files"],
             glpi_images=local_image_tags("glpi", docker_snapshot["image_tags"]),
-            db_images=local_image_tags("database", docker_snapshot["image_tags"]),
+            db_images=local_glpi_database_image_tags(docker_snapshot["image_tags"]),
             suggested_host_port=suggest_free_host_port(containers=docker_snapshot["containers"]),
             profiles=profile_catalog(),
             tz_default=TZ_DEFAULT, demo_mode=test_demo_is_active(), preflight=preflight,
@@ -5085,8 +5220,9 @@ def new_application_page():
         profiles=profiles,
         selected_app=selected_profile.key,
         profile_images=local_profile_image_tags(selected_profile, docker_snapshot["image_tags"]),
-        database_image=("postgres:16-alpine" if selected_profile.key == "n8n" else "mysql:5.7"),
-        database_image_installed=("postgres:16-alpine" if selected_profile.key == "n8n" else "mysql:5.7") in docker_snapshot["image_tags"],
+        database_images=local_profile_database_image_tags(
+            selected_profile, docker_snapshot["image_tags"]
+        ),
         db_backups=backup_choices["database"],
         tpm_backups=classify_tpm_backup_choices(backup_choices["database"]),
         suggested_host_port=suggest_free_host_port(
@@ -5308,8 +5444,8 @@ def classify_tpm_backup_choices(choices):
     return result
 
 
-def ensure_application_images_available(profile, image):
-    required = [image, "postgres:16-alpine" if profile.key == "n8n" else "mysql:5.7"]
+def ensure_application_images_available(profile, image, database_image):
+    required = [image, validate_application_database_image(profile, database_image)]
     for required_image in required:
         present = subprocess.run(
             ["docker", "image", "inspect", required_image],
@@ -5328,6 +5464,9 @@ def validate_application_request(source):
     project = validate_application_project(source.get("project"))
     host_port = validate_application_port(source.get("host_port"))
     image = validate_application_image(profile, source.get("image"))
+    database_image = validate_application_database_image(
+        profile, source.get("database_image") or profile.default_database_image
+    )
     timezone = str(source.get("timezone") or TZ_DEFAULT).strip()
     deployment_mode = str(source.get("deployment_mode") or "fresh").strip().lower()
     if deployment_mode not in {"fresh", "quarantine"}:
@@ -5342,15 +5481,12 @@ def validate_application_request(source):
         if not profile.quarantine_restore:
             raise ValueError(f"{profile.name} has no verified isolated restore adapter yet.")
         database_backup = str(source.get("database_backup") or "").strip()
-        backup_version = str(source.get("backup_version") or "").strip()
         backup_inspection = inspect_tpm_backup(database_backup) if profile.key == "teampasswordmanager" else inspect_n8n_backup(database_backup)
-        if not re.fullmatch(r"[0-9]+(?:\.[0-9]+){1,3}", backup_version):
-            raise ValueError("Enter the exact application version recorded with the backup.")
-        image_tag = image.rpartition(":")[2]
-        if image_tag == "latest" or backup_version != image_tag:
-            raise ValueError("Test restore requires a fixed image tag exactly matching the backup application version.")
-        if backup_inspection["manifest"] and backup_inspection["manifest"].get("application_version") != backup_version:
-            raise ValueError(f"{profile.name} image version does not match the backup manifest application version.")
+        backup_version = str(
+            (backup_inspection.get("manifest") or {}).get("application_version")
+            or backup_inspection.get("application_version")
+            or "Unknown"
+        ).strip()
         try:
             expiry_days = int(str(source.get("expiry_days") or QUARANTINE_DEFAULT_DAYS))
         except ValueError as exc:
@@ -5364,12 +5500,17 @@ def validate_application_request(source):
             "Existing projects are never adopted or overwritten."
         )
     assert_docker_port_free(host_port)
-    build_application_environment(profile, project, host_port, image, timezone, quarantine=quarantine, bind_address=bind_address, expires_at=expires_at)
+    build_application_environment(
+        profile, project, host_port, image, timezone,
+        database_image=database_image, quarantine=quarantine,
+        bind_address=bind_address, expires_at=expires_at,
+    )
     return {
         "app_type": profile.key,
         "project": project,
         "host_port": host_port,
         "image": image,
+        "database_image": database_image,
         "timezone": timezone,
         "quarantine": quarantine,
         "deployment_mode": deployment_mode,
@@ -5428,6 +5569,7 @@ def write_private_application_files(data):
         raise ValueError(f"Project directory already exists: {folder}")
     environment = build_application_environment(
         profile, project, data["host_port"], data["image"], data["timezone"],
+        database_image=data.get("database_image") or profile.default_database_image,
         quarantine=bool(data.get("quarantine")),
         bind_address=data.get("bind_address") or "0.0.0.0",
         expires_at=data.get("expires_at") or "",
@@ -5596,7 +5738,7 @@ def execute_application():
             failed = ", ".join(item["name"] for item in preflight["checks"] if item["status"] != "pass")
             raise RuntimeError("NAS preflight failed: " + failed)
         profile = get_profile(data["app_type"])
-        ensure_application_images_available(profile, data["image"])
+        ensure_application_images_available(profile, data["image"], data["database_image"])
         assert_docker_port_free(data["host_port"])
         profile = write_private_application_files(data)
         validation = subprocess.run(

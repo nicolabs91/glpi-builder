@@ -15,6 +15,7 @@ from app_profiles import (
     read_manifest,
     render_compose,
     validate_image,
+    validate_database_image,
 )
 
 
@@ -32,6 +33,7 @@ class ApplicationProfileTests(unittest.TestCase):
         self.assertNotIn("encryption-secret", compose)
         self.assertIn("condition: service_healthy", compose)
         self.assertIn("/volume1/docker/n8n-prod/data:/home/node/.n8n:rw", compose)
+        self.assertIn("image: ${DATABASE_IMAGE}", compose)
 
     @patch("app_profiles._secret", side_effect=["user-secret", "root-secret"])
     def test_team_password_manager_compose_isolated_database(self, _secret):
@@ -42,7 +44,7 @@ class ApplicationProfileTests(unittest.TestCase):
         self.assertIn("${MYSQL_ROOT_PASSWORD}", compose)
         self.assertNotIn("root-secret", compose)
         self.assertIn("TPM_CONFIG_HOSTNAME: passwords-db", compose)
-        self.assertIn("image: mysql:5.7", compose)
+        self.assertIn("image: ${DATABASE_IMAGE}", compose)
         self.assertIn("/volume1/docker/passwords/application:/var/www/html:rw", compose)
 
     @patch("app_profiles._secret", side_effect=["user-secret", "root-secret"])
@@ -68,6 +70,18 @@ class ApplicationProfileTests(unittest.TestCase):
     def test_rejects_images_outside_profile_allowlist(self):
         with self.assertRaises(ValueError):
             validate_image(get_profile("n8n"), "evil.invalid/n8n:latest")
+
+    def test_database_images_are_profile_scoped_but_not_fixed_to_one_tag(self):
+        self.assertEqual(
+            validate_database_image(get_profile("n8n"), "postgres:15-alpine"),
+            "postgres:15-alpine",
+        )
+        self.assertEqual(
+            validate_database_image(get_profile("teampasswordmanager"), "mysql:8.0"),
+            "mysql:8.0",
+        )
+        with self.assertRaises(ValueError):
+            validate_database_image(get_profile("n8n"), "mysql:8.0")
 
     def test_manifest_is_fail_closed(self):
         profile = get_profile("n8n")

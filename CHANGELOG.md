@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.5.0-rc.3
+
+- Allow independent selection of locally installed compatible application and
+  database images for isolated compatibility tests.
+- Treat backup versions as source metadata rather than requiring them to match
+  the selected target images.
+- Remove the manually entered backup application version from isolated restore.
+- Enable GLPI isolated test restore for manifest/checksum-verified database and
+  files sets, using new credentials and a new internal Docker network.
+- Verify GLPI containers, network attachment, rewritten database configuration
+  and restored table count, then write a content-free proof report.
+- Record application and database image versions in new GLPI and TPM backup
+  manifests.
+
 ## 0.5.0-rc.2
 
 - List only locally installed, allowlisted n8n and Team Password Manager

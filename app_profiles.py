@@ -29,6 +29,8 @@ class AppProfile:
     default_image: str
     internal_port: int
     database: str
+    database_image_prefixes: tuple[str, ...]
+    default_database_image: str
     volumes: tuple[str, ...]
     backup_note: str
     quarantine_restore: bool = False
@@ -44,6 +46,8 @@ PROFILES = {
         default_image="docker.n8n.io/n8nio/n8n:latest",
         internal_port=5678,
         database="postgresql",
+        database_image_prefixes=("postgres:",),
+        default_database_image="postgres:16-alpine",
         volumes=("data", "database"),
         backup_note="Back up PostgreSQL and the n8n data directory together; the encryption key is retained in the private environment file.",
         quarantine_restore=True,
@@ -57,6 +61,8 @@ PROFILES = {
         default_image="teampasswordmanager/teampasswordmanager:latest",
         internal_port=80,
         database="mysql:5.7",
+        database_image_prefixes=("mysql:",),
+        default_database_image="mysql:5.7",
         volumes=("application", "database"),
         backup_note="Back up the MariaDB database and application data directory as one consistent set.",
         quarantine_restore=True,
@@ -90,6 +96,16 @@ def validate_image(profile: AppProfile, image: str) -> str:
     return image
 
 
+def validate_database_image(profile: AppProfile, image: str) -> str:
+    image = str(image or "").strip()
+    if not IMAGE_RE.fullmatch(image) or not image.startswith(profile.database_image_prefixes):
+        raise ValueError(
+            f"Database image must use an allowed repository for {profile.name}: "
+            f"{', '.join(profile.database_image_prefixes)}"
+        )
+    return image
+
+
 def validate_port(value) -> int:
     try:
         port = int(str(value).strip())
@@ -106,11 +122,14 @@ def _secret() -> str:
 
 def build_environment(
     profile: AppProfile, project: str, host_port: int, image: str, timezone: str,
-    *, quarantine=False, bind_address="0.0.0.0", expires_at="",
+    *, database_image="", quarantine=False, bind_address="0.0.0.0", expires_at="",
 ):
     project = validate_project_name(project)
     host_port = validate_port(host_port)
     image = validate_image(profile, image)
+    database_image = validate_database_image(
+        profile, database_image or profile.default_database_image
+    )
     timezone = str(timezone or "Europe/Brussels").strip()
     if not re.fullmatch(r"[A-Za-z0-9_+./-]{1,64}", timezone):
         raise ValueError("Time zone contains unsupported characters.")
@@ -119,6 +138,7 @@ def build_environment(
         "BUILDER_APP_TYPE": profile.key,
         "PROJECT_NAME": project,
         "APP_IMAGE": image,
+        "DATABASE_IMAGE": database_image,
         "APP_HTTP_PORT": str(host_port),
         "TZ": timezone,
         "BUILDER_QUARANTINE": "1" if quarantine else "0",
@@ -155,7 +175,7 @@ def render_compose(profile: AppProfile, env: dict, base_path: str = "/volume1/do
     if profile.key == "n8n":
         return f'''services:
   {project}-db:
-    image: postgres:16-alpine
+    image: ${{DATABASE_IMAGE}}
     container_name: {project}-db
     restart: unless-stopped
     env_file: [.env]
@@ -199,7 +219,7 @@ networks:
 '''
     return f'''services:
   {project}-db:
-    image: mysql:5.7
+    image: ${{DATABASE_IMAGE}}
     container_name: {project}-db
     restart: unless-stopped
     env_file: [.env]
@@ -254,6 +274,9 @@ def manifest(profile: AppProfile, env: dict) -> dict:
         "project": validate_project_name(env["PROJECT_NAME"]),
         "port": validate_port(env["APP_HTTP_PORT"]),
         "image": validate_image(profile, env["APP_IMAGE"]),
+        "database_image": validate_database_image(
+            profile, env.get("DATABASE_IMAGE") or profile.default_database_image
+        ),
         "internal_port": profile.internal_port,
         "volumes": list(profile.volumes),
         "quarantine": str(env.get("BUILDER_QUARANTINE", "0")) == "1",

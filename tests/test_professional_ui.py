@@ -45,7 +45,7 @@ class ProfessionalUiTest(unittest.TestCase):
         authenticate(self.client, module)
         self.snapshot = {
             "containers": [],
-            "image_tags": ("glpi/glpi:11.0.8", "mariadb:11.4", "docker.n8n.io/n8nio/n8n:1.99.1", "teampasswordmanager/teampasswordmanager:12.158.302", "postgres:16-alpine", "mysql:5.7"),
+            "image_tags": ("glpi/glpi:11.0.8", "mariadb:11.4", "docker.n8n.io/n8nio/n8n:1.99.1", "teampasswordmanager/teampasswordmanager:12.158.302", "postgres:15-alpine", "postgres:16-alpine", "mysql:5.7", "mysql:8.0"),
         }
 
     def get_with_data(self, path):
@@ -89,11 +89,12 @@ class ProfessionalUiTest(unittest.TestCase):
         self.assertIn(b"Application settings", response.data)
         self.assertNotIn(b"New project or restore", response.data)
 
-    def test_profiles_always_show_isolated_restore_and_fail_closed_when_unverified(self):
+    def test_profiles_show_verified_isolated_restore_adapters(self):
         glpi = self.get_with_data("/applications/new?app=glpi")
         self.assertEqual(glpi.status_code, 200)
         self.assertIn(b"Isolated test restore", glpi.data)
-        self.assertIn(b'value="isolated" disabled', glpi.data)
+        self.assertIn(b'value="isolated"', glpi.data)
+        self.assertNotIn(b'value="isolated" disabled', glpi.data)
 
         n8n = self.get_with_data("/applications/new?app=n8n")
         self.assertEqual(n8n.status_code, 200)
@@ -105,13 +106,16 @@ class ProfessionalUiTest(unittest.TestCase):
         self.assertIn(b"docker.n8n.io/n8nio/n8n:1.99.1", n8n.data)
         self.assertNotIn(b"docker.n8n.io/n8nio/n8n:latest", n8n.data)
         self.assertIn(b"postgres:16-alpine", n8n.data)
-        self.assertIn(b"installed", n8n.data)
+        self.assertIn(b"postgres:15-alpine", n8n.data)
+        self.assertIn(b'name="database_image"', n8n.data)
 
         tpm = self.get_with_data("/applications/new?app=teampasswordmanager")
         self.assertEqual(tpm.status_code, 200)
         self.assertIn(b'name="app_type" value="teampasswordmanager"', tpm.data)
         self.assertIn(b"Isolated test restore", tpm.data)
         self.assertNotIn(b'value="quarantine" disabled', tpm.data)
+        self.assertIn(b"mysql:5.7", tpm.data)
+        self.assertIn(b"mysql:8.0", tpm.data)
 
     def test_project_detail_preserves_existing_safe_actions(self):
         response = self.get_with_data("/projects/glpi-test")
