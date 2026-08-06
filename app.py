@@ -59,7 +59,7 @@ from app_profiles import (
     validate_project_name as validate_application_project,
 )
 
-APP_VERSION = "0.5.0-rc.3"
+APP_VERSION = "0.5.0-rc.4"
 TPM_BACKUP_MANIFEST = "tpm-backup.json"
 QUARANTINE_REPORT = "quarantine-report.json"
 QUARANTINE_DEFAULT_DAYS = 14
@@ -5223,7 +5223,7 @@ def new_application_page():
         database_images=local_profile_database_image_tags(
             selected_profile, docker_snapshot["image_tags"]
         ),
-        db_backups=backup_choices["database"],
+        db_backups=classify_n8n_backup_choices(backup_choices["database"]),
         tpm_backups=classify_tpm_backup_choices(backup_choices["database"]),
         suggested_host_port=suggest_free_host_port(
             containers=docker_snapshot["containers"]
@@ -5438,9 +5438,36 @@ def classify_tpm_backup_choices(choices):
             continue
         text = f"{path.name} {path.parent.name}".lower()
         verified = (path.parent / TPM_BACKUP_MANIFEST).is_file()
+        manifest_application = backup_manifest_application(path)
         likely = "tpm" in text or "team" in text
-        prefix = "Verified TPM set" if verified else ("TPM candidate" if likely else "Unclassified SQL")
+        if manifest_application not in {"", "teampasswordmanager"}:
+            continue
+        if not verified and manifest_application != "teampasswordmanager" and not likely:
+            continue
+        prefix = "Verified TPM set" if verified or manifest_application == "teampasswordmanager" else "TPM candidate"
         result.append((value, f"{prefix} · {label}"))
+    return result
+
+
+def backup_manifest_application(path):
+    manifest_path = Path(path).parent / "manifest.json"
+    if not manifest_path.is_file() or manifest_path.is_symlink():
+        return ""
+    try:
+        return str(json.loads(manifest_path.read_text(encoding="utf-8")).get("application") or "").strip().lower()
+    except (OSError, json.JSONDecodeError):
+        return ""
+
+
+def classify_n8n_backup_choices(choices):
+    result = []
+    for value, label in choices:
+        path = Path(value)
+        if not path.name.lower().endswith(".sql.gz"):
+            continue
+        if backup_manifest_application(path) != "n8n":
+            continue
+        result.append((value, f"Verified n8n set · {label}"))
     return result
 
 

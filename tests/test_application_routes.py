@@ -36,6 +36,27 @@ class ApplicationRouteTests(unittest.TestCase):
             "timezone": "Europe/Brussels",
         }
 
+    def test_application_backup_choices_exclude_other_applications(self):
+        backup_root = self.base / "choices"
+        choices = []
+        for app_type in ("glpi", "n8n", "teampasswordmanager"):
+            folder = backup_root / app_type
+            folder.mkdir(parents=True)
+            database = folder / "database.sql.gz"
+            database.write_bytes(b"backup")
+            (folder / "manifest.json").write_text(json.dumps({
+                "schema": 2 if app_type == "n8n" else 1,
+                "application": app_type,
+                "database": database.name,
+            }), encoding="utf-8")
+            choices.append((str(database), f"{app_type} backup"))
+
+        n8n = module.classify_n8n_backup_choices(choices)
+        tpm = module.classify_tpm_backup_choices(choices)
+
+        self.assertEqual([Path(value).parent.name for value, _label in n8n], ["n8n"])
+        self.assertEqual([Path(value).parent.name for value, _label in tpm], ["teampasswordmanager"])
+
     @patch.object(module, "assert_docker_port_free")
     def test_preview_is_review_first_and_does_not_write_files(self, _port):
         with patch.object(module, "BASE_PATH", self.base):

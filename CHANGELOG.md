@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.0-rc.4
+
+- Filter isolated-restore backup choices by application manifest so n8n and
+  Team Password Manager no longer offer GLPI or other-application backups.
+- Keep explicitly named legacy TPM candidates visible while excluding generic
+  unclassified SQL files.
+
 ## 0.5.0-rc.3
 
 - Allow independent selection of locally installed compatible application and
