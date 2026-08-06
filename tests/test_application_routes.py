@@ -57,6 +57,22 @@ class ApplicationRouteTests(unittest.TestCase):
         self.assertEqual([Path(value).parent.name for value, _label in n8n], ["n8n"])
         self.assertEqual([Path(value).parent.name for value, _label in tpm], ["teampasswordmanager"])
 
+    def test_application_backup_scan_includes_non_glpi_tpm_folder(self):
+        backup_root = self.base / "choices"
+        folder = backup_root / "TeamPasswordManager" / "2026-08-06"
+        folder.mkdir(parents=True)
+        database = folder / "database.sql.gz"
+        database.write_bytes(b"backup")
+
+        with patch.object(module, "BACKUP_ROOT", backup_root):
+            choices = module.scan_backup_choices(backup_root, glpi_only=False)
+
+        self.assertEqual([value for value, _label in choices["database"]], [str(database)])
+        self.assertEqual(
+            [value for value, _label in module.classify_tpm_backup_choices(choices["database"])],
+            [str(database)],
+        )
+
     @patch.object(module, "assert_docker_port_free")
     def test_preview_is_review_first_and_does_not_write_files(self, _port):
         with patch.object(module, "BASE_PATH", self.base):
@@ -77,7 +93,11 @@ class ApplicationRouteTests(unittest.TestCase):
                 "/applications/create/execute",
                 data={"csrf_token": self.csrf(), "preview_token": token},
             )
+            deadline = module.time.monotonic() + 2
+            while not (self.base / "n8n-production" / ".builder-app.json").is_file() and module.time.monotonic() < deadline:
+                module.time.sleep(0.01)
         self.assertEqual(response.status_code, 302)
+        self.assertIn("/progress/", response.headers["Location"])
         folder = self.base / "n8n-production"
         self.assertTrue((folder / ".builder-app.json").is_file())
         self.assertEqual((folder / ".env").stat().st_mode & 0o777, 0o600)
@@ -90,6 +110,12 @@ class ApplicationRouteTests(unittest.TestCase):
         commands = [call.args[0] for call in _run.call_args_list]
         self.assertIn(["docker", "compose", "-f", "docker-compose.yml", "config", "--quiet"], commands)
         self.assertIn(["docker", "compose", "-f", "docker-compose.yml", "up", "-d"], commands)
+
+    def test_application_deployment_progress_job_has_specific_title(self):
+        token = module.create_progress_job("n8n-progress", self.base, kind="deployment")
+        job = module.progress_job_snapshot(token)
+        self.assertEqual(job["title"], "Application deployment")
+        self.assertEqual(job["kind"], "deployment")
 
     @patch.object(module.subprocess, "run")
     def test_database_diagnostics_are_bounded_and_redact_passwords(self, run):

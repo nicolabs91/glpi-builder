@@ -59,7 +59,7 @@ from app_profiles import (
     validate_project_name as validate_application_project,
 )
 
-APP_VERSION = "0.5.0-rc.6"
+APP_VERSION = "0.5.0-rc.7"
 TPM_BACKUP_MANIFEST = "tpm-backup.json"
 QUARANTINE_REPORT = "quarantine-report.json"
 QUARANTINE_DEFAULT_DAYS = 14
@@ -2540,11 +2540,11 @@ def consume_create_preview(token):
 
 def create_progress_job(project, backup_root, kind="restore"):
     kind = str(kind or "restore").strip().lower()
-    if kind not in {"restore", "backup"}:
-        raise ValueError("Progress job kind must be restore or backup.")
+    if kind not in {"restore", "backup", "deployment"}:
+        raise ValueError("Progress job kind must be restore, backup or deployment.")
     token = secrets.token_urlsafe(32)
     now = int(time.time())
-    title = "Backup" if kind == "backup" else "Restore"
+    title = {"backup": "Backup", "deployment": "Application deployment"}.get(kind, "Restore")
     job = {
         "token": token,
         "project": project,
@@ -2734,7 +2734,7 @@ def scan_files(root, extensions, include_dirs=False):
     return [(str(path), f"{path} ({time.strftime('%Y-%m-%d %H:%M', time.localtime(mtime))})") for mtime, path in files[:MAX_SCAN_ENTRIES]]
 
 
-def scan_backup_choices(root, include_dirs=False):
+def scan_backup_choices(root, include_dirs=False, glpi_only=True):
     """Collect database and file backup choices in one filesystem traversal."""
     root = Path(root or BACKUP_ROOT).resolve()
     result = {"database": [], "files": []}
@@ -2746,7 +2746,7 @@ def scan_backup_choices(root, include_dirs=False):
             break
         if item.is_symlink():
             continue
-        if not is_glpi_backup_path(item, root):
+        if glpi_only and not is_glpi_backup_path(item, root):
             continue
         try:
             if item.is_file():
@@ -5164,6 +5164,14 @@ def new_project_page():
     )
     docker_snapshot, _projects = professional_ui_snapshot()
     preflight = synology_preflight()
+    db_backups = [
+        choice for choice in backup_choices["database"]
+        if is_glpi_backup_path(choice[0], BACKUP_ROOT)
+    ]
+    file_backups = [
+        choice for choice in backup_choices["files"]
+        if is_glpi_backup_path(choice[0], BACKUP_ROOT)
+    ]
     return render_professional_page(
         WIZARD,
         "New project",
@@ -5173,8 +5181,8 @@ def new_project_page():
             if test_demo_is_active()
             else str(BACKUP_ROOT)
         ),
-        db_backups=backup_choices["database"],
-        file_backups=backup_choices["files"],
+        db_backups=db_backups,
+        file_backups=file_backups,
         glpi_images=local_image_tags("glpi", docker_snapshot["image_tags"]),
         db_images=local_glpi_database_image_tags(docker_snapshot["image_tags"]),
         suggested_host_port=suggest_free_host_port(
@@ -5190,7 +5198,7 @@ def new_project_page():
 @app.route("/applications/new", methods=["GET"])
 def new_application_page():
     docker_snapshot, _projects = professional_ui_snapshot()
-    backup_choices = scan_backup_choices(BACKUP_ROOT, include_dirs=False)
+    backup_choices = scan_backup_choices(BACKUP_ROOT, include_dirs=False, glpi_only=False)
     preflight = synology_preflight()
     requested_app = request.args.get("app", "").strip().lower()
     if requested_app == "glpi":
@@ -5198,10 +5206,18 @@ def new_application_page():
             demo_backup_choices() if test_demo_is_active()
             else scan_backup_choices(BACKUP_ROOT, include_dirs=True)
         )
+        glpi_db_backups = [
+            choice for choice in glpi_choices["database"]
+            if is_glpi_backup_path(choice[0], BACKUP_ROOT)
+        ]
+        glpi_file_backups = [
+            choice for choice in glpi_choices["files"]
+            if is_glpi_backup_path(choice[0], BACKUP_ROOT)
+        ]
         return render_professional_page(
             WIZARD, "Add application", "projects",
             backup_root="/demo-only/backups" if test_demo_is_active() else str(BACKUP_ROOT),
-            db_backups=glpi_choices["database"], file_backups=glpi_choices["files"],
+            db_backups=glpi_db_backups, file_backups=glpi_file_backups,
             glpi_images=local_image_tags("glpi", docker_snapshot["image_tags"]),
             db_images=local_glpi_database_image_tags(docker_snapshot["image_tags"]),
             suggested_host_port=suggest_free_host_port(containers=docker_snapshot["containers"]),
@@ -5436,7 +5452,7 @@ def classify_tpm_backup_choices(choices):
         path = Path(value)
         if not path.name.lower().endswith((".sql", ".sql.gz")):
             continue
-        text = f"{path.name} {path.parent.name}".lower()
+        text = " ".join(path.parts).lower()
         verified = (path.parent / TPM_BACKUP_MANIFEST).is_file()
         manifest_application = backup_manifest_application(path)
         likely = "tpm" in text or "team" in text
@@ -5778,21 +5794,23 @@ def verify_quarantine_restore(data):
     return report
 
 
-@app.route("/applications/create/execute", methods=["POST"])
-def execute_application():
-    project = None
+def run_application_deployment(job_token, data):
+    project = data["project"]
+    messages = []
+    log_name = ""
     try:
-        require_csrf()
-        data = consume_application_preview(request.form.get("preview_token"))
-        project = data["project"]
+        update_progress_job(job_token, 5, "Checking NAS", "Running Docker, storage and Compose preflight checks.", status="running")
         preflight = synology_preflight()
         if not preflight["ready"]:
             failed = ", ".join(item["name"] for item in preflight["checks"] if item["status"] != "pass")
             raise RuntimeError("NAS preflight failed: " + failed)
         profile = get_profile(data["app_type"])
+        update_progress_job(job_token, 15, "Checking images", f"Verifying the selected {profile.name} and database images are installed locally.")
         ensure_application_images_available(profile, data["image"], data["database_image"])
         assert_docker_port_free(data["host_port"])
+        update_progress_job(job_token, 28, "Preparing project", "Creating private configuration and persistent application directories.")
         profile = write_private_application_files(data)
+        update_progress_job(job_token, 38, "Validating configuration", "Validating the generated Docker Compose configuration.")
         validation = subprocess.run(
             ["docker", "compose", "-f", "docker-compose.yml", "config", "--quiet"],
             cwd=project_dir(project), capture_output=True, text=True, timeout=60,
@@ -5800,8 +5818,11 @@ def execute_application():
         if validation.returncode:
             raise RuntimeError("Compose validation failed: " + tail_text(validation.stderr, 2000))
         if data.get("quarantine"):
+            update_progress_job(job_token, 48, "Restoring database", "Starting the isolated database and importing the selected backup.")
             restore_quarantine_database(data)
+            update_progress_job(job_token, 68, "Restoring application data", "Restoring verified application files and protected secrets.")
             restore_quarantine_application_files(data)
+        update_progress_job(job_token, 78, "Starting containers", f"Starting the {profile.name} application and its database.")
         deployment = subprocess.run(
             ["docker", "compose", "-f", "docker-compose.yml", "up", "-d"],
             cwd=project_dir(project), capture_output=True, text=True, timeout=600,
@@ -5812,20 +5833,24 @@ def execute_application():
                 "Application deployment failed: " + tail_text(deployment.stderr, 1800)
                 + " Database log: " + details
             )
-        report = verify_quarantine_restore(data) if data.get("quarantine") else None
-        write_action_log(project, "application-deploy", [
+        report = None
+        if data.get("quarantine"):
+            update_progress_job(job_token, 90, "Verifying isolation", "Checking the private network and restored database tables.")
+            report = verify_quarantine_restore(data)
+        messages = [
             f"Application profile: {profile.name}",
             f"Image: {data['image']}",
             f"Web port: {data['host_port']}",
             "Mode: isolated test restore; external network blocked." if data.get("quarantine") else "Mode: fresh installation.",
             "Compose validation passed and containers were started.",
             (f"Quarantine proof passed: {report['restored_tables']} database tables restored." if report else "Fresh deployment preflight passed."),
-        ])
+        ]
+        update_progress_job(job_token, 97, "Saving action log", "Saving deployment evidence and refreshing the dashboard.")
+        log_name = write_action_log(project, "application-deploy", messages)
         invalidate_dashboard_cache()
-        flash(f"{profile.name} project {project} was deployed.", "ok")
-        return redirect(url_for("project_detail_page", project=project))
+        update_progress_job(job_token, 100, "Completed", f"{profile.name} project {project} was deployed successfully.", status="completed", log_name=log_name)
     except Exception as exc:
-        if project and project_dir(project).is_dir():
+        if project_dir(project).is_dir():
             try:
                 subprocess.run(
                     ["docker", "compose", "down"], cwd=project_dir(project),
@@ -5834,9 +5859,36 @@ def execute_application():
             except Exception:
                 pass
             try:
-                write_action_log(project, "application-deploy-failed", [tail_text(exc, 3000)])
+                log_name = write_action_log(project, "application-deploy-failed", [tail_text(exc, 3000)] + messages)
             except Exception:
-                pass
+                log_name = ""
+        update_progress_job(job_token, stage="Deployment failed", message="The deployment stopped safely. Review the error and action log.", status="failed", log_name=log_name, error=str(exc))
+    finally:
+        invalidate_dashboard_cache()
+        MUTATION_LOCK.release()
+
+
+@app.route("/applications/create/execute", methods=["POST"])
+def execute_application():
+    try:
+        require_csrf()
+        data = consume_application_preview(request.form.get("preview_token"))
+        project = data["project"]
+        job_token = create_progress_job(project, BACKUP_ROOT, kind="deployment")
+        worker = threading.Thread(
+            target=run_application_deployment,
+            args=(job_token, data),
+            name=f"application-deploy-{project}",
+            daemon=True,
+        )
+        g.mutation_lock_held = False
+        try:
+            worker.start()
+        except Exception:
+            g.mutation_lock_held = True
+            raise
+        return redirect(url_for("restore_progress", job_token=job_token))
+    except Exception as exc:
         flash(str(exc), "err")
         return redirect(url_for("new_application_page"))
 

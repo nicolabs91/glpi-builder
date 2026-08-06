@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.0-rc.7
+
+- Show TPM and n8n deployments on the same live, stage-by-stage progress page
+  used by GLPI instead of blocking on the confirmation request.
+- Scan the complete configured backup root before applying application-specific
+  filtering, so TPM backups stored outside GLPI-named folders are selectable.
+- Keep GLPI, n8n and TPM restore choices isolated from each other and add
+  regression coverage for non-GLPI TPM backup folder layouts.
+
 ## 0.5.0-rc.6
 
 - Generate the n8n PostgreSQL data mount according to the selected local image:
