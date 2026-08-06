@@ -81,6 +81,8 @@ class ApplicationRouteTests(unittest.TestCase):
         folder = self.base / "n8n-production"
         self.assertTrue((folder / ".builder-app.json").is_file())
         self.assertEqual((folder / ".env").stat().st_mode & 0o777, 0o600)
+        self.assertEqual((folder / "data").stat().st_mode & 0o777, 0o777)
+        self.assertEqual((folder / "database").stat().st_mode & 0o777, 0o777)
         compose = (folder / "docker-compose.yml").read_text(encoding="utf-8")
         environment = (folder / ".env").read_text(encoding="utf-8")
         encryption_line = next(line for line in environment.splitlines() if line.startswith("N8N_ENCRYPTION_KEY="))
@@ -88,6 +90,23 @@ class ApplicationRouteTests(unittest.TestCase):
         commands = [call.args[0] for call in _run.call_args_list]
         self.assertIn(["docker", "compose", "-f", "docker-compose.yml", "config", "--quiet"], commands)
         self.assertIn(["docker", "compose", "-f", "docker-compose.yml", "up", "-d"], commands)
+
+    @patch.object(module.subprocess, "run")
+    def test_database_diagnostics_are_bounded_and_redact_passwords(self, run):
+        run.return_value = SimpleNamespace(
+            returncode=0,
+            stdout="database init failed password=do-not-show\n",
+            stderr="",
+        )
+
+        result = module.application_database_diagnostics("n8n-production")
+
+        self.assertIn("password=[redacted]", result)
+        self.assertNotIn("do-not-show", result)
+        run.assert_called_once_with(
+            ["docker", "logs", "--tail", "40", "n8n-production-db"],
+            capture_output=True, text=True, timeout=30,
+        )
 
     @patch.object(module, "assert_docker_port_free")
     def test_existing_directory_is_never_adopted(self, _port):

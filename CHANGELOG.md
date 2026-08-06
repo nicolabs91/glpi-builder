@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.0-rc.5
+
+- Make newly created n8n and TPM bind-mount directories writable for their
+  non-root application and database users during first-time initialization on
+  Synology.
+- Include bounded, password-redacted database-container logs when deployment
+  fails because the database remains unhealthy.
+
 ## 0.5.0-rc.4
 
 - Filter isolated-restore backup choices by application manifest so n8n and
