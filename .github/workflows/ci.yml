@@ -40,4 +40,4 @@ jobs:
         run: docker build --tag docker-app-manager:${GITHUB_SHA} .
 
       - name: Verify application version inside image
-        run: docker run --rm docker-app-manager:${GITHUB_SHA} python -c "import app; assert app.APP_VERSION == '0.5.0-rc.1'"
+        run: docker run --rm docker-app-manager:${GITHUB_SHA} python -c "import app; assert app.APP_VERSION == '0.5.0-rc.2'"

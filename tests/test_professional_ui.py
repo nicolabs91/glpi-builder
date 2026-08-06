@@ -45,7 +45,7 @@ class ProfessionalUiTest(unittest.TestCase):
         authenticate(self.client, module)
         self.snapshot = {
             "containers": [],
-            "image_tags": ("glpi/glpi:11.0.8", "mariadb:11.4"),
+            "image_tags": ("glpi/glpi:11.0.8", "mariadb:11.4", "docker.n8n.io/n8nio/n8n:1.99.1", "teampasswordmanager/teampasswordmanager:12.158.302", "postgres:16-alpine", "mysql:5.7"),
         }
 
     def get_with_data(self, path):
@@ -102,6 +102,10 @@ class ProfessionalUiTest(unittest.TestCase):
         self.assertIn(b"Isolated test restore", n8n.data)
         self.assertNotIn(b'value="quarantine" disabled', n8n.data)
         self.assertIn(b"Verified n8n database backup", n8n.data)
+        self.assertIn(b"docker.n8n.io/n8nio/n8n:1.99.1", n8n.data)
+        self.assertNotIn(b"docker.n8n.io/n8nio/n8n:latest", n8n.data)
+        self.assertIn(b"postgres:16-alpine", n8n.data)
+        self.assertIn(b"installed", n8n.data)
 
         tpm = self.get_with_data("/applications/new?app=teampasswordmanager")
         self.assertEqual(tpm.status_code, 200)

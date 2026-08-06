@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.0-rc.2
+
+- List only locally installed, allowlisted n8n and Team Password Manager
+  application images in the wizard.
+- Show whether the required PostgreSQL or MySQL image is installed and block
+  deployment instead of automatically pulling a missing image.
+
 ## 0.5.0-rc.1
 
 Test prerelease. TPM and n8n isolated restores are available for NAS proof

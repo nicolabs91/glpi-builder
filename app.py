@@ -58,7 +58,7 @@ from app_profiles import (
     validate_project_name as validate_application_project,
 )
 
-APP_VERSION = "0.5.0-rc.1"
+APP_VERSION = "0.5.0-rc.2"
 TPM_BACKUP_MANIFEST = "tpm-backup.json"
 QUARANTINE_REPORT = "quarantine-report.json"
 QUARANTINE_DEFAULT_DAYS = 14
@@ -771,6 +771,15 @@ def local_image_tags(kind, available_tags=None):
         available_tags = dashboard_docker_snapshot()["image_tags"]
     tags = set(available_tags)
     return sorted(tag for tag in tags if any(tag.startswith(prefix) for prefix in prefixes))
+
+
+def local_profile_image_tags(profile, available_tags=None):
+    if available_tags is None:
+        available_tags = dashboard_docker_snapshot()["image_tags"]
+    return sorted({
+        tag for tag in available_tags
+        if any(tag.startswith(prefix) for prefix in profile.image_prefixes)
+    })
 
 
 def read_env(project):
@@ -5075,7 +5084,9 @@ def new_application_page():
         "projects",
         profiles=profiles,
         selected_app=selected_profile.key,
-        selected_image=selected_profile.default_image,
+        profile_images=local_profile_image_tags(selected_profile, docker_snapshot["image_tags"]),
+        database_image=("postgres:16-alpine" if selected_profile.key == "n8n" else "mysql:5.7"),
+        database_image_installed=("postgres:16-alpine" if selected_profile.key == "n8n" else "mysql:5.7") in docker_snapshot["image_tags"],
         db_backups=backup_choices["database"],
         tpm_backups=classify_tpm_backup_choices(backup_choices["database"]),
         suggested_host_port=suggest_free_host_port(
@@ -5306,14 +5317,10 @@ def ensure_application_images_available(profile, image):
         )
         if present.returncode == 0:
             continue
-        pulled = subprocess.run(
-            ["docker", "pull", required_image],
-            capture_output=True, text=True, timeout=900,
+        raise RuntimeError(
+            f"Required Docker image is not installed locally: {required_image}. "
+            "Install the exact image in Container Manager first, then reopen the wizard."
         )
-        if pulled.returncode:
-            raise RuntimeError(
-                f"Image/platform preflight failed for {required_image}: " + tail_text(pulled.stderr, 2000)
-            )
 
 
 def validate_application_request(source):
