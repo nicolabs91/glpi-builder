@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.5.0-rc.16
+
+- Use the canonical early GLPI Compose YAML as the single source for normal and isolated test restores. Isolated mode now applies only the documented internal-network and cron substitutions.
+
 ## 0.5.0-rc.15
 
 - Restore the proven GLPI YAML and entrypoint byte for byte for isolated restores; do not rewrite the image's Supervisor configuration.

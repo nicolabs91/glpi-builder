@@ -60,7 +60,7 @@ from app_profiles import (
     validate_project_name as validate_application_project,
 )
 
-APP_VERSION = "0.5.0-rc.15"
+APP_VERSION = "0.5.0-rc.16"
 UPDATE_MAX_ZIP_BYTES = 64 * 1024 * 1024
 UPDATE_MAX_EXPANDED_BYTES = 256 * 1024 * 1024
 UPDATE_MAX_FILES = 2000
@@ -299,6 +299,9 @@ exec /opt/glpi/entrypoint.sh /usr/bin/supervisord -c /etc/supervisor/supervisord
 GLPI_ENTRY_COMMAND = GLPI_ENTRY_COMMAND.replace(
     "__REQUEST_LINE_LIMIT__", str(APACHE_REQUEST_LINE_LIMIT)
 ).replace("__GLPI_INTERNAL_PORT__", str(GLPI_INTERNAL_PORT))
+
+GLPI_COMPOSE_TEMPLATE_PATH = Path(__file__).with_name("templates") / "glpi-compose.yml"
+GLPI_COMPOSE_TEMPLATE = GLPI_COMPOSE_TEMPLATE_PATH.read_text(encoding="utf-8")
 
 AUTH_CONFIG_PATH = Path(os.environ.get("BUILDER_CONFIG_PATH", "/config/builder-auth.json"))
 
@@ -1966,95 +1969,24 @@ def indent_text(text, spaces):
 
 
 def render_glpi_compose(project, env):
-    """Write project Compose using the custom v7 structure.
+    """Render the original proven GLPI YAML with scoped substitutions.
 
-    This YAML intentionally stays very close to the proven v7 template. The
-    GLPI image was sensitive to small entrypoint and volume changes, so SSO
-    cookie settings are added only through .env and the entrypoint. Service and
-    volume structure must remain unchanged.
+    The template is the canonical early Docker App Manager YAML. Isolated
+    restores use this exact same source and only add the explicitly allowed
+    internal-network and cron changes.
     """
     env = normalize_env_defaults(env)
     entrypoint_script = indent_text(GLPI_ENTRY_COMMAND, 8)
-    network_internal_line = "\n    internal: true" if env.get("BUILDER_QUARANTINE") == "1" else ""
-    glpi_crontab_enabled = "0" if env.get("BUILDER_QUARANTINE") == "1" else "1"
-    compose = f"""services:
-  {project}-db:
-    image: {env["MARIADB_IMAGE"]}
-    container_name: {project}-db
-    restart: unless-stopped
-
-    env_file:
-      - .env
-
-    environment:
-      MARIADB_ROOT_PASSWORD: ${{MARIADB_ROOT_PASSWORD}}
-      MARIADB_DATABASE: ${{GLPI_DB_NAME}}
-      MARIADB_USER: ${{GLPI_DB_USER}}
-      MARIADB_PASSWORD: ${{GLPI_DB_PASSWORD}}
-
-      GLPI_DB_NAME: ${{GLPI_DB_NAME}}
-      GLPI_DB_USER: ${{GLPI_DB_USER}}
-      GLPI_DB_PASSWORD: ${{GLPI_DB_PASSWORD}}
-      TZ: ${{TZ}}
-
-    volumes:
-      - /volume1/docker/{project}/db:/var/lib/mysql:rw
-
-    networks:
-      - {project}-network
-
-
-  {project}:
-    image: {env["GLPI_IMAGE"]}
-    container_name: {project}
-    restart: unless-stopped
-    user: "0:0"
-
-    depends_on:
-      - {project}-db
-
-    ports:
-      - "${{GLPI_HTTP_PORT}}:8080"
-
-    volumes:
-      - /volume1/docker/{project}/glpi:/var/glpi:rw
-      - /volume1/docker/{project}/plugins:/var/www/glpi/plugins:rw
-
-    env_file:
-      - .env
-
-    environment:
-      GLPI_DB_HOST: {project}-db
-      GLPI_DB_PORT: 3306
-      GLPI_DB_NAME: ${{GLPI_DB_NAME}}
-      GLPI_DB_USER: ${{GLPI_DB_USER}}
-      GLPI_DB_PASSWORD: ${{GLPI_DB_PASSWORD}}
-
-      GLPI_SKIP_AUTOINSTALL: "true"
-      GLPI_SKIP_AUTOUPDATE: "true"
-      GLPI_CRONTAB_ENABLED: "{glpi_crontab_enabled}"
-      GLPI_SESSION_COOKIE_SAMESITE: ${{GLPI_SESSION_COOKIE_SAMESITE}}
-      GLPI_SESSION_COOKIE_SECURE: ${{GLPI_SESSION_COOKIE_SECURE}}
-
-      TZ: ${{TZ}}
-      TIMEZONE: ${{TZ}}
-
-    networks:
-      - {project}-network
-
-    entrypoint:
-      - /bin/sh
-      - -c
-      - |
-{entrypoint_script}
-
-
-networks:
-  {project}-network:
-    name: {project}-network
-    driver: bridge{network_internal_line}
-"""
-    return compose
+    isolated = env.get("BUILDER_QUARANTINE") == "1"
+    return (
+        GLPI_COMPOSE_TEMPLATE
+        .replace("__PROJECT__", str(project))
+        .replace("__MARIADB_IMAGE__", str(env["MARIADB_IMAGE"]))
+        .replace("__GLPI_IMAGE__", str(env["GLPI_IMAGE"]))
+        .replace("__GLPI_CRONTAB_ENABLED__", "0" if isolated else "1")
+        .replace("        __ENTRYPOINT__", entrypoint_script)
+        .replace("__INTERNAL_NETWORK__", "\n    internal: true" if isolated else "")
+    ).rstrip("\n") + "\n"
 
 
 def write_compose(project, env, compose_override=None):
@@ -6479,6 +6411,7 @@ def inspect_update_zip(zip_path, transaction_id):
     required = (
         "app.py", "app_ui.py", "app_profiles.py", "auth_security.py", "Dockerfile",
         "docker-compose.container-manager.yml", "requirements.txt",
+        "templates/glpi-compose.yml",
     )
     missing = [name for name in required if not (package_root / name).is_file()]
     if missing:

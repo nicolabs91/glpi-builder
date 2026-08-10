@@ -1,0 +1,77 @@
+services:
+  __PROJECT__-db:
+    image: __MARIADB_IMAGE__
+    container_name: __PROJECT__-db
+    restart: unless-stopped
+
+    env_file:
+      - .env
+
+    environment:
+      MARIADB_ROOT_PASSWORD: ${MARIADB_ROOT_PASSWORD}
+      MARIADB_DATABASE: ${GLPI_DB_NAME}
+      MARIADB_USER: ${GLPI_DB_USER}
+      MARIADB_PASSWORD: ${GLPI_DB_PASSWORD}
+
+      GLPI_DB_NAME: ${GLPI_DB_NAME}
+      GLPI_DB_USER: ${GLPI_DB_USER}
+      GLPI_DB_PASSWORD: ${GLPI_DB_PASSWORD}
+      TZ: ${TZ}
+
+    volumes:
+      - /volume1/docker/__PROJECT__/db:/var/lib/mysql:rw
+
+    networks:
+      - __PROJECT__-network
+
+
+  __PROJECT__:
+    image: __GLPI_IMAGE__
+    container_name: __PROJECT__
+    restart: unless-stopped
+    user: "0:0"
+
+    depends_on:
+      - __PROJECT__-db
+
+    ports:
+      - "${GLPI_HTTP_PORT}:8080"
+
+    volumes:
+      - /volume1/docker/__PROJECT__/glpi:/var/glpi:rw
+      - /volume1/docker/__PROJECT__/plugins:/var/www/glpi/plugins:rw
+
+    env_file:
+      - .env
+
+    environment:
+      GLPI_DB_HOST: __PROJECT__-db
+      GLPI_DB_PORT: 3306
+      GLPI_DB_NAME: ${GLPI_DB_NAME}
+      GLPI_DB_USER: ${GLPI_DB_USER}
+      GLPI_DB_PASSWORD: ${GLPI_DB_PASSWORD}
+
+      GLPI_SKIP_AUTOINSTALL: "true"
+      GLPI_SKIP_AUTOUPDATE: "true"
+      GLPI_CRONTAB_ENABLED: "__GLPI_CRONTAB_ENABLED__"
+      GLPI_SESSION_COOKIE_SAMESITE: ${GLPI_SESSION_COOKIE_SAMESITE}
+      GLPI_SESSION_COOKIE_SECURE: ${GLPI_SESSION_COOKIE_SECURE}
+
+      TZ: ${TZ}
+      TIMEZONE: ${TZ}
+
+    networks:
+      - __PROJECT__-network
+
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        __ENTRYPOINT__
+
+
+networks:
+  __PROJECT__-network:
+    name: __PROJECT__-network
+    driver: bridge__INTERNAL_NETWORK__
+

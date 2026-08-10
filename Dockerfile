@@ -28,6 +28,7 @@ COPY app.py .
 COPY app_ui.py .
 COPY app_profiles.py .
 COPY auth_security.py .
+COPY templates ./templates
 COPY docker-compose.app.yml .
 COPY install_on_synology.sh .
 COPY reset_setup_on_synology.sh .
