@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.0-rc.18
+
+- Start isolated GLPI database and application services from the saved canonical `docker-compose.yml` instead of recreating them through separate Docker API calls.
+- Verify that the requested host port is actually published to `8080/tcp`; fail the restore instead of reporting success when the binding is missing.
+
 ## 0.5.0-rc.17
 
 - Fix application links so they use the NAS/public host and the published GLPI port, without reusing the Docker App Manager management port.

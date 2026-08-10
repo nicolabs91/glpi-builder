@@ -5,12 +5,38 @@ import tarfile
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import app as module
 
 
 class GlpiIsolatedRestoreTest(unittest.TestCase):
+    def test_isolated_services_are_started_from_saved_compose_yaml(self):
+        completed = MagicMock(returncode=0, stdout="started", stderr="")
+        with tempfile.TemporaryDirectory() as root, \
+             patch.object(module, "BASE_PATH", Path(root)), \
+             patch.object(module.subprocess, "run", return_value=completed) as run:
+            (Path(root) / "glpi-isolated").mkdir()
+            result = module.run_isolated_compose(
+                "glpi-isolated", ["glpi-isolated"], force_recreate=True,
+            )
+        self.assertEqual(result, "started")
+        self.assertEqual(
+            run.call_args.args[0],
+            ["docker", "compose", "--project-name", "glpi-isolated", "-f",
+             "docker-compose.yml", "up", "-d", "--force-recreate", "glpi-isolated"],
+        )
+
+    def test_isolated_port_binding_must_match_requested_port(self):
+        container = MagicMock()
+        container.attrs = {
+            "HostConfig": {"PortBindings": {"8080/tcp": [{"HostPort": "8778"}]}}
+        }
+        with patch.object(module, "get_container", return_value=container):
+            self.assertIn("8778:8080", module.verify_glpi_port_binding("glpi-isolated", 8778))
+            with self.assertRaisesRegex(RuntimeError, "no matching published port"):
+                module.verify_glpi_port_binding("glpi-isolated", 8779)
+
     def test_isolated_compose_only_adds_supported_isolation_settings(self):
         env = module.build_env(
             "glpi-isolated",

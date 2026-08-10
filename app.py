@@ -60,7 +60,7 @@ from app_profiles import (
     validate_project_name as validate_application_project,
 )
 
-APP_VERSION = "0.5.0-rc.17"
+APP_VERSION = "0.5.0-rc.18"
 UPDATE_MAX_ZIP_BYTES = 64 * 1024 * 1024
 UPDATE_MAX_EXPANDED_BYTES = 256 * 1024 * 1024
 UPDATE_MAX_FILES = 2000
@@ -3522,6 +3522,52 @@ def create_glpi_container(project, env, force_recreate=True, pull_image=True):
     return f"Created GLPI container using the custom v7 YAML template: {project} ({host_port}:8080)"
 
 
+def run_isolated_compose(project, services, force_recreate=False):
+    """Start isolated restore services from the saved, user-reviewed Compose YAML."""
+    command = [
+        "docker", "compose", "--project-name", project,
+        "-f", "docker-compose.yml", "up", "-d",
+    ]
+    if force_recreate:
+        command.append("--force-recreate")
+    command.extend(services)
+    result = subprocess.run(
+        command,
+        cwd=project_dir(project),
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    output = "\n".join(part.strip() for part in (result.stdout, result.stderr) if part.strip())
+    if result.returncode != 0:
+        raise RuntimeError(
+            "Isolated restore could not be started from docker-compose.yml:\n"
+            + tail_text(output, 5000)
+        )
+    return output or "Docker Compose applied the isolated restore service."
+
+
+def verify_glpi_port_binding(project, host_port):
+    """Fail closed when Compose did not publish the requested GLPI port."""
+    expected_port = validate_port(host_port, "GLPI_HTTP_PORT")
+    container = get_container(project)
+    if not container:
+        raise RuntimeError(f"GLPI port proof failed: missing container {project}.")
+    container.reload()
+    bindings = (container.attrs.get("HostConfig", {}).get("PortBindings", {}) or {}).get("8080/tcp") or []
+    published = {
+        int(item.get("HostPort"))
+        for item in bindings
+        if str(item.get("HostPort", "")).isdigit()
+    }
+    if expected_port not in published:
+        raise RuntimeError(
+            f"GLPI port proof failed: docker-compose.yml requested {expected_port}:8080, "
+            "but the running container has no matching published port."
+        )
+    return f"Verified published GLPI port: {expected_port}:8080/tcp."
+
+
 def install_fresh_glpi(project, env):
     command = r'''exec php bin/console database:install \
   --db-host="$GLPI_DB_HOST" \
@@ -3596,7 +3642,17 @@ def create_or_restore(
     messages.append(f"Checked network: {project}-network")
 
     report(36, "Database container", "Checking or rebuilding the database container.")
-    messages.append(create_db_container(project, env, clean_db))
+    if isolated_restore:
+        if clean_db:
+            remove_container(project)
+            remove_container(f"{project}-db")
+            db_folder = project_dir(project) / "db"
+            if db_folder.exists():
+                shutil.rmtree(db_folder)
+        prepare_db_directory(project)
+        messages.append(run_isolated_compose(project, [f"{project}-db"], force_recreate=force_recreate))
+    else:
+        messages.append(create_db_container(project, env, clean_db))
 
     report(45, "Waiting for MariaDB", "Waiting until MariaDB accepts connections.")
     ensure_container_network(project, f"{project}-db", internal=isolated_restore)
@@ -3640,10 +3696,14 @@ def create_or_restore(
     ensure_glpi_writable_dirs(project)
     messages.append(fix_permissions(project))
     report(92, "Applying GLPI container", "Creating or updating the GLPI application container.")
-    messages.append(create_glpi_container(
-        project, env, force_recreate=force_recreate,
-        pull_image=not isolated_restore,
-    ))
+    if isolated_restore:
+        messages.append(run_isolated_compose(project, [project], force_recreate=force_recreate))
+        messages.append(verify_glpi_port_binding(project, env["GLPI_HTTP_PORT"]))
+    else:
+        messages.append(create_glpi_container(
+            project, env, force_recreate=force_recreate,
+            pull_image=True,
+        ))
     if fresh_install:
         messages.append("Initial GLPI credentials are glpi / glpi. Change this password immediately after signing in.")
     return messages
@@ -3655,6 +3715,7 @@ def verify_glpi_isolated_restore(project, data):
     network.reload()
     if not bool(network.attrs.get("Internal")):
         raise RuntimeError("GLPI isolated restore proof failed: Docker network is not internal.")
+    verify_glpi_port_binding(project, data["host_port"])
     for container_name in (project, f"{project}-db"):
         container = get_container(container_name)
         if not container:
