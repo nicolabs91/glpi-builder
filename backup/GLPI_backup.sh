@@ -107,7 +107,7 @@ case "$APP_TYPE" in
   n8n) tar -C "$PROJECT_DIR" -czf "$TEMP_BACKUP_DIR/files.tar.gz" data ;;
   teampasswordmanager) tar -C "$PROJECT_DIR" -czf "$TEMP_BACKUP_DIR/files.tar.gz" application ;;
 esac
-[ -s "$TEMP_BACKUP_DIR/files.tar.gz" ] || fail "GLPI files archive is empty"
+[ -s "$TEMP_BACKUP_DIR/files.tar.gz" ] || fail "$APP_TYPE application-data archive is empty"
 
 EXTRA_CHECKSUM_FILE=""
 MANIFEST_SCHEMA=1

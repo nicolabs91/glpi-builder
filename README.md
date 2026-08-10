@@ -1,4 +1,4 @@
-# Docker App Manager 0.5.0-rc.7 for Synology
+# Docker App Manager 0.5.0-rc.15 for Synology
 
 Docker Application Manager creates and manages supported internal Docker
 applications on a Synology NAS. Existing GLPI Builder projects remain fully
@@ -53,6 +53,9 @@ rate limited per source address and globally.
 - profile-specific image allowlists, health checks and recovery guidance;
 - generated secrets kept only in a mode-600 `.env`; sanitized Compose output
   exposes placeholders rather than credential values;
+- a two-step Builder self-update page that validates a newer release ZIP in
+  staging, then uses a temporary updater container for no-cache rebuilding,
+  health/version verification and automatic rollback while preserving config;
 
 - professional multi-page console with Overview, Applications, Backups, Activity,
   Settings, project details, and a guided create/restore wizard;

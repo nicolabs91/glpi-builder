@@ -11,6 +11,79 @@ import app as module
 
 
 class GlpiIsolatedRestoreTest(unittest.TestCase):
+    def test_isolated_compose_only_adds_supported_isolation_settings(self):
+        env = module.build_env(
+            "glpi-isolated",
+            "glpi/glpi:11.0.8",
+            "mariadb:11.4",
+            18080,
+            8080,
+            "Europe/Brussels",
+            True,
+            isolated_restore=True,
+        )
+
+        compose = module.render_glpi_compose("glpi-isolated", env)
+
+        self.assertIn("chmod 666 /tmp/supervisord.log /tmp/stdout.log /tmp/stderr.log", compose)
+        self.assertIn("internal: true", compose)
+        self.assertIn('GLPI_CRONTAB_ENABLED: "0"', compose)
+        self.assertNotIn("/tmp/supervisord.isolated.conf", compose)
+        self.assertNotIn("command=/bin/true", compose)
+        self.assertNotIn("autostart=false", compose)
+        self.assertNotIn("autorestart=false", compose)
+
+    def test_normal_compose_does_not_change_proven_cron_program(self):
+        env = module.build_env(
+            "glpi-normal", "glpi/glpi:11.0.8", "mariadb:11.4",
+            18080, 8080, "Europe/Brussels", False,
+        )
+        compose = module.render_glpi_compose("glpi-normal", env)
+        self.assertNotIn("command=/bin/true", compose)
+        self.assertNotIn("autorestart=false", compose)
+
+    def test_isolated_entrypoint_is_byte_for_byte_the_proven_entrypoint(self):
+        env = module.build_env(
+            "glpi-isolated", "glpi/glpi:11.0.8", "mariadb:11.4",
+            18080, 8080, "Europe/Brussels", True, isolated_restore=True,
+        )
+        compose = module.render_glpi_compose("glpi-isolated", env)
+        expected = module.indent_text(module.GLPI_ENTRY_COMMAND, 8)
+        self.assertIn("      - |\n" + expected + "\n", compose)
+
+    def test_isolated_yaml_diff_is_limited_to_two_isolation_lines(self):
+        normal_env = module.build_env(
+            "glpi-compare", "glpi/glpi:11.0.8", "mariadb:11.4",
+            18080, 8080, "Europe/Brussels", True, isolated_restore=False,
+        )
+        isolated_env = dict(normal_env, BUILDER_QUARANTINE="1")
+        normal = module.render_glpi_compose("glpi-compare", normal_env)
+        isolated = module.render_glpi_compose("glpi-compare", isolated_env)
+
+        normalized = isolated.replace(
+            'GLPI_CRONTAB_ENABLED: "0"', 'GLPI_CRONTAB_ENABLED: "1"',
+        ).replace("    driver: bridge\n    internal: true\n", "    driver: bridge\n")
+        self.assertEqual(normalized, normal)
+
+    def test_isolated_runtime_removes_only_restored_runtime_traces(self):
+        with tempfile.TemporaryDirectory() as root:
+            project_root = Path(root) / "glpi-isolated"
+            for relative in ("files/_log", "files/_cron", "logs"):
+                folder = project_root / "glpi" / relative
+                folder.mkdir(parents=True)
+                (folder / "production.log").write_text("An email was sent", encoding="utf-8")
+            config = project_root / "glpi" / "config"
+            config.mkdir(parents=True)
+            (config / "config_db.php").write_text("keep", encoding="utf-8")
+
+            with patch.object(module, "BASE_PATH", Path(root)):
+                result = module.prepare_glpi_isolated_runtime("glpi-isolated")
+
+            self.assertIn("Cleared isolated runtime logs", result)
+            self.assertEqual((config / "config_db.php").read_text(encoding="utf-8"), "keep")
+            for relative in ("files/_log", "files/_cron", "logs"):
+                self.assertEqual(list((project_root / "glpi" / relative).iterdir()), [])
+
     def make_set(self, root):
         folder = Path(root) / "glpi-production" / "2026-08-06_100000"
         folder.mkdir(parents=True)

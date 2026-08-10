@@ -62,10 +62,13 @@ class PreviewFlowTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertIn(b"Review the execution plan", response.data)
-        self.assertIn(b"<div>0.5.0-rc.7</div>", response.data)
+        self.assertIn(b"<div>0.5.0-rc.15</div>", response.data)
         self.assertNotIn(b"nothing has been changed yet", response.data)
         self.assertIn(b"glpi-preview-test", response.data)
         self.assertIn(b"Fresh installation", response.data)
+        self.assertIn(b'Docker Compose YAML', response.data)
+        self.assertIn(b'name="compose_yaml"', response.data)
+        self.assertIn(b'image: glpi/glpi:11-test', response.data)
         self.assertNotIn(b"Fresh installation (rare)", response.data)
         self.assertNotIn(b"Execution order", response.data)
         self.assertNotIn(b"The preflight checks run again", response.data)
@@ -83,9 +86,18 @@ class PreviewFlowTest(unittest.TestCase):
             token = flask_session["pending_create_preview"]["token"]
 
         env = {
+            "MARIADB_IMAGE": "mariadb:11-test",
+            "GLPI_IMAGE": "glpi/glpi:11-test",
+            "GLPI_HTTP_PORT": "18775",
+            "GLPI_CONTAINER_PORT": "8080",
             "GLPI_DB_NAME": "glpi",
+            "GLPI_DB_USER": "glpiuser",
+            "MARIADB_ROOT_PASSWORD": "test-root-password",
+            "GLPI_DB_PASSWORD": "test-db-password",
             "GLPI_SESSION_COOKIE_SAMESITE": "Lax",
             "GLPI_SESSION_COOKIE_SECURE": "Off",
+            "TZ": "Europe/Brussels",
+            "BUILDER_QUARANTINE": "0",
         }
         patches = self.validation_patches()
         with patches[0], patches[1], patches[2], patches[3], \
@@ -138,6 +150,37 @@ class PreviewFlowTest(unittest.TestCase):
     def test_obsolete_ui_preview_route_is_removed(self):
         response = self.client.get("/ui-preview")
         self.assertEqual(response.status_code, 404)
+
+    def test_compose_editor_rejects_privileged_and_external_mounts(self):
+        generated = "services:\n  app:\n    image: safe:1\n"
+        with self.assertRaisesRegex(ValueError, "forbidden"):
+            module.validate_compose_override(
+                generated + "    privileged: true\n", generated, ("image: safe:1",),
+                allowed_bind_root="/volume1/docker/test",
+            )
+        with self.assertRaisesRegex(ValueError, "outside"):
+            module.validate_compose_override(
+                generated + "    volumes:\n      - /etc:/host:rw\n", generated, ("image: safe:1",),
+                allowed_bind_root="/volume1/docker/test",
+            )
+
+    def test_isolated_compose_editor_cannot_remove_network_or_cron_isolation(self):
+        env = module.build_env(
+            "glpi-isolated", "glpi/glpi:11-test", "mariadb:11-test",
+            18775, 8080, "Europe/Brussels", True, isolated_restore=True,
+        )
+        generated = module.render_glpi_compose("glpi-isolated", env)
+        contract = module.glpi_compose_contract("glpi-isolated", env)
+
+        for unsafe in (
+            generated.replace("    internal: true\n", ""),
+            generated.replace('GLPI_CRONTAB_ENABLED: "0"', 'GLPI_CRONTAB_ENABLED: "1"'),
+        ):
+            with self.assertRaisesRegex(ValueError, "removed a required"):
+                module.validate_compose_override(
+                    unsafe, generated, contract,
+                    allowed_bind_root="/volume1/docker/glpi-isolated",
+                )
 
 
 if __name__ == "__main__":

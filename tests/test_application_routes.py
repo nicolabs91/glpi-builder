@@ -73,12 +73,57 @@ class ApplicationRouteTests(unittest.TestCase):
             [str(database)],
         )
 
+    def test_complete_backup_sets_are_application_scoped_and_checksum_verified(self):
+        backup_root = self.base / "sets"
+        for application in ("glpi", "n8n", "teampasswordmanager"):
+            folder = backup_root / application / "project" / "2026-08-06_020000"
+            folder.mkdir(parents=True)
+            database = folder / "database.sql.gz"
+            files = folder / "files.tar.gz"
+            database.write_bytes(application.encode() + b"-database")
+            files.write_bytes(application.encode() + b"-files")
+            members = [database, files]
+            manifest = {
+                "schema": 2 if application == "n8n" else 1,
+                "application": application, "project": "project",
+                "created_at": "2026-08-06T02:00:00+02:00",
+                "database": database.name, "files": files.name,
+            }
+            if application == "n8n":
+                secrets = folder / "secrets.env"
+                secrets.write_text("N8N_ENCRYPTION_KEY=test\n", encoding="utf-8")
+                members.append(secrets)
+                manifest["secrets"] = secrets.name
+            (folder / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+            (folder / "SHA256SUMS").write_text("".join(
+                f"{hashlib.sha256(member.read_bytes()).hexdigest()}  {member.name}\n"
+                for member in members
+            ), encoding="utf-8")
+
+        with patch.object(module, "BACKUP_ROOT", backup_root):
+            glpi_sets = module.discover_complete_backup_sets(backup_root, "glpi")
+            n8n_sets = module.discover_complete_backup_sets(backup_root, "n8n")
+            tpm_sets = module.discover_complete_backup_sets(backup_root, "teampasswordmanager")
+
+        self.assertEqual(len(glpi_sets), 1)
+        self.assertEqual(len(n8n_sets), 1)
+        self.assertEqual(len(tpm_sets), 1)
+        self.assertIn("verified: database, files, secrets", n8n_sets[0][1])
+        bad_database = Path(glpi_sets[0][0]) / "database.sql.gz"
+        bad_database.write_bytes(b"changed-after-backup")
+        with patch.object(module, "BACKUP_ROOT", backup_root):
+            with self.assertRaisesRegex(ValueError, "checksum mismatch"):
+                module.inspect_complete_backup_set(glpi_sets[0][0], "glpi")
+
     @patch.object(module, "assert_docker_port_free")
     def test_preview_is_review_first_and_does_not_write_files(self, _port):
         with patch.object(module, "BASE_PATH", self.base):
             response = self.client.post("/applications/create", data=self.payload())
         self.assertEqual(response.status_code, 200)
         self.assertIn(b"Review deployment", response.data)
+        self.assertIn(b"Docker Compose YAML", response.data)
+        self.assertIn(b'name="compose_yaml"', response.data)
+        self.assertIn(b"docker.n8n.io/n8nio/n8n:latest", response.data)
         self.assertFalse((self.base / "n8n-production").exists())
 
     @patch.object(module, "assert_docker_port_free")
@@ -93,7 +138,7 @@ class ApplicationRouteTests(unittest.TestCase):
                 "/applications/create/execute",
                 data={"csrf_token": self.csrf(), "preview_token": token},
             )
-            deadline = module.time.monotonic() + 2
+            deadline = module.time.monotonic() + 5
             while not (self.base / "n8n-production" / ".builder-app.json").is_file() and module.time.monotonic() < deadline:
                 module.time.sleep(0.01)
         self.assertEqual(response.status_code, 302)

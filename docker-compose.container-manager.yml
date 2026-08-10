@@ -10,6 +10,9 @@ services:
       BASE_PATH: /volume1/docker
       BACKUP_ROOT: /volume1/docker/_BACKUPS
       BUILDER_CONFIG_PATH: /config/builder-auth.json
+      BUILDER_INSTALL_ROOT: /volume1/docker/docker-app-manager
+      BUILDER_CONTAINER_NAME: docker-app-manager
+      BUILDER_IMAGE_NAME: docker-app-manager:container-manager
       BUILDER_SESSION_COOKIE_SECURE: ${BUILDER_SESSION_COOKIE_SECURE:-false}
       TZ: ${TZ:-Europe/Brussels}
     volumes:

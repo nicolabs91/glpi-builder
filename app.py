@@ -42,6 +42,7 @@ from app_ui import (
     PROJECT_DETAIL,
     PROJECTS,
     SETTINGS,
+    UPDATE_STATUS,
     WIZARD,
     page_template,
 )
@@ -59,7 +60,20 @@ from app_profiles import (
     validate_project_name as validate_application_project,
 )
 
-APP_VERSION = "0.5.0-rc.7"
+APP_VERSION = "0.5.0-rc.15"
+UPDATE_MAX_ZIP_BYTES = 64 * 1024 * 1024
+UPDATE_MAX_EXPANDED_BYTES = 256 * 1024 * 1024
+UPDATE_MAX_FILES = 2000
+BUILDER_INSTALL_ROOT = Path(
+    os.environ.get("BUILDER_INSTALL_ROOT", "/volume1/docker/docker-app-manager")
+)
+BUILDER_UPDATE_ROOT = Path(
+    os.environ.get("BUILDER_UPDATE_ROOT", "/volume1/docker/.docker-app-manager-updates")
+)
+BUILDER_CONTAINER_NAME = os.environ.get("BUILDER_CONTAINER_NAME", "docker-app-manager")
+BUILDER_IMAGE_NAME = os.environ.get(
+    "BUILDER_IMAGE_NAME", "docker-app-manager:container-manager"
+)
 TPM_BACKUP_MANIFEST = "tpm-backup.json"
 QUARANTINE_REPORT = "quarantine-report.json"
 QUARANTINE_DEFAULT_DAYS = 14
@@ -201,6 +215,28 @@ UI_JAVASCRIPT = r"""
       window.setTimeout(() => { button.textContent = 'Copy command'; }, 1800);
     });
   });
+  const updateBox = document.querySelector('[data-update-status]');
+  if (updateBox) {
+    const state = document.getElementById('update-state');
+    const message = document.getElementById('update-message');
+    const bar = document.getElementById('update-progress');
+    const widths = {validated: 10, starting: 15, building: 35, switching: 60, verifying: 85, rollback: 90, completed: 100, failed: 100};
+    const pollUpdate = async () => {
+      try {
+        const response = await fetch(updateBox.dataset.statusUrl, {cache: 'no-store'});
+        if (!response.ok) throw new Error('offline');
+        const data = await response.json();
+        state.textContent = data.status;
+        message.textContent = data.message || data.status;
+        bar.style.width = `${widths[data.status] || 15}%`;
+        if (!['completed', 'failed'].includes(data.status)) window.setTimeout(pollUpdate, 2000);
+      } catch (_) {
+        message.textContent = 'Builder is restarting; reconnecting…';
+        window.setTimeout(pollUpdate, 2500);
+      }
+    };
+    pollUpdate();
+  }
   if (checked) window.setInterval(refresh, 20000);
 })();
 """
@@ -1929,7 +1965,7 @@ def indent_text(text, spaces):
     return "\n".join(prefix + line if line else prefix for line in text.splitlines())
 
 
-def write_compose(project, env):
+def render_glpi_compose(project, env):
     """Write project Compose using the custom v7 structure.
 
     This YAML intentionally stays very close to the proven v7 template. The
@@ -1940,6 +1976,7 @@ def write_compose(project, env):
     env = normalize_env_defaults(env)
     entrypoint_script = indent_text(GLPI_ENTRY_COMMAND, 8)
     network_internal_line = "\n    internal: true" if env.get("BUILDER_QUARANTINE") == "1" else ""
+    glpi_crontab_enabled = "0" if env.get("BUILDER_QUARANTINE") == "1" else "1"
     compose = f"""services:
   {project}-db:
     image: {env["MARIADB_IMAGE"]}
@@ -1995,7 +2032,7 @@ def write_compose(project, env):
 
       GLPI_SKIP_AUTOINSTALL: "true"
       GLPI_SKIP_AUTOUPDATE: "true"
-      GLPI_CRONTAB_ENABLED: "1"
+      GLPI_CRONTAB_ENABLED: "{glpi_crontab_enabled}"
       GLPI_SESSION_COOKIE_SAMESITE: ${{GLPI_SESSION_COOKIE_SAMESITE}}
       GLPI_SESSION_COOKIE_SECURE: ${{GLPI_SESSION_COOKIE_SECURE}}
 
@@ -2017,7 +2054,66 @@ networks:
     name: {project}-network
     driver: bridge{network_internal_line}
 """
+    return compose
+
+
+def write_compose(project, env, compose_override=None):
+    compose = compose_override if compose_override is not None else render_glpi_compose(project, env)
     compose_file(project).write_text(compose, encoding="utf-8")
+
+
+def validate_compose_override(value, generated, required_fragments, secret_values=(), allowed_bind_root=""):
+    compose = str(value or "")
+    if not compose.strip():
+        return generated
+    if len(compose.encode("utf-8")) > 128 * 1024 or "\x00" in compose:
+        raise ValueError("Edited Compose YAML is empty, binary or larger than 128 KiB.")
+    forbidden = (
+        r"(?mi)^\s*privileged\s*:\s*(?:true|yes|on)\s*$",
+        r"(?mi)^\s*network_mode\s*:\s*(?:host|none)\s*$",
+        r"(?mi)^\s*pid\s*:\s*host\s*$",
+        r"(?mi)^\s*ipc\s*:\s*host\s*$",
+        r"(?mi)^\s*userns_mode\s*:\s*host\s*$",
+        r"/(?:var/)?run/docker\.sock",
+    )
+    if any(re.search(pattern, compose) for pattern in forbidden):
+        raise ValueError("Edited Compose YAML requests a forbidden host or privileged capability.")
+    for source in re.findall(r"(?m)^\s*-\s+(/[^:\n]+):/[^\n]+$", compose):
+        if not allowed_bind_root or not source.startswith(allowed_bind_root.rstrip("/") + "/"):
+            raise ValueError("Edited Compose YAML contains a bind mount outside this project's directory.")
+    if any(fragment not in compose for fragment in required_fragments):
+        raise ValueError("Edited Compose YAML removed a required image, service, network or persistent volume.")
+    for secret_value in secret_values:
+        if secret_value and secret_value in compose:
+            raise ValueError("Edited Compose YAML may not embed generated credentials; keep the .env placeholders.")
+    return compose if compose.endswith("\n") else compose + "\n"
+
+
+def glpi_compose_contract(project, env):
+    required = [
+        f"  {project}-db:", f"  {project}:",
+        f"image: {env['MARIADB_IMAGE']}", f"image: {env['GLPI_IMAGE']}",
+        f"container_name: {project}-db", f"container_name: {project}",
+        f"/volume1/docker/{project}/db:/var/lib/mysql:rw",
+        f"/volume1/docker/{project}/glpi:/var/glpi:rw",
+        f"/volume1/docker/{project}/plugins:/var/www/glpi/plugins:rw",
+        "${MARIADB_ROOT_PASSWORD}", "${GLPI_DB_PASSWORD}",
+        f"name: {project}-network",
+    ]
+    if env.get("BUILDER_QUARANTINE") == "1":
+        required.extend(('GLPI_CRONTAB_ENABLED: "0"', "internal: true"))
+    return tuple(required)
+
+
+def application_compose_contract(generated):
+    keep_prefixes = ("image:", "container_name:", "name:")
+    fragments = []
+    for line in generated.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(keep_prefixes) or "/volume1/docker/" in stripped:
+            fragments.append(stripped)
+    fragments.extend(re.findall(r"\$\{[A-Z0-9_]*(?:PASSWORD|KEY)[A-Z0-9_]*\}", generated))
+    return tuple(dict.fromkeys(fragments))
 
 def ensure_glpi_writable_dirs(project):
     glpi_dir = project_dir(project) / "glpi"
@@ -2366,6 +2462,12 @@ def inspect_glpi_backup_set(database_value, files_value):
 
 
 def validate_create_request(source):
+    source = dict(source)
+    selected_set = None
+    if source.get("backup_set"):
+        selected_set = inspect_complete_backup_set(source["backup_set"], "glpi")
+        source["db_backup_select"] = selected_set["members"]["database"]
+        source["file_backup_select"] = selected_set["members"]["files"]
     project = validate_project(source.get("project"))
     glpi_image = validate_local_image(source.get("glpi_image"), "glpi")
     mariadb_image = validate_local_image(source.get("mariadb_image"), "database")
@@ -2451,6 +2553,7 @@ def validate_create_request(source):
         "fresh_install": fresh_install,
         "isolated_restore": isolated_restore,
         "backup_inspection": backup_inspection,
+        "backup_set": selected_set,
         "clean_db": clean_db,
         "force_recreate": force_recreate,
         "restore_everything": restore_everything,
@@ -2493,25 +2596,31 @@ def build_create_plan(data):
         ])
     if data.get("update_backup_source"):
         steps.append("Update the scheduled backup script and backup.env for this project")
+    rows = [
+        ("Project", data["project"]),
+        ("Mode", mode_title),
+        ("Web port", f"{data['host_port']}:8080"),
+        ("GLPI image", data["glpi_image"]),
+        ("Database image", data["mariadb_image"]),
+        ("Database", database_action),
+        ("GLPI files/config", files_action),
+        ("Plugins", plugin_action),
+        ("Scheduled backups", backup_action),
+        ("Database backup", data["db_backup"] or "none"),
+        ("GLPI files backup", data["file_backup"] or "none"),
+        ("Cookie policy", f"SameSite={data['cookie_samesite']}, Secure={data['cookie_secure']}"),
+        ("Time zone", data["tz"]),
+    ]
+    if data.get("backup_set"):
+        rows.insert(2, ("Backup set", data["backup_set"]["folder"]))
+        rows.insert(3, ("Verified components", ", ".join(
+            item["role"] for item in data["backup_set"]["components"]
+        )))
     return {
         "title": mode_title,
         "risk": "High - all existing project data will be deleted" if fresh_install else ("Contained - restored into a new project on an internal Docker network" if isolated_restore else ("High - existing project data will be replaced" if destructive else "Normal - required backups will be restored")),
         "destructive": destructive,
-        "rows": [
-            ("Project", data["project"]),
-            ("Mode", mode_title),
-            ("Web port", f"{data['host_port']}:8080"),
-            ("GLPI image", data["glpi_image"]),
-            ("Database image", data["mariadb_image"]),
-            ("Database", database_action),
-            ("GLPI files/config", files_action),
-            ("Plugins", plugin_action),
-            ("Scheduled backups", backup_action),
-            ("Database backup", data["db_backup"] or "none"),
-            ("GLPI files backup", data["file_backup"] or "none"),
-            ("Cookie policy", f"SameSite={data['cookie_samesite']}, Secure={data['cookie_secure']}"),
-            ("Time zone", data["tz"]),
-        ],
+        "rows": rows,
         "steps": steps,
     }
 
@@ -2766,6 +2875,74 @@ def scan_backup_choices(root, include_dirs=False, glpi_only=True):
             for mtime, path in result[key][:MAX_SCAN_ENTRIES]
         ]
     return result
+
+
+def inspect_complete_backup_set(value, expected_application=None):
+    folder = Path(str(value or "")).resolve()
+    if not folder.is_dir() or folder.is_symlink() or not path_under_backup_root(folder):
+        raise ValueError("Select a backup-set folder below the configured backup root.")
+    manifest_path = folder / "manifest.json"
+    checksums_path = folder / "SHA256SUMS"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("The backup set has no valid manifest.json.") from exc
+    application = str(manifest.get("application") or "").strip().lower()
+    if application not in {"glpi", "n8n", "teampasswordmanager"}:
+        raise ValueError("The backup manifest has no supported application label.")
+    if expected_application and application != expected_application:
+        raise ValueError("The selected backup set belongs to another application.")
+    members = {
+        "database": _safe_backup_member(folder, manifest.get("database")),
+        "files": _safe_backup_member(folder, manifest.get("files")),
+    }
+    if application == "n8n":
+        members["secrets"] = _safe_backup_member(folder, manifest.get("secrets"))
+    if not members["database"].name.lower().endswith((".sql", ".sql.gz", ".dump", ".dump.gz")):
+        raise ValueError("The backup-set database member has an unsupported format.")
+    if not members["files"].name.lower().endswith((".tar", ".tar.gz", ".tgz")):
+        raise ValueError("The backup-set application-data member has an unsupported format.")
+    if "secrets" in members and not members["secrets"].name.lower().endswith(".env"):
+        raise ValueError("The backup-set secrets member has an unsupported format.")
+    try:
+        expected = {}
+        for line in checksums_path.read_text(encoding="utf-8").splitlines():
+            digest, name = line.strip().split(None, 1)
+            expected[Path(name.lstrip("* ")).name] = digest.lower()
+    except (OSError, ValueError) as exc:
+        raise ValueError("The backup set has no valid SHA256SUMS inventory.") from exc
+    for role, member in members.items():
+        if not hmac.compare_digest(expected.get(member.name, ""), sha256_file(member)):
+            raise ValueError(f"Backup-set checksum mismatch for {role}: {member.name}.")
+    return {
+        "folder": str(folder), "application": application, "manifest": manifest,
+        "members": {role: str(path) for role, path in members.items()},
+        "components": [
+            {"role": role, "name": path.name, "status": "verified"}
+            for role, path in members.items()
+        ],
+        "complete": True,
+    }
+
+
+def discover_complete_backup_sets(root, application):
+    root = Path(root or BACKUP_ROOT).resolve()
+    choices = []
+    if not root.is_dir() or not path_under_backup_root(root):
+        return choices
+    for manifest_path in root.rglob("manifest.json"):
+        if manifest_path.is_symlink():
+            continue
+        try:
+            inspected = inspect_complete_backup_set(manifest_path.parent, application)
+            manifest = inspected["manifest"]
+            created = str(manifest.get("created_at") or manifest_path.parent.name)
+            project = str(manifest.get("project") or manifest_path.parent.parent.name)
+            components = ", ".join(item["role"] for item in inspected["components"])
+            choices.append((inspected["folder"], f"{project} · {created} · verified: {components}"))
+        except ValueError:
+            continue
+    return sorted(choices, key=lambda choice: choice[1], reverse=True)[:MAX_SCAN_ENTRIES]
 
 
 def write_action_log(project, action, messages):
@@ -3222,6 +3399,25 @@ def restore_glpi_files(project, file_source, restore_plugins=True):
     return messages
 
 
+def prepare_glpi_isolated_runtime(project):
+    """Remove production runtime traces from a quarantined restore copy.
+
+    Application logs and cron state are not restore data. Keeping them makes
+    old production mail/cron messages appear as if the isolated container had
+    just emitted them. The production backup is never modified.
+    """
+    glpi_root = project_dir(project) / "glpi"
+    cleared = []
+    for relative in ("files/_log", "files/_cron", "logs"):
+        target = glpi_root / relative
+        if target.exists():
+            empty_dir(target)
+            cleared.append(relative)
+        target.mkdir(parents=True, exist_ok=True)
+    ensure_glpi_writable_dirs(project)
+    return "Cleared isolated runtime logs and cron state: " + ", ".join(cleared or ("none present",))
+
+
 def fix_permissions(project):
     roots = [
         project_dir(project) / "glpi",
@@ -3497,6 +3693,8 @@ def create_or_restore(
     if file_backup:
         report(72, "Restoring GLPI files", "Extracting and copying the selected GLPI files backup.")
         messages.extend(restore_glpi_files(project, file_backup, restore_plugins=not skip_plugins))
+        if isolated_restore:
+            messages.append(prepare_glpi_isolated_runtime(project))
     else:
         report(72, "Using image defaults", "No files backup is used; GLPI will create only its standard config and data.")
         messages.append("Fresh installation uses only the original GLPI image files and empty persistent directories.")
@@ -3589,7 +3787,7 @@ def run_create_job(job_token, data):
         )
         validate_db_identifier(env["GLPI_DB_NAME"])
         write_env(project, env)
-        write_compose(project, env)
+        write_compose(project, env, data.get("compose_yaml"))
 
         def report(percent, stage, message=None):
             update_progress_job(job_token, percent, stage, message)
@@ -4015,6 +4213,7 @@ header{background:#fff;color:#12233f;padding:18px;border-bottom:1px solid var(--
 h1,h2{margin-top:0}.risk{border-left:5px solid var(--brand);padding:12px 14px;background:#edf8f3;border-radius:8px}.risk.danger{border-color:var(--danger);background:#fff0ef}
 dl{display:grid;grid-template-columns:minmax(170px,240px) 1fr;gap:0;border-top:1px solid var(--line)}dt,dd{margin:0;padding:10px 0;border-bottom:1px solid var(--line)}dt{font-weight:700;padding-right:15px}dd{overflow-wrap:anywhere}
 .actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center}button,.button{border:0;border-radius:8px;padding:11px 15px;background:var(--brand);color:#fff;font-weight:750;text-decoration:none;cursor:pointer}.secondary{background:#425466}
+.yaml-editor{width:100%;min-height:440px;margin:12px 0 16px;padding:16px;border:1px solid #263b57;border-radius:9px;background:#12233f;color:#dce7f6;font:12px/1.55 ui-monospace,SFMono-Regular,Menlo,monospace;tab-size:2}.yaml-help{color:var(--muted);font-size:12px}
 @media(max-width:640px){dl{grid-template-columns:1fr}dt{border-bottom:0;padding-bottom:0}dd{padding-top:4px}}
 </style></head><body>
 <header><div><h1>Review the execution plan</h1><div>{{ app_version }}</div></div></header>
@@ -4022,7 +4221,7 @@ dl{display:grid;grid-template-columns:minmax(170px,240px) 1fr;gap:0;border-top:1
 {% if demo_only %}<section class="card"><p class="risk"><strong>Simulation only:</strong> confirming this plan adds a temporary demo project to your current preview session. Docker, files and backups are not changed.</p></section>{% endif %}
 <section class="card"><h2>{{ plan.title }}</h2><p class="risk {{ 'danger' if plan.destructive else '' }}"><strong>Risk:</strong> {{ plan.risk }}</p>
 <dl>{% for label,value in plan.rows %}<dt>{{ label }}</dt><dd>{{ value }}</dd>{% endfor %}</dl></section>
-<section class="card"><div class="actions">{% if preview_only %}<strong>Preview only</strong>{% else %}<form method="post" action="{{ url_for('execute_create') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="preview_token" value="{{ preview_token }}"><button type="submit">{{ 'Add simulated project' if demo_only else 'Confirm plan and start' }}</button></form>{% endif %}<a class="button secondary" href="{{ url_for('new_project_page') }}">{{ 'Back' if preview_only else 'Back and edit' }}</a></div></section>
+<section class="card"><h2>Docker Compose YAML</h2><p class="yaml-help">Review the exact Compose file before execution. You may edit operational settings, but required images, project volumes, secret placeholders and isolation controls are enforced again when you continue.</p>{% if preview_only %}<textarea class="yaml-editor" readonly>{{ compose_yaml }}</textarea><div class="actions"><strong>Preview only</strong>{% else %}<form method="post" action="{{ url_for('execute_create') }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="preview_token" value="{{ preview_token }}"><textarea class="yaml-editor" name="compose_yaml" spellcheck="false" aria-label="Docker Compose YAML">{{ compose_yaml }}</textarea><div class="actions"><button type="submit">{{ 'Add simulated project' if demo_only else 'Validate YAML and start' }}</button>{% endif %}<a class="button secondary" href="{{ url_for('new_project_page') }}">{{ 'Back' if preview_only else 'Back and edit' }}</a></div>{% if not preview_only %}</form>{% endif %}</section>
 </main></body></html>"""
 
 
@@ -4063,6 +4262,13 @@ def create():
         project_for_log = data["project"]
         preview_token = store_create_preview(data)
         plan = build_create_plan(data)
+        preview_env = build_env(
+            data["project"], data["glpi_image"], data["mariadb_image"],
+            data["host_port"], data["container_port"], data["tz"], data["clean_db"],
+            cookie_samesite=data["cookie_samesite"], cookie_secure=data["cookie_secure"],
+            isolated_restore=bool(data.get("isolated_restore")),
+        )
+        compose_yaml = render_glpi_compose(data["project"], preview_env)
         if test_demo_is_active():
             plan["risk"] = "None - simulation only; Docker and host storage remain unchanged"
             plan["destructive"] = False
@@ -4077,6 +4283,7 @@ def create():
             preview_token=preview_token,
             preview_only=False,
             demo_only=test_demo_is_active(),
+            compose_yaml=compose_yaml,
         )
     except Exception as exc:
         flash_error(str(exc), project_for_log, "create-preview-error")
@@ -4109,6 +4316,19 @@ def execute_create():
             )
             return redirect(url_for("project_detail_page", project=data["project"]))
         data = validate_create_request(stored_data)
+        generated_env = build_env(
+            data["project"], data["glpi_image"], data["mariadb_image"],
+            data["host_port"], data["container_port"], data["tz"], data["clean_db"],
+            cookie_samesite=data["cookie_samesite"], cookie_secure=data["cookie_secure"],
+            isolated_restore=bool(data.get("isolated_restore")),
+        )
+        generated_compose = render_glpi_compose(data["project"], generated_env)
+        data["compose_yaml"] = validate_compose_override(
+            request.form.get("compose_yaml"), generated_compose,
+            glpi_compose_contract(data["project"], generated_env),
+            secret_values=(generated_env["MARIADB_ROOT_PASSWORD"], generated_env["GLPI_DB_PASSWORD"]),
+            allowed_bind_root=f"/volume1/docker/{data['project']}",
+        )
         project = data["project"]
         project_for_log = project
         job_token = create_progress_job(project, backup_root)
@@ -5183,6 +5403,7 @@ def new_project_page():
         ),
         db_backups=db_backups,
         file_backups=file_backups,
+        backup_sets=discover_complete_backup_sets(BACKUP_ROOT, "glpi"),
         glpi_images=local_image_tags("glpi", docker_snapshot["image_tags"]),
         db_images=local_glpi_database_image_tags(docker_snapshot["image_tags"]),
         suggested_host_port=suggest_free_host_port(
@@ -5218,6 +5439,7 @@ def new_application_page():
             WIZARD, "Add application", "projects",
             backup_root="/demo-only/backups" if test_demo_is_active() else str(BACKUP_ROOT),
             db_backups=glpi_db_backups, file_backups=glpi_file_backups,
+            backup_sets=discover_complete_backup_sets(BACKUP_ROOT, "glpi"),
             glpi_images=local_image_tags("glpi", docker_snapshot["image_tags"]),
             db_images=local_glpi_database_image_tags(docker_snapshot["image_tags"]),
             suggested_host_port=suggest_free_host_port(containers=docker_snapshot["containers"]),
@@ -5241,6 +5463,7 @@ def new_application_page():
         ),
         db_backups=classify_n8n_backup_choices(backup_choices["database"]),
         tpm_backups=classify_tpm_backup_choices(backup_choices["database"]),
+        backup_sets=discover_complete_backup_sets(BACKUP_ROOT, selected_profile.key),
         suggested_host_port=suggest_free_host_port(
             containers=docker_snapshot["containers"]
         ),
@@ -5503,7 +5726,12 @@ def ensure_application_images_available(profile, image, database_image):
 
 
 def validate_application_request(source):
+    source = dict(source)
     profile = get_profile(source.get("app_type"))
+    selected_set = None
+    if source.get("backup_set"):
+        selected_set = inspect_complete_backup_set(source["backup_set"], profile.key)
+        source["database_backup"] = selected_set["members"]["database"]
     project = validate_application_project(source.get("project"))
     host_port = validate_application_port(source.get("host_port"))
     image = validate_application_image(profile, source.get("image"))
@@ -5525,6 +5753,11 @@ def validate_application_request(source):
             raise ValueError(f"{profile.name} has no verified isolated restore adapter yet.")
         database_backup = str(source.get("database_backup") or "").strip()
         backup_inspection = inspect_tpm_backup(database_backup) if profile.key == "teampasswordmanager" else inspect_n8n_backup(database_backup)
+        if selected_set and profile.key == "teampasswordmanager":
+            backup_inspection.update({
+                "manifest": selected_set["manifest"], "complete_set": True,
+                "files": [{"role": "tpm-data", "path": selected_set["members"]["files"]}],
+            })
         backup_version = str(
             (backup_inspection.get("manifest") or {}).get("application_version")
             or backup_inspection.get("application_version")
@@ -5560,6 +5793,7 @@ def validate_application_request(source):
         "database_backup": database_backup,
         "backup_version": backup_version,
         "backup_inspection": backup_inspection,
+        "backup_set": selected_set,
         "bind_address": bind_address,
         "expires_at": expires_at,
     }
@@ -5581,13 +5815,21 @@ def create_application():
             "data": data,
         }
         session.modified = True
+        profile = get_profile(data["app_type"])
+        preview_environment = build_application_environment(
+            profile, data["project"], data["host_port"], data["image"], data["timezone"],
+            database_image=data["database_image"], quarantine=bool(data.get("quarantine")),
+            bind_address=data.get("bind_address") or "0.0.0.0", expires_at=data.get("expires_at") or "",
+        )
+        compose_yaml = render_application_compose(profile, preview_environment)
         return render_professional_page(
             APPLICATION_PREVIEW,
             "Review application",
             "projects",
             data=data,
-            profile=get_profile(data["app_type"]),
+            profile=profile,
             preview_token=token,
+            compose_yaml=compose_yaml,
         )
     except Exception as exc:
         flash(str(exc), "err")
@@ -5632,7 +5874,7 @@ def write_private_application_files(data):
     atomic_write_text(folder / ".env", env_text, 0o600)
     atomic_write_text(
         folder / "docker-compose.yml",
-        render_application_compose(profile, environment),
+        data.get("compose_yaml") or render_application_compose(profile, environment),
         0o600,
     )
     atomic_write_text(
@@ -5716,10 +5958,12 @@ def restore_quarantine_database(data):
 def restore_quarantine_application_files(data):
     inspection = data.get("backup_inspection") or {}
     for item in inspection.get("files") or []:
-        if item.get("role") not in {"uploads", "n8n-data"}:
+        if item.get("role") not in {"uploads", "n8n-data", "tpm-data"}:
             raise RuntimeError("Unsupported application-file role reached restore execution.")
-        destination = (project_dir(data["project"]) / "data" if item["role"] == "n8n-data"
-                       else project_dir(data["project"]) / "application" / "site" / "uploads")
+        destination = (
+            project_dir(data["project"]) if item["role"] in {"n8n-data", "tpm-data"}
+            else project_dir(data["project"]) / "application" / "site" / "uploads"
+        )
         destination.mkdir(mode=0o700, parents=True, exist_ok=True)
         safe_extract_tar(Path(item["path"]), destination)
     if data["app_type"] == "n8n":
@@ -5874,6 +6118,22 @@ def execute_application():
         require_csrf()
         data = consume_application_preview(request.form.get("preview_token"))
         project = data["project"]
+        profile = get_profile(data["app_type"])
+        generated_environment = build_application_environment(
+            profile, project, data["host_port"], data["image"], data["timezone"],
+            database_image=data["database_image"], quarantine=bool(data.get("quarantine")),
+            bind_address=data.get("bind_address") or "0.0.0.0", expires_at=data.get("expires_at") or "",
+        )
+        generated_compose = render_application_compose(profile, generated_environment)
+        data["compose_yaml"] = validate_compose_override(
+            request.form.get("compose_yaml"), generated_compose,
+            application_compose_contract(generated_compose),
+            secret_values=tuple(
+                value for key, value in generated_environment.items()
+                if "PASSWORD" in key or "KEY" in key
+            ),
+            allowed_bind_root=f"/volume1/docker/{project}",
+        )
         job_token = create_progress_job(project, BACKUP_ROOT, kind="deployment")
         worker = threading.Thread(
             target=run_application_deployment,
@@ -6174,6 +6434,203 @@ def activity_page():
     )
 
 
+def version_sort_key(value):
+    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:-rc\.(\d+))?", str(value or "").strip())
+    if not match:
+        raise ValueError("The update contains an unsupported version number.")
+    major, minor, patch, release_candidate = match.groups()
+    return (
+        int(major), int(minor), int(patch),
+        1 if release_candidate is None else 0,
+        int(release_candidate or 0),
+    )
+
+
+def safe_update_member_name(name):
+    normalized = str(name or "").replace("\\", "/")
+    if not normalized or normalized.startswith("/") or "\x00" in normalized:
+        raise ValueError("The update ZIP contains an invalid path.")
+    parts = normalized.rstrip("/").split("/")
+    if not parts or parts[0] != "docker-app-manager" or any(part in {"", ".", ".."} for part in parts):
+        raise ValueError("Every update file must be below docker-app-manager/.")
+    return normalized
+
+
+def inspect_update_zip(zip_path, transaction_id):
+    transaction_dir = BUILDER_UPDATE_ROOT / "transactions" / transaction_id
+    staging_dir = transaction_dir / "staging"
+    package_root = staging_dir / "docker-app-manager"
+    if zip_path.stat().st_size > UPDATE_MAX_ZIP_BYTES:
+        raise ValueError("The update ZIP is larger than 64 MiB.")
+    with zipfile.ZipFile(zip_path) as archive:
+        entries = archive.infolist()
+        if not entries or len(entries) > UPDATE_MAX_FILES:
+            raise ValueError("The update ZIP has an invalid number of files.")
+        expanded = 0
+        for item in entries:
+            safe_update_member_name(item.filename)
+            mode = (item.external_attr >> 16) & 0o170000
+            if mode == stat.S_IFLNK:
+                raise ValueError("Symbolic links are not allowed in update ZIPs.")
+            expanded += item.file_size
+            if expanded > UPDATE_MAX_EXPANDED_BYTES:
+                raise ValueError("The expanded update is larger than 256 MiB.")
+        archive.extractall(staging_dir)
+    required = (
+        "app.py", "app_ui.py", "app_profiles.py", "auth_security.py", "Dockerfile",
+        "docker-compose.container-manager.yml", "requirements.txt",
+    )
+    missing = [name for name in required if not (package_root / name).is_file()]
+    if missing:
+        raise ValueError("The update ZIP is incomplete: " + ", ".join(missing))
+    app_source = (package_root / "app.py").read_text(encoding="utf-8")
+    version_match = re.search(r'^APP_VERSION\s*=\s*["\']([^"\']+)["\']', app_source, re.M)
+    if not version_match:
+        raise ValueError("The update version could not be read from app.py.")
+    target_version = version_match.group(1)
+    if version_sort_key(target_version) <= version_sort_key(APP_VERSION):
+        raise ValueError(f"The uploaded version {target_version} is not newer than {APP_VERSION}.")
+    for source in package_root.rglob("*.py"):
+        compile(source.read_text(encoding="utf-8"), str(source), "exec")
+    compose = subprocess.run(
+        ["docker", "compose", "-f", "docker-compose.container-manager.yml", "config", "--quiet"],
+        cwd=package_root, capture_output=True, text=True, timeout=60,
+    )
+    if compose.returncode:
+        raise ValueError("The update Compose file is invalid: " + tail_text(compose.stderr, 1200))
+    checksum = hashlib.sha256(zip_path.read_bytes()).hexdigest()
+    manifest = {
+        "transaction_id": transaction_id,
+        "current_version": APP_VERSION,
+        "target_version": target_version,
+        "sha256": checksum,
+        "file_count": len([item for item in entries if not item.is_dir()]),
+        "expanded_bytes": expanded,
+        "package_root": str(package_root),
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "status": "validated",
+    }
+    (transaction_dir / "status.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return manifest
+
+
+def read_update_status(transaction_id):
+    if not re.fullmatch(r"[A-Za-z0-9_-]{16,80}", str(transaction_id or "")):
+        raise ValueError("Invalid update transaction.")
+    status_path = BUILDER_UPDATE_ROOT / "transactions" / transaction_id / "status.json"
+    if not status_path.is_file():
+        raise ValueError("The update transaction no longer exists.")
+    return json.loads(status_path.read_text(encoding="utf-8"))
+
+
+def write_update_runner(transaction_id, manifest):
+    transaction_dir = BUILDER_UPDATE_ROOT / "transactions" / transaction_id
+    script_path = transaction_dir / "run-update.sh"
+    script = r'''#!/bin/sh
+set -eu
+status_file="$UPDATE_TX/status.json"
+log_file="$UPDATE_TX/update.log"
+backup_root="$UPDATE_TX/backup"
+staging_root="$UPDATE_TX/staging/docker-app-manager"
+rollback_tag="docker-app-manager:rollback-$UPDATE_ID"
+candidate_tag="docker-app-manager:candidate-$UPDATE_ID"
+write_status() {
+  python - "$status_file" "$1" "$2" <<'PY'
+import json, pathlib, sys
+p=pathlib.Path(sys.argv[1]); data=json.loads(p.read_text()); data["status"]=sys.argv[2]; data["message"]=sys.argv[3]; p.write_text(json.dumps(data,indent=2))
+PY
+}
+rollback() {
+  [ "${rollback_done:-0}" = 1 ] && return
+  rollback_done=1
+  trap - EXIT HUP INT TERM
+  if [ ! -d "$backup_root" ]; then
+    write_status failed "Candidate build failed; the active Builder was not changed."
+    return
+  fi
+  write_status rollback "Update failed; restoring the previous Builder version."
+  rm -rf "$INSTALL_ROOT.rollback"
+  mv "$INSTALL_ROOT" "$INSTALL_ROOT.rollback" 2>/dev/null || true
+  cp -a "$backup_root" "$INSTALL_ROOT"
+  docker image tag "$rollback_tag" "$BUILDER_IMAGE"
+  (cd "$INSTALL_ROOT" && docker compose -f docker-compose.container-manager.yml up -d --force-recreate --no-build) >>"$log_file" 2>&1 || true
+  write_status failed "Update failed and rollback was attempted. Review the update log."
+}
+trap 'code=$?; if [ "$code" -ne 0 ]; then rollback; fi' EXIT
+trap 'exit 1' HUP INT TERM
+write_status building "Building the candidate image without cache."
+current_id="$(docker inspect "$BUILDER_CONTAINER" --format '{{.Image}}')"
+docker image tag "$current_id" "$rollback_tag"
+docker build --pull --no-cache -t "$candidate_tag" "$staging_root" >>"$log_file" 2>&1
+write_status switching "Candidate built; replacing Builder and preserving configuration."
+rm -rf "$backup_root"
+cp -a "$INSTALL_ROOT" "$backup_root"
+saved_config="$UPDATE_TX/config-preserved"
+rm -rf "$saved_config"
+cp -a "$INSTALL_ROOT/config" "$saved_config"
+find "$INSTALL_ROOT" -mindepth 1 -maxdepth 1 ! -name config -exec rm -rf {} +
+cp -a "$staging_root"/. "$INSTALL_ROOT"/
+rm -rf "$INSTALL_ROOT/config"
+cp -a "$saved_config" "$INSTALL_ROOT/config"
+docker image tag "$candidate_tag" "$BUILDER_IMAGE"
+(cd "$INSTALL_ROOT" && docker compose -f docker-compose.container-manager.yml up -d --force-recreate --no-build) >>"$log_file" 2>&1
+write_status verifying "New container started; waiting for health and version checks."
+ok=0
+i=0
+while [ "$i" -lt 60 ]; do
+  health="$(docker inspect "$BUILDER_CONTAINER" --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{.State.Status}}{{end}}' 2>/dev/null || true)"
+  version="$(docker exec "$BUILDER_CONTAINER" python -c 'import app; print(app.APP_VERSION)' 2>/dev/null || true)"
+  if [ "$health" = healthy ] && [ "$version" = "$TARGET_VERSION" ]; then ok=1; break; fi
+  i=$((i+1)); sleep 2
+done
+if [ "$ok" -ne 1 ]; then exit 1; fi
+write_status completed "Builder was updated successfully and is healthy."
+docker image rm "$rollback_tag" "$candidate_tag" >/dev/null 2>&1 || true
+rm -rf "$INSTALL_ROOT.rollback" "$saved_config"
+trap - EXIT HUP INT TERM
+'''
+    script_path.write_text(script, encoding="utf-8")
+    script_path.chmod(0o700)
+    return script_path
+
+
+def start_update_container(transaction_id, manifest):
+    install_root = BUILDER_INSTALL_ROOT.resolve()
+    expected_parent = BASE_PATH.resolve()
+    if install_root.parent != expected_parent or install_root.name != "docker-app-manager":
+        raise ValueError("The Builder install path is not the expected managed directory.")
+    if not (install_root / "docker-compose.container-manager.yml").is_file():
+        raise ValueError("The managed Builder install directory is incomplete.")
+    transaction_dir = BUILDER_UPDATE_ROOT / "transactions" / transaction_id
+    write_update_runner(transaction_id, manifest)
+    client = docker_client()
+    try:
+        current = client.containers.get(BUILDER_CONTAINER_NAME)
+        helper = client.containers.run(
+            current.image.id,
+            ["/bin/sh", "/update/run-update.sh"],
+            name=f"docker-app-manager-updater-{transaction_id[:12]}",
+            detach=True,
+            remove=True,
+            environment={
+                "UPDATE_ID": transaction_id[:12],
+                "UPDATE_TX": "/update",
+                "INSTALL_ROOT": str(install_root),
+                "BUILDER_CONTAINER": BUILDER_CONTAINER_NAME,
+                "BUILDER_IMAGE": BUILDER_IMAGE_NAME,
+                "TARGET_VERSION": manifest["target_version"],
+            },
+            volumes={
+                "/var/run/docker.sock": {"bind": "/var/run/docker.sock", "mode": "rw"},
+                str(BASE_PATH.resolve()): {"bind": str(BASE_PATH.resolve()), "mode": "rw"},
+                str(transaction_dir.resolve()): {"bind": "/update", "mode": "rw"},
+            },
+        )
+        return helper.name
+    finally:
+        close_docker_client(client)
+
+
 @app.route("/settings", methods=["GET"])
 def settings_page():
     auth = {
@@ -6200,7 +6657,102 @@ def settings_page():
         default_cookie_secure=DEFAULT_SESSION_COOKIE_SECURE,
         max_scan_entries=MAX_SCAN_ENTRIES,
         operation_modes=OPERATION_MODES,
+        update_preview=session.get("pending_builder_update"),
     )
+
+
+@app.route("/settings/update/inspect", methods=["POST"])
+def inspect_builder_update_route():
+    transaction_dir = None
+    try:
+        require_csrf()
+        upload = request.files.get("update_zip")
+        if not upload or not str(upload.filename or "").lower().endswith(".zip"):
+            raise ValueError("Select a Docker App Manager release ZIP.")
+        transaction_id = secrets.token_urlsafe(18).replace("-", "_")
+        transaction_dir = BUILDER_UPDATE_ROOT / "transactions" / transaction_id
+        transaction_dir.mkdir(parents=True, mode=0o700)
+        zip_path = transaction_dir / "release.zip"
+        total = 0
+        with zip_path.open("wb") as destination:
+            while True:
+                chunk = upload.stream.read(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > UPDATE_MAX_ZIP_BYTES:
+                    raise ValueError("The update ZIP is larger than 64 MiB.")
+                destination.write(chunk)
+        manifest = inspect_update_zip(zip_path, transaction_id)
+        session["pending_builder_update"] = manifest
+        session.modified = True
+        flash(f"Version {manifest['target_version']} passed the update checks.", "ok")
+    except Exception as exc:
+        if transaction_dir and transaction_dir.is_dir():
+            shutil.rmtree(transaction_dir, ignore_errors=True)
+        flash(str(exc), "err")
+    return redirect(url_for("settings_page") + "#builder-update")
+
+
+@app.route("/settings/update/execute", methods=["POST"])
+def execute_builder_update_route():
+    transaction_id = ""
+    try:
+        require_csrf()
+        pending = session.get("pending_builder_update") or {}
+        transaction_id = str(request.form.get("transaction_id") or "")
+        if not pending or not hmac.compare_digest(str(pending.get("transaction_id", "")), transaction_id):
+            raise ValueError("The validated update preview is missing or expired.")
+        previous_manifest = read_update_status(transaction_id)
+        if previous_manifest.get("sha256") != pending.get("sha256") or previous_manifest.get("status") != "validated":
+            raise ValueError("The staged update no longer matches the validated preview.")
+        transaction_dir = BUILDER_UPDATE_ROOT / "transactions" / transaction_id
+        shutil.rmtree(transaction_dir / "staging", ignore_errors=True)
+        manifest = inspect_update_zip(transaction_dir / "release.zip", transaction_id)
+        if (
+            not hmac.compare_digest(str(manifest.get("sha256", "")), str(pending.get("sha256", "")))
+            or manifest.get("target_version") != pending.get("target_version")
+        ):
+            raise ValueError("The update ZIP changed after inspection; upload it again.")
+        manifest["status"] = "starting"
+        manifest["message"] = "Starting the temporary updater container."
+        status_path = BUILDER_UPDATE_ROOT / "transactions" / transaction_id / "status.json"
+        status_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        helper_name = start_update_container(transaction_id, manifest)
+        session.pop("pending_builder_update", None)
+        session.modified = True
+        return redirect(url_for("builder_update_status_page", transaction_id=transaction_id))
+    except Exception as exc:
+        try:
+            if transaction_id:
+                failed = read_update_status(transaction_id)
+                failed.update(status="failed", message=f"The updater could not start: {exc}")
+                (BUILDER_UPDATE_ROOT / "transactions" / transaction_id / "status.json").write_text(
+                    json.dumps(failed, indent=2), encoding="utf-8"
+                )
+        except Exception:
+            pass
+        flash(str(exc), "err")
+        return redirect(url_for("settings_page") + "#builder-update")
+
+
+@app.route("/settings/update/status/<transaction_id>", methods=["GET"])
+def builder_update_status_page(transaction_id):
+    try:
+        status = read_update_status(transaction_id)
+    except ValueError as exc:
+        abort(404, str(exc))
+    return render_professional_page(
+        UPDATE_STATUS, "Builder update", "settings", update=status,
+    )
+
+
+@app.route("/api/settings/update/status/<transaction_id>", methods=["GET"])
+def builder_update_status_api(transaction_id):
+    try:
+        return jsonify(read_update_status(transaction_id))
+    except ValueError as exc:
+        return jsonify({"status": "missing", "message": str(exc)}), 404
 
 
 @app.after_request

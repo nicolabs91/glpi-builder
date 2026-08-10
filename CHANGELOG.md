@@ -1,5 +1,69 @@
 # Changelog
 
+## 0.5.0-rc.15
+
+- Restore the proven GLPI YAML and entrypoint byte for byte for isolated restores; do not rewrite the image's Supervisor configuration.
+- Keep isolated differences limited to a new project/database, selected local images, `GLPI_CRONTAB_ENABLED=0`, an internal Docker network, and cleanup of copied runtime logs.
+- Prevent edited isolated YAML from removing either the internal network or disabled GLPI cron setting.
+
+## 0.5.0-rc.14
+
+- Fully disable the Supervisor `glpi-cron` program for GLPI isolated restores, instead of leaving the image's disabled worker visible as a running process.
+- Keep the normal GLPI Compose output byte-for-byte unchanged while retaining the isolated internal network and disabled automatic actions.
+
+## 0.5.0-rc.13
+
+- Restored the proven GLPI Supervisor/stdout contract for both normal and isolated containers; isolated mode no longer substitutes private dispatcher files that prevent Apache from starting as UID 33.
+- Kept isolated differences limited to the new project/database, internal network, disabled GLPI cron, and cleanup of restored runtime logs.
+
+## 0.5.0-rc.12
+
+- Fixed GLPI isolated containers that restarted with a Supervisor HTTP/control-socket `EACCES` error by removing unused Supervisor control-server sections before startup.
+- Disabled the GLPI cron worker for isolated restores and cleared restored runtime log/cron files from the isolated copy, preventing historical production mail messages from appearing as new activity.
+- Kept the original verified backup immutable; runtime cleanup applies only to the newly restored test project.
+
+## 0.5.0-rc.11
+
+- Fix GLPI isolated restores that restarted with a permission error while
+  Supervisor tried to write `/var/log/supervisor/supervisord.log` after
+  dropping privileges.
+- Move Supervisor's logfile, pidfile and child-log directory to writable
+  `/tmp` paths without granting the container superuser bypasses.
+- Add regression coverage for the generated isolated Compose startup command.
+
+## 0.5.0-rc.10
+
+- Add a two-step self-update workflow under Settings: upload and inspect a
+  newer release ZIP before explicitly confirming any change.
+- Reject oversized, incomplete, same/older-version, path-traversal and symlink
+  archives; compile Python sources and validate Compose from isolated staging.
+- Run the actual replacement in a temporary updater container based on the
+  current Builder image, preserving the persistent config directory.
+- Build the candidate image with `--pull --no-cache`, then verify container
+  health and the exact application version after replacement.
+- Restore the previous source tree and image automatically when build, start,
+  health or version verification fails; the updater removes itself afterward.
+
+## 0.5.0-rc.9
+
+- Replace separate normal-restore source choices with one application-scoped,
+  manifest- and SHA-256-verified **Backup set** selector for GLPI, n8n and TPM.
+- Automatically link matching database, application data/configuration,
+  plugins/uploads and required secrets from the selected immutable set.
+- Show verified set components in the review screen and block incomplete,
+  cross-application or checksum-mismatched sets.
+- Keep loose older files available only under a clearly separated Legacy
+  restore section.
+
+## 0.5.0-rc.8
+
+- Always show the generated Docker Compose YAML before a new GLPI, TPM or n8n
+  deployment or restore.
+- Allow administrators to edit the YAML while enforcing required services,
+  images, project volumes, secret placeholders and isolated-restore networks.
+- Reject privileged host capabilities, Docker-socket mounts, external bind
+  mounts and literal generated credentials before execution.
+
 ## 0.5.0-rc.7
 
 - Show TPM and n8n deployments on the same live, stage-by-stage progress page
