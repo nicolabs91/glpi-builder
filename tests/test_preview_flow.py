@@ -62,7 +62,7 @@ class PreviewFlowTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertIn(b"Review the execution plan", response.data)
-        self.assertIn(b"<div>0.5.0-rc.16</div>", response.data)
+        self.assertIn(b"<div>0.5.0-rc.17</div>", response.data)
         self.assertNotIn(b"nothing has been changed yet", response.data)
         self.assertIn(b"glpi-preview-test", response.data)
         self.assertIn(b"Fresh installation", response.data)
@@ -124,6 +124,8 @@ class PreviewFlowTest(unittest.TestCase):
         self.assertEqual(progress_response.status_code, 200)
         self.assertIn(b"Completed", progress_response.data)
         self.assertIn(b"100%", progress_response.data)
+        self.assertIn(b"Open application", progress_response.data)
+        self.assertIn(b":18775", progress_response.data)
         with self.client.session_transaction() as flask_session:
             self.assertNotIn("pending_create_preview", flask_session)
 

@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.0-rc.17
+
+- Fix application links so they use the NAS/public host and the published GLPI port, without reusing the Docker App Manager management port.
+- Preserve the selected web port on completed deployment progress pages and expose a working Open GLPI/application link.
+- Make backup manifest generation safe for older configurations where `APP_IMAGE` is unset.
+- Accept complete HTTPS public-host URLs for reverse-proxy deployments.
+
 ## 0.5.0-rc.16
 
 - Use the canonical early GLPI Compose YAML as the single source for normal and isolated test restores. Isolated mode now applies only the documented internal-network and cron substitutions.

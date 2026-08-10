@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import os
 import sys
 import tempfile
 import unittest
@@ -26,7 +27,7 @@ class UiLanguageAndProgressTest(unittest.TestCase):
         authenticate(self.client, module)
 
     def test_dashboard_is_english(self):
-        self.assertEqual(module.APP_VERSION, "0.5.0-rc.16")
+        self.assertEqual(module.APP_VERSION, "0.5.0-rc.17")
         with patch.object(module, "discover_projects", return_value=[]), \
              patch.object(module, "scan_backup_choices", return_value={"database": [], "files": []}), \
              patch.object(module, "suggest_free_host_port", return_value=18888), \
@@ -44,7 +45,7 @@ class UiLanguageAndProgressTest(unittest.TestCase):
         self.assertIn(b'aria-label="Primary"', response.data)
         self.assertIn(b'aria-label="Mobile navigation"', response.data)
         self.assertIn(b"font:inherit", response.data)
-        self.assertIn(b'class="version">0.5.0-rc.16</span>', response.data)
+        self.assertIn(b'class="version">0.5.0-rc.17</span>', response.data)
         self.assertIn(b'<html lang="en">', response.data)
 
     def test_project_management_is_moved_to_project_detail(self):
@@ -122,7 +123,7 @@ class UiLanguageAndProgressTest(unittest.TestCase):
         self.assertIn(b'http-equiv="refresh"', response.data)
         self.assertIn(b"Restoring database", response.data)
         self.assertIn(b"57%", response.data)
-        self.assertIn(b"<div>0.5.0-rc.16</div>", response.data)
+        self.assertIn(b"<div>0.5.0-rc.17</div>", response.data)
         self.assertNotIn(b"0.2 \xc2\xb7 project", response.data)
 
     def test_obsolete_local_ui_preview_button_is_absent(self):
@@ -243,13 +244,44 @@ class UiLanguageAndProgressTest(unittest.TestCase):
             self.assertFalse(module.is_managed_glpi_project(unrelated_project, base_path=base_path))
 
     def test_completed_progress_page_stops_refreshing(self):
-        token = module.create_progress_job("glpi-progress-test", module.BACKUP_ROOT)
+        token = module.create_progress_job(
+            "glpi-progress-test", module.BACKUP_ROOT, target_port=18775
+        )
         module.update_progress_job(token, 100, "Completed", status="completed")
 
         response = self.client.get(f"/progress/{token}")
         self.assertEqual(response.status_code, 200)
         self.assertNotIn(b'http-equiv="refresh"', response.data)
         self.assertIn(b"100%", response.data)
+        self.assertIn(b"Open application", response.data)
+        self.assertIn(b":18775", response.data)
+
+    def test_application_url_uses_public_host_without_manager_port(self):
+        with self.client:
+            response = self.client.get(
+                "/progress/missing", base_url="http://nas1473.example:5055"
+            )
+            self.assertEqual(response.status_code, 302)
+            self.assertEqual(
+                module.application_url(18775), "http://nas1473.example:18775"
+            )
+
+    def test_application_url_supports_ipv6(self):
+        with self.client:
+            self.client.get("/progress/missing", base_url="http://[2001:db8::7]:5055")
+            self.assertEqual(
+                module.application_url(18775), "http://[2001:db8::7]:18775"
+            )
+
+    def test_application_url_accepts_public_https_url(self):
+        with patch.dict(
+            os.environ,
+            {"BUILDER_PUBLIC_HOST": "https://glpi.example.test/ignored/path"},
+            clear=False,
+        ):
+            self.assertEqual(
+                module.application_url(18775), "https://glpi.example.test:18775"
+            )
 
 
 if __name__ == "__main__":

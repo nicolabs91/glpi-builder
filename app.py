@@ -60,7 +60,7 @@ from app_profiles import (
     validate_project_name as validate_application_project,
 )
 
-APP_VERSION = "0.5.0-rc.16"
+APP_VERSION = "0.5.0-rc.17"
 UPDATE_MAX_ZIP_BYTES = 64 * 1024 * 1024
 UPDATE_MAX_EXPANDED_BYTES = 256 * 1024 * 1024
 UPDATE_MAX_FILES = 2000
@@ -2579,7 +2579,7 @@ def consume_create_preview(token):
     return pending["data"]
 
 
-def create_progress_job(project, backup_root, kind="restore"):
+def create_progress_job(project, backup_root, kind="restore", target_port=None):
     kind = str(kind or "restore").strip().lower()
     if kind not in {"restore", "backup", "deployment"}:
         raise ValueError("Progress job kind must be restore, backup or deployment.")
@@ -2601,6 +2601,7 @@ def create_progress_job(project, backup_root, kind="restore"):
         "finished_at": 0,
         "log_name": "",
         "error": "",
+        "target_port": str(validate_port(target_port, "Web port")) if target_port is not None else "",
     }
     with PROGRESS_LOCK:
         cutoff = now - PROGRESS_JOB_TTL_SECONDS
@@ -4175,7 +4176,7 @@ progress{display:block;width:100%;height:24px;margin:16px 0;accent-color:var(--b
 <section class="card"><span class="status {{ job.status }}">{{ job.status|capitalize }}</span><h2 style="margin-top:14px">{{ job.stage }}</h2><div class="percent">{{ job.percent }}%</div><progress max="100" value="{{ job.percent }}">{{ job.percent }}%</progress><p class="meta">Elapsed time: {{ elapsed }} seconds{% if job.status in ['queued','running'] %} · this page refreshes automatically{% endif %}</p></section>
 {% if job.error %}<section class="card"><h2>Error</h2><div class="error">{{ job.error }}</div></section>{% endif %}
 <section class="card"><h2>Activity</h2><ol class="timeline">{% for message in job.messages %}<li>{{ message }}</li>{% endfor %}</ol></section>
-<section class="card"><div class="actions"><a class="button secondary" href="{{ url_for('index') }}#projects">Dashboard</a>{% if job.log_name %}<a class="button" href="{{ url_for('view_log', project=job.project, filename=job.log_name) }}">Open full log</a>{% endif %}</div></section>
+<section class="card"><div class="actions"><a class="button secondary" href="{{ url_for('index') }}#projects">Dashboard</a>{% if job.status == 'completed' and job.target_port %}<a class="button" href="{{ application_url(job.target_port) }}" target="_blank" rel="noopener">Open application ↗</a>{% endif %}{% if job.log_name %}<a class="button" href="{{ url_for('view_log', project=job.project, filename=job.log_name) }}">Open full log</a>{% endif %}</div></section>
 </main></body></html>"""
 
 
@@ -4263,7 +4264,7 @@ def execute_create():
         )
         project = data["project"]
         project_for_log = project
-        job_token = create_progress_job(project, backup_root)
+        job_token = create_progress_job(project, backup_root, target_port=data["host_port"])
         worker = threading.Thread(
             target=run_create_job,
             args=(job_token, data),
@@ -5415,6 +5416,47 @@ def suggested_management_address():
     except ValueError:
         pass
     return "127.0.0.1"
+
+
+def application_url(port):
+    """Build a browser URL for a published application port.
+
+    The application manager and GLPI normally share the NAS host but not the
+    management port.  Do not copy ``request.host`` verbatim: it contains the
+    manager's port and is also ambiguous for IPv6 hosts.  A public host can be
+    set explicitly for reverse-proxy deployments; otherwise use the validated
+    host from the current request.
+    """
+    port = validate_port(port, "Application port")
+    public_host = os.environ.get("BUILDER_PUBLIC_HOST", "").strip()
+    configured_scheme = ""
+    if public_host:
+        if "://" in public_host:
+            parsed_public_host = urlsplit(public_host)
+            configured_scheme = parsed_public_host.scheme.lower()
+            candidate = parsed_public_host.netloc
+        else:
+            candidate = public_host
+    elif has_request_context():
+        candidate = request.host
+    else:
+        candidate = "127.0.0.1"
+
+    parsed = urlsplit(f"//{candidate}")
+    hostname = parsed.hostname
+    if not hostname:
+        raise ValueError("The application host is unavailable.")
+    if ":" in hostname and not hostname.startswith("["):
+        hostname = f"[{hostname}]"
+    scheme = os.environ.get(
+        "BUILDER_APPLICATION_SCHEME", configured_scheme or "http"
+    ).strip().lower()
+    if scheme not in {"http", "https"}:
+        scheme = "http"
+    return f"{scheme}://{hostname}:{port}"
+
+
+app.jinja_env.globals["application_url"] = application_url
 
 
 def validate_bind_address(value, *, quarantine=False):
