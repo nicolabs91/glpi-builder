@@ -60,7 +60,7 @@ from app_profiles import (
     validate_project_name as validate_application_project,
 )
 
-APP_VERSION = "0.5.0-rc.18"
+APP_VERSION = "0.5.0-rc.19"
 UPDATE_MAX_ZIP_BYTES = 64 * 1024 * 1024
 UPDATE_MAX_EXPANDED_BYTES = 256 * 1024 * 1024
 UPDATE_MAX_FILES = 2000
@@ -2096,6 +2096,48 @@ def ensure_network(project, internal=False):
         return cli.networks.create(name, driver="bridge", internal=bool(internal))
 
 
+def prepare_compose_network(project, internal=True):
+    """Let Compose own a managed network and repair an empty legacy network.
+
+    Older restore paths created the network through the Docker API.  Compose
+    refuses to reuse such a network because it lacks the
+    ``com.docker.compose.network`` label.  An empty legacy network is safe to
+    remove; Compose will recreate it from the saved YAML with the required
+    ownership labels and network isolation setting.
+    """
+    name = f"{project}-network"
+    try:
+        network = docker_client().networks.get(name)
+    except NotFound:
+        return f"Compose will create isolated network: {name}"
+
+    network.reload()
+    attrs = network.attrs or {}
+    expected_internal = bool(internal)
+    if bool(attrs.get("Internal")) != expected_internal:
+        raise RuntimeError(
+            f"Docker network {name} has internal={bool(attrs.get('Internal'))}; "
+            f"expected internal={expected_internal}."
+        )
+
+    labels = attrs.get("Labels") or {}
+    compose_owned = (
+        labels.get("com.docker.compose.project") == project
+        and labels.get("com.docker.compose.network") == name
+    )
+    if compose_owned:
+        return f"Checked Compose-owned isolated network: {name}"
+
+    if attrs.get("Containers"):
+        raise RuntimeError(
+            f"Docker network {name} is not owned by this Compose project and "
+            "still has connected containers; refusing to remove it."
+        )
+
+    network.remove()
+    return f"Removed empty legacy network so Compose can recreate it: {name}"
+
+
 def ensure_container_network(project, container_name, internal=False):
     cli = docker_client()
     net = ensure_network(project, internal=internal)
@@ -3638,8 +3680,11 @@ def create_or_restore(
         messages.append(prepare_fresh_install(project))
         messages.append(fix_permissions(project))
     report(26, "Preparing network", "Checking the isolated Docker network.")
-    ensure_network(project, internal=isolated_restore)
-    messages.append(f"Checked network: {project}-network")
+    if isolated_restore:
+        messages.append(prepare_compose_network(project, internal=True))
+    else:
+        ensure_network(project, internal=False)
+        messages.append(f"Checked network: {project}-network")
 
     report(36, "Database container", "Checking or rebuilding the database container.")
     if isolated_restore:
@@ -6089,6 +6134,8 @@ def run_application_deployment(job_token, data):
         assert_docker_port_free(data["host_port"])
         update_progress_job(job_token, 28, "Preparing project", "Creating private configuration and persistent application directories.")
         profile = write_private_application_files(data)
+        if data.get("quarantine"):
+            prepare_compose_network(project, internal=True)
         update_progress_job(job_token, 38, "Validating configuration", "Validating the generated Docker Compose configuration.")
         validation = subprocess.run(
             ["docker", "compose", "-f", "docker-compose.yml", "config", "--quiet"],

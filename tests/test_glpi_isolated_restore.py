@@ -11,6 +11,57 @@ import app as module
 
 
 class GlpiIsolatedRestoreTest(unittest.TestCase):
+    def test_empty_legacy_network_is_removed_before_compose_start(self):
+        network = MagicMock()
+        network.attrs = {
+            "Internal": True,
+            "Labels": {},
+            "Containers": {},
+        }
+        client = MagicMock()
+        client.networks.get.return_value = network
+
+        with patch.object(module, "docker_client", return_value=client):
+            result = module.prepare_compose_network("glpi-isolated", internal=True)
+
+        network.remove.assert_called_once_with()
+        self.assertIn("Compose can recreate", result)
+
+    def test_connected_unowned_network_is_not_removed(self):
+        network = MagicMock()
+        network.attrs = {
+            "Internal": True,
+            "Labels": {},
+            "Containers": {"container-id": {"Name": "unexpected"}},
+        }
+        client = MagicMock()
+        client.networks.get.return_value = network
+
+        with patch.object(module, "docker_client", return_value=client), \
+             self.assertRaisesRegex(RuntimeError, "connected containers"):
+            module.prepare_compose_network("glpi-isolated", internal=True)
+
+        network.remove.assert_not_called()
+
+    def test_compose_owned_network_is_preserved(self):
+        network = MagicMock()
+        network.attrs = {
+            "Internal": True,
+            "Labels": {
+                "com.docker.compose.project": "glpi-isolated",
+                "com.docker.compose.network": "glpi-isolated-network",
+            },
+            "Containers": {},
+        }
+        client = MagicMock()
+        client.networks.get.return_value = network
+
+        with patch.object(module, "docker_client", return_value=client):
+            result = module.prepare_compose_network("glpi-isolated", internal=True)
+
+        network.remove.assert_not_called()
+        self.assertIn("Compose-owned", result)
+
     def test_isolated_services_are_started_from_saved_compose_yaml(self):
         completed = MagicMock(returncode=0, stdout="started", stderr="")
         with tempfile.TemporaryDirectory() as root, \

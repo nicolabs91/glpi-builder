@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.0-rc.19
+
+- Repair isolated restores for GLPI, n8n and Team Password Manager when an
+  empty Docker-API-created network from an earlier attempt lacks Compose
+  ownership labels. Compose now recreates the network itself with the required
+  labels and internal isolation setting.
+
 ## 0.5.0-rc.18
 
 - Start isolated GLPI database and application services from the saved canonical `docker-compose.yml` instead of recreating them through separate Docker API calls.
