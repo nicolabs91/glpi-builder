@@ -97,6 +97,8 @@ services:
         exec /opt/glpi/entrypoint.sh /usr/bin/supervisord -c /etc/supervisor/supervisord.conf
 
 
+
+
 networks:
   glpi-contract-test-network:
     name: glpi-contract-test-network

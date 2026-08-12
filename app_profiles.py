@@ -180,6 +180,36 @@ def render_compose(profile: AppProfile, env: dict, base_path: str = "/volume1/do
       - no-new-privileges:true
     pids_limit: 256
     mem_limit: 1g''' if quarantine else ""
+    if quarantine:
+        port_block = ""
+        proxy_block = f'''  {project}-ingress:
+    image: alpine/socat:1.8.0.3
+    container_name: {project}-ingress
+    restart: unless-stopped
+    command: ["TCP-LISTEN:{profile.internal_port},fork,reuseaddr", "TCP:{project}:{profile.internal_port}"]
+    depends_on: [{project}]
+    ports:
+      - target: {profile.internal_port}
+        published: "${{APP_HTTP_PORT}}"
+        host_ip: ${{APP_BIND_ADDRESS}}
+        protocol: tcp
+    read_only: true
+    security_opt: [no-new-privileges:true]
+    cap_drop: [ALL]
+    networks: [{project}-network, {project}-ingress]
+'''
+        ingress_network = f'''  {project}-ingress:
+    name: {project}-ingress
+    driver: bridge
+'''
+    else:
+        port_block = f'''    ports:
+      - target: {profile.internal_port}
+        published: "${{APP_HTTP_PORT}}"
+        host_ip: ${{APP_BIND_ADDRESS}}
+        protocol: tcp'''
+        proxy_block = ""
+        ingress_network = ""
     if profile.key == "n8n":
         postgres_mount = postgres_data_mount_target(env.get("DATABASE_IMAGE", ""))
         return f'''services:
@@ -205,11 +235,7 @@ def render_compose(profile: AppProfile, env: dict, base_path: str = "/volume1/do
     container_name: {project}
     restart: unless-stopped
     env_file: [.env]
-    ports:
-      - target: 5678
-        published: "${{APP_HTTP_PORT}}"
-        host_ip: ${{APP_BIND_ADDRESS}}
-        protocol: tcp{security_options}
+{port_block}{security_options}
     environment:
       DB_TYPE: postgresdb
       DB_POSTGRESDB_HOST: {project}-db
@@ -225,11 +251,11 @@ def render_compose(profile: AppProfile, env: dict, base_path: str = "/volume1/do
       {project}-db:
         condition: service_healthy
     networks: [{project}-network]
-networks:
+{proxy_block}networks:
   {project}-network:
     name: {project}-network
     driver: bridge{network_options}
-'''
+{ingress_network}'''
     return f'''services:
   {project}-db:
     image: ${{DATABASE_IMAGE}}
@@ -254,11 +280,7 @@ networks:
     container_name: {project}
     restart: unless-stopped
     env_file: [.env]
-    ports:
-      - target: 80
-        published: "${{APP_HTTP_PORT}}"
-        host_ip: ${{APP_BIND_ADDRESS}}
-        protocol: tcp{security_options}
+{port_block}{security_options}
     environment:
       TPM_SERVER_TIMEZONE: ${{TZ}}
       TPM_PHP_TIMEZONE: ${{TZ}}
@@ -276,11 +298,11 @@ networks:
       {project}-db:
         condition: service_healthy
     networks: [{project}-network]
-networks:
+{proxy_block}networks:
   {project}-network:
     name: {project}-network
     driver: bridge{network_options}
-'''
+{ingress_network}'''
 
 
 def manifest(profile: AppProfile, env: dict) -> dict:

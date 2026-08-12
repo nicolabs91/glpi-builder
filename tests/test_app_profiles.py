@@ -73,6 +73,10 @@ class ApplicationProfileTests(unittest.TestCase):
         self.assertIn("internal: true", compose)
         self.assertIn("host_ip: ${APP_BIND_ADDRESS}", compose)
         self.assertIn('target: 80', compose)
+        self.assertIn("passwords-test-ingress", compose)
+        self.assertIn("alpine/socat:1.8.0.3", compose)
+        app_section = compose.split("  passwords-test:", 1)[1].split("  passwords-test-ingress:", 1)[0]
+        self.assertNotIn("ports:", app_section)
         self.assertIn("no-new-privileges:true", compose)
         self.assertIn("pids_limit: 256", compose)
         self.assertIn("mem_limit: 1g", compose)

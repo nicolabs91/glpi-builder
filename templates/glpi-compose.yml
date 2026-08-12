@@ -34,11 +34,7 @@ services:
     depends_on:
       - __PROJECT__-db
 
-    ports:
-      - target: 8080
-        published: "${GLPI_HTTP_PORT}"
-        host_ip: 0.0.0.0
-        protocol: tcp
+__APP_PORTS__
 
     volumes:
       - /volume1/docker/__PROJECT__/glpi:/var/glpi:rw
@@ -72,8 +68,11 @@ services:
       - |
         __ENTRYPOINT__
 
+__INGRESS_SERVICE__
+
 
 networks:
   __PROJECT__-network:
     name: __PROJECT__-network
     driver: bridge__INTERNAL_NETWORK__
+__INGRESS_NETWORK__

@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.0-rc.21
+
+- Publish isolated application ports through a hardened ingress proxy on a
+  separate bridge network. Application and database containers remain only on
+  the internal network, while Synology Docker can activate the LAN port.
+
 ## 0.5.0-rc.20
 
 - Bind isolated and profile application web ports explicitly to `0.0.0.0` (or

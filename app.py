@@ -60,7 +60,7 @@ from app_profiles import (
     validate_project_name as validate_application_project,
 )
 
-APP_VERSION = "0.5.0-rc.20"
+APP_VERSION = "0.5.0-rc.21"
 UPDATE_MAX_ZIP_BYTES = 64 * 1024 * 1024
 UPDATE_MAX_EXPANDED_BYTES = 256 * 1024 * 1024
 UPDATE_MAX_FILES = 2000
@@ -1982,6 +1982,41 @@ def render_glpi_compose(project, env):
     # keeps the original single-dollar shell script.
     entrypoint_script = indent_text(GLPI_ENTRY_COMMAND.replace("$", "$$"), 8)
     isolated = env.get("BUILDER_QUARANTINE") == "1"
+    if isolated:
+        app_ports = ""
+        ingress_service = f'''  {project}-ingress:
+    image: alpine/socat:1.8.0.3
+    container_name: {project}-ingress
+    restart: unless-stopped
+    command: ["TCP-LISTEN:8080,fork,reuseaddr", "TCP:{project}:8080"]
+    depends_on:
+      - {project}
+    ports:
+      - target: 8080
+        published: "${{GLPI_HTTP_PORT}}"
+        host_ip: 0.0.0.0
+        protocol: tcp
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop: [ALL]
+    networks:
+      - {project}-network
+      - {project}-ingress
+'''
+        ingress_network = f'''  {project}-ingress:
+    name: {project}-ingress
+    driver: bridge
+'''
+    else:
+        app_ports = '''    ports:
+      - target: 8080
+        published: "${GLPI_HTTP_PORT}"
+        host_ip: 0.0.0.0
+        protocol: tcp
+'''
+        ingress_service = ""
+        ingress_network = ""
     return (
         GLPI_COMPOSE_TEMPLATE
         .replace("__PROJECT__", str(project))
@@ -1990,6 +2025,9 @@ def render_glpi_compose(project, env):
         .replace("__GLPI_CRONTAB_ENABLED__", "0" if isolated else "1")
         .replace("        __ENTRYPOINT__", entrypoint_script)
         .replace("__INTERNAL_NETWORK__", "\n    internal: true" if isolated else "")
+        .replace("__APP_PORTS__", app_ports.rstrip())
+        .replace("__INGRESS_SERVICE__", ingress_service.rstrip())
+        .replace("__INGRESS_NETWORK__", ingress_network.rstrip())
     ).rstrip("\n") + "\n"
 
 
@@ -3602,9 +3640,9 @@ def verify_glpi_port_binding(project, host_port):
     NAS.  The latter is therefore the source of truth for isolated restores.
     """
     expected_port = validate_port(host_port, "GLPI_HTTP_PORT")
-    container = get_container(project)
+    container = get_container(f"{project}-ingress") or get_container(project)
     if not container:
-        raise RuntimeError(f"GLPI port proof failed: missing container {project}.")
+        raise RuntimeError(f"GLPI port proof failed: missing ingress container for {project}.")
     container.reload()
     bindings = (container.attrs.get("NetworkSettings", {}).get("Ports", {}) or {}).get("8080/tcp") or []
     published = {
@@ -3624,7 +3662,7 @@ def verify_application_port(project, host_port, container_port):
     """Verify that a profile app has an active host-to-container port map."""
     expected_host = validate_port(host_port, "APP_HTTP_PORT")
     expected_container = int(container_port)
-    container = get_container(project)
+    container = get_container(f"{project}-ingress") or get_container(project)
     if not container:
         raise RuntimeError(f"Application port proof failed: missing container {project}.")
     container.reload()
@@ -3805,6 +3843,15 @@ def verify_glpi_isolated_restore(project, data):
             raise RuntimeError(f"GLPI isolated restore proof failed: {container_name} has unexpected networks.")
         if container.status != "running":
             raise RuntimeError(f"GLPI isolated restore proof failed: {container_name} is not running.")
+    ingress = get_container(f"{project}-ingress")
+    if not ingress:
+        raise RuntimeError("GLPI isolated restore proof failed: missing ingress proxy.")
+    ingress.reload()
+    ingress_networks = set((ingress.attrs.get("NetworkSettings", {}).get("Networks", {}) or {}).keys())
+    if ingress_networks != {network_name, f"{project}-ingress"}:
+        raise RuntimeError("GLPI isolated restore proof failed: ingress proxy has unexpected networks.")
+    if ingress.status != "running":
+        raise RuntimeError("GLPI isolated restore proof failed: ingress proxy is not running.")
     config_file = project_dir(project) / "glpi" / "config" / "config_db.php"
     if not config_file.is_file() or f"{project}-db" not in config_file.read_text(encoding="utf-8", errors="replace"):
         raise RuntimeError("GLPI isolated restore proof failed: config_db.php does not target the isolated database.")
@@ -6108,6 +6155,16 @@ def verify_quarantine_restore(data):
         networks = {}
     if set(networks) != {network}:
         raise RuntimeError("Quarantine proof failed: application is attached to an unexpected Docker network.")
+    ingress = subprocess.run(
+        ["docker", "inspect", f"{project}-ingress", "--format", "{{json .NetworkSettings.Networks}}"],
+        capture_output=True, text=True, timeout=30,
+    )
+    try:
+        ingress_networks = json.loads(ingress.stdout) if ingress.returncode == 0 else {}
+    except json.JSONDecodeError:
+        ingress_networks = {}
+    if set(ingress_networks) != {network, f"{project}-ingress"}:
+        raise RuntimeError("Quarantine proof failed: ingress proxy networks are incorrect.")
     database_service = f"{project}-db"
     count_shell = ('exec psql -At -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=\'public\'"'
                    if data["app_type"] == "n8n" else

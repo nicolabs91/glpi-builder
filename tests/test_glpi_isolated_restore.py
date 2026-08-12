@@ -121,6 +121,10 @@ class GlpiIsolatedRestoreTest(unittest.TestCase):
         self.assertNotIn("autostart=false", compose)
         self.assertNotIn("autorestart=false", compose)
         self.assertIn('host_ip: 0.0.0.0', compose)
+        self.assertIn("glpi-isolated-ingress", compose)
+        self.assertIn("alpine/socat:1.8.0.3", compose)
+        app_section = compose.split("  glpi-isolated:", 1)[1].split("  glpi-isolated-ingress:", 1)[0]
+        self.assertNotIn("ports:", app_section)
         self.assertIn('SAMESITE="$${GLPI_SESSION_COOKIE_SAMESITE:-Lax}"', compose)
         self.assertIn('for dir in /etc/php/*/apache2/conf.d', compose)
         self.assertNotIn('for dir in /etc/php/*/apache2/conf.d; do\n  if [ -d "" ]', compose)
@@ -143,7 +147,7 @@ class GlpiIsolatedRestoreTest(unittest.TestCase):
         expected = module.indent_text(module.GLPI_ENTRY_COMMAND.replace("$", "$$"), 8)
         self.assertIn("      - |\n" + expected + "\n", compose)
 
-    def test_isolated_yaml_diff_is_limited_to_two_isolation_lines(self):
+    def test_isolated_yaml_adds_ingress_without_exposing_app_container(self):
         normal_env = module.build_env(
             "glpi-compare", "glpi/glpi:11.0.8", "mariadb:11.4",
             18080, 8080, "Europe/Brussels", True, isolated_restore=False,
@@ -152,10 +156,12 @@ class GlpiIsolatedRestoreTest(unittest.TestCase):
         normal = module.render_glpi_compose("glpi-compare", normal_env)
         isolated = module.render_glpi_compose("glpi-compare", isolated_env)
 
-        normalized = isolated.replace(
-            'GLPI_CRONTAB_ENABLED: "0"', 'GLPI_CRONTAB_ENABLED: "1"',
-        ).replace("    driver: bridge\n    internal: true\n", "    driver: bridge\n")
-        self.assertEqual(normalized, normal)
+        self.assertIn("glpi-compare-ingress", isolated)
+        self.assertNotIn("glpi-compare-ingress", normal)
+        isolated_app = isolated.split("  glpi-compare:", 1)[1].split("  glpi-compare-ingress:", 1)[0]
+        normal_app = normal.split("  glpi-compare:", 1)[1].split("networks:", 1)[0]
+        self.assertNotIn("ports:", isolated_app)
+        self.assertIn("ports:", normal_app)
 
     def test_isolated_runtime_removes_only_restored_runtime_traces(self):
         with tempfile.TemporaryDirectory() as root:
