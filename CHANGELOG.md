@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.0-rc.22
+
+- Explicitly start the isolated ingress proxy during GLPI restores. Compose
+  does not automatically start services that depend on the selected GLPI
+  service, which left the LAN port unpublished in rc.21.
+
 ## 0.5.0-rc.21
 
 - Publish isolated application ports through a hardened ingress proxy on a

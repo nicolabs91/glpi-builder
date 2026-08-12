@@ -78,6 +78,31 @@ class GlpiIsolatedRestoreTest(unittest.TestCase):
              "docker-compose.yml", "up", "-d", "--force-recreate", "glpi-isolated"],
         )
 
+    def test_restore_explicitly_starts_ingress_service(self):
+        env = module.build_env(
+            "glpi-isolated", "glpi/glpi:11.0.8", "mariadb:11.4",
+            18778, 8080, "Europe/Brussels", True, isolated_restore=True,
+        )
+        with patch.object(module, "prepare_compose_network", return_value="network"), \
+             patch.object(module, "ensure_dirs"), \
+             patch.object(module, "prepare_db_directory"), \
+             patch.object(module, "run_isolated_compose", side_effect=["db", "web"]) as run, \
+             patch.object(module, "ensure_container_network"), \
+             patch.object(module, "wait_db", return_value=(True, "ready")), \
+             patch.object(module, "finalize_db_directory_permissions", return_value="permissions"), \
+             patch.object(module, "reset_db_user", return_value=(True, "user")), \
+             patch.object(module, "ensure_glpi_writable_dirs"), \
+             patch.object(module, "fix_permissions", return_value="fixed"), \
+             patch.object(module, "verify_glpi_port_binding", return_value="port"):
+            module.create_or_restore(
+                "glpi-isolated", env, clean_db=False, force_recreate=True,
+                db_backup=None, file_backup=None, isolated_restore=True,
+            )
+        self.assertEqual(
+            run.call_args_list[-1].args[1],
+            ["glpi-isolated", "glpi-isolated-ingress"],
+        )
+
     def test_isolated_port_binding_must_match_requested_port(self):
         container = MagicMock()
         container.attrs = {

@@ -60,7 +60,7 @@ from app_profiles import (
     validate_project_name as validate_application_project,
 )
 
-APP_VERSION = "0.5.0-rc.21"
+APP_VERSION = "0.5.0-rc.22"
 UPDATE_MAX_ZIP_BYTES = 64 * 1024 * 1024
 UPDATE_MAX_EXPANDED_BYTES = 256 * 1024 * 1024
 UPDATE_MAX_FILES = 2000
@@ -3814,7 +3814,13 @@ def create_or_restore(
     messages.append(fix_permissions(project))
     report(92, "Applying GLPI container", "Creating or updating the GLPI application container.")
     if isolated_restore:
-        messages.append(run_isolated_compose(project, [project], force_recreate=force_recreate))
+        # Compose only starts dependencies of explicitly selected services.
+        # The ingress proxy depends on GLPI (not the other way around), so it
+        # must be selected explicitly or the LAN port is never published.
+        messages.append(run_isolated_compose(
+            project, [project, f"{project}-ingress"],
+            force_recreate=force_recreate,
+        ))
         messages.append(verify_glpi_port_binding(project, env["GLPI_HTTP_PORT"]))
     else:
         messages.append(create_glpi_container(
