@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.0-rc.20
+
+- Bind isolated and profile application web ports explicitly to `0.0.0.0` (or
+  the selected host address), ensuring LAN access remains available on
+  Synology when the network is marked internal.
+- Escape shell variables in the generated GLPI entrypoint so Docker Compose
+  does not replace `SAMESITE`, `SECURE` or loop variables before the container
+  starts.
+- Verify the active Docker port publication from `NetworkSettings.Ports`, not
+  only the requested `HostConfig.PortBindings` declaration.
+
 ## 0.5.0-rc.19
 
 - Repair isolated restores for GLPI, n8n and Team Password Manager when an

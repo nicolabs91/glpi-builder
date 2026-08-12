@@ -60,7 +60,7 @@ from app_profiles import (
     validate_project_name as validate_application_project,
 )
 
-APP_VERSION = "0.5.0-rc.19"
+APP_VERSION = "0.5.0-rc.20"
 UPDATE_MAX_ZIP_BYTES = 64 * 1024 * 1024
 UPDATE_MAX_EXPANDED_BYTES = 256 * 1024 * 1024
 UPDATE_MAX_FILES = 2000
@@ -1976,7 +1976,11 @@ def render_glpi_compose(project, env):
     internal-network and cron changes.
     """
     env = normalize_env_defaults(env)
-    entrypoint_script = indent_text(GLPI_ENTRY_COMMAND, 8)
+    # This script is embedded in a Compose YAML block.  Compose treats a
+    # single dollar sign as its own interpolation syntax, so shell variables
+    # must be doubled here.  The Docker-API entrypoint below intentionally
+    # keeps the original single-dollar shell script.
+    entrypoint_script = indent_text(GLPI_ENTRY_COMMAND.replace("$", "$$"), 8)
     isolated = env.get("BUILDER_QUARANTINE") == "1"
     return (
         GLPI_COMPOSE_TEMPLATE
@@ -3590,13 +3594,19 @@ def run_isolated_compose(project, services, force_recreate=False):
 
 
 def verify_glpi_port_binding(project, host_port):
-    """Fail closed when Compose did not publish the requested GLPI port."""
+    """Fail closed unless Docker reports an active LAN port publication.
+
+    HostConfig.PortBindings only records what was requested at container
+    creation time.  Synology's Docker stack can retain that declaration while
+    NetworkSettings.Ports is empty, which means nothing is reachable on the
+    NAS.  The latter is therefore the source of truth for isolated restores.
+    """
     expected_port = validate_port(host_port, "GLPI_HTTP_PORT")
     container = get_container(project)
     if not container:
         raise RuntimeError(f"GLPI port proof failed: missing container {project}.")
     container.reload()
-    bindings = (container.attrs.get("HostConfig", {}).get("PortBindings", {}) or {}).get("8080/tcp") or []
+    bindings = (container.attrs.get("NetworkSettings", {}).get("Ports", {}) or {}).get("8080/tcp") or []
     published = {
         int(item.get("HostPort"))
         for item in bindings
@@ -3605,9 +3615,33 @@ def verify_glpi_port_binding(project, host_port):
     if expected_port not in published:
         raise RuntimeError(
             f"GLPI port proof failed: docker-compose.yml requested {expected_port}:8080, "
-            "but the running container has no matching published port."
+            "but Docker reports no matching active published port."
         )
     return f"Verified published GLPI port: {expected_port}:8080/tcp."
+
+
+def verify_application_port(project, host_port, container_port):
+    """Verify that a profile app has an active host-to-container port map."""
+    expected_host = validate_port(host_port, "APP_HTTP_PORT")
+    expected_container = int(container_port)
+    container = get_container(project)
+    if not container:
+        raise RuntimeError(f"Application port proof failed: missing container {project}.")
+    container.reload()
+    bindings = (container.attrs.get("NetworkSettings", {}).get("Ports", {}) or {}).get(
+        f"{expected_container}/tcp"
+    ) or []
+    published = {
+        int(item.get("HostPort"))
+        for item in bindings
+        if str(item.get("HostPort", "")).isdigit()
+    }
+    if expected_host not in published:
+        raise RuntimeError(
+            f"Application port proof failed: requested {expected_host}:{expected_container}, "
+            "but Docker reports no matching active published port."
+        )
+    return f"Verified published application port: {expected_host}:{expected_container}/tcp."
 
 
 def install_fresh_glpi(project, env):
@@ -6159,6 +6193,7 @@ def run_application_deployment(job_token, data):
                 "Application deployment failed: " + tail_text(deployment.stderr, 1800)
                 + " Database log: " + details
             )
+        port_proof = verify_application_port(project, data["host_port"], profile.internal_port)
         report = None
         if data.get("quarantine"):
             update_progress_job(job_token, 90, "Verifying isolation", "Checking the private network and restored database tables.")
@@ -6167,6 +6202,7 @@ def run_application_deployment(job_token, data):
             f"Application profile: {profile.name}",
             f"Image: {data['image']}",
             f"Web port: {data['host_port']}",
+            port_proof,
             "Mode: isolated test restore; external network blocked." if data.get("quarantine") else "Mode: fresh installation.",
             "Compose validation passed and containers were started.",
             (f"Quarantine proof passed: {report['restored_tables']} database tables restored." if report else "Fresh deployment preflight passed."),

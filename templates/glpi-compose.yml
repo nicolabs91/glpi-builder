@@ -35,7 +35,10 @@ services:
       - __PROJECT__-db
 
     ports:
-      - "${GLPI_HTTP_PORT}:8080"
+      - target: 8080
+        published: "${GLPI_HTTP_PORT}"
+        host_ip: 0.0.0.0
+        protocol: tcp
 
     volumes:
       - /volume1/docker/__PROJECT__/glpi:/var/glpi:rw
@@ -74,4 +77,3 @@ networks:
   __PROJECT__-network:
     name: __PROJECT__-network
     driver: bridge__INTERNAL_NETWORK__
-

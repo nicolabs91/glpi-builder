@@ -18,9 +18,21 @@ from app_profiles import (
     validate_image,
     validate_database_image,
 )
+import app as app_module
 
 
 class ApplicationProfileTests(unittest.TestCase):
+    def test_profile_port_proof_rejects_requested_but_inactive_port(self):
+        container = type("Container", (), {
+            "attrs": {
+                "NetworkSettings": {"Ports": {}},
+            },
+            "reload": lambda self: None,
+        })()
+        with patch.object(app_module, "get_container", return_value=container), \
+             self.assertRaisesRegex(RuntimeError, "no matching active published port"):
+            app_module.verify_application_port("n8n-test", 18775, 5678)
+
     def test_catalog_contains_initial_supported_apps(self):
         self.assertEqual({item.key for item in profile_catalog()}, {"n8n", "teampasswordmanager"})
 
@@ -59,7 +71,8 @@ class ApplicationProfileTests(unittest.TestCase):
         )
         compose = render_compose(profile, env)
         self.assertIn("internal: true", compose)
-        self.assertIn("${APP_BIND_ADDRESS}:${APP_HTTP_PORT}:80", compose)
+        self.assertIn("host_ip: ${APP_BIND_ADDRESS}", compose)
+        self.assertIn('target: 80', compose)
         self.assertIn("no-new-privileges:true", compose)
         self.assertIn("pids_limit: 256", compose)
         self.assertIn("mem_limit: 1g", compose)

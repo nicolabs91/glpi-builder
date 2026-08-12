@@ -81,12 +81,23 @@ class GlpiIsolatedRestoreTest(unittest.TestCase):
     def test_isolated_port_binding_must_match_requested_port(self):
         container = MagicMock()
         container.attrs = {
-            "HostConfig": {"PortBindings": {"8080/tcp": [{"HostPort": "8778"}]}}
+            "HostConfig": {"PortBindings": {"8080/tcp": [{"HostPort": "8778"}]}},
+            "NetworkSettings": {"Ports": {"8080/tcp": [{"HostIp": "0.0.0.0", "HostPort": "8778"}]}},
         }
         with patch.object(module, "get_container", return_value=container):
             self.assertIn("8778:8080", module.verify_glpi_port_binding("glpi-isolated", 8778))
-            with self.assertRaisesRegex(RuntimeError, "no matching published port"):
+            with self.assertRaisesRegex(RuntimeError, "no matching active published port"):
                 module.verify_glpi_port_binding("glpi-isolated", 8779)
+
+    def test_isolated_port_proof_rejects_configured_but_inactive_binding(self):
+        container = MagicMock()
+        container.attrs = {
+            "HostConfig": {"PortBindings": {"8080/tcp": [{"HostPort": "8778"}]}},
+            "NetworkSettings": {"Ports": {}},
+        }
+        with patch.object(module, "get_container", return_value=container), \
+             self.assertRaisesRegex(RuntimeError, "no matching active published port"):
+            module.verify_glpi_port_binding("glpi-isolated", 8778)
 
     def test_isolated_compose_only_adds_supported_isolation_settings(self):
         env = module.build_env(
@@ -109,6 +120,10 @@ class GlpiIsolatedRestoreTest(unittest.TestCase):
         self.assertNotIn("command=/bin/true", compose)
         self.assertNotIn("autostart=false", compose)
         self.assertNotIn("autorestart=false", compose)
+        self.assertIn('host_ip: 0.0.0.0', compose)
+        self.assertIn('SAMESITE="$${GLPI_SESSION_COOKIE_SAMESITE:-Lax}"', compose)
+        self.assertIn('for dir in /etc/php/*/apache2/conf.d', compose)
+        self.assertNotIn('for dir in /etc/php/*/apache2/conf.d; do\n  if [ -d "" ]', compose)
 
     def test_normal_compose_does_not_change_proven_cron_program(self):
         env = module.build_env(
@@ -125,7 +140,7 @@ class GlpiIsolatedRestoreTest(unittest.TestCase):
             18080, 8080, "Europe/Brussels", True, isolated_restore=True,
         )
         compose = module.render_glpi_compose("glpi-isolated", env)
-        expected = module.indent_text(module.GLPI_ENTRY_COMMAND, 8)
+        expected = module.indent_text(module.GLPI_ENTRY_COMMAND.replace("$", "$$"), 8)
         self.assertIn("      - |\n" + expected + "\n", compose)
 
     def test_isolated_yaml_diff_is_limited_to_two_isolation_lines(self):

@@ -205,7 +205,11 @@ def render_compose(profile: AppProfile, env: dict, base_path: str = "/volume1/do
     container_name: {project}
     restart: unless-stopped
     env_file: [.env]
-    ports: ["${{APP_BIND_ADDRESS}}:${{APP_HTTP_PORT}}:5678"]{security_options}
+    ports:
+      - target: 5678
+        published: "${{APP_HTTP_PORT}}"
+        host_ip: ${{APP_BIND_ADDRESS}}
+        protocol: tcp{security_options}
     environment:
       DB_TYPE: postgresdb
       DB_POSTGRESDB_HOST: {project}-db
@@ -250,7 +254,11 @@ networks:
     container_name: {project}
     restart: unless-stopped
     env_file: [.env]
-    ports: ["${{APP_BIND_ADDRESS}}:${{APP_HTTP_PORT}}:80"]{security_options}
+    ports:
+      - target: 80
+        published: "${{APP_HTTP_PORT}}"
+        host_ip: ${{APP_BIND_ADDRESS}}
+        protocol: tcp{security_options}
     environment:
       TPM_SERVER_TIMEZONE: ${{TZ}}
       TPM_PHP_TIMEZONE: ${{TZ}}
