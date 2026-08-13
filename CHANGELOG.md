@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.5.1
+
+- Release the isolated-restore safety cleanup from rc.24 as the stable
+  0.5.1 build. Copied GLPI OAuth clients and their access, refresh and
+  authorization tokens are removed from isolated test restores; normal
+  production restores are unchanged.
+
+## 0.5.0-rc.24
+
+- Remove copied GLPI OAuth clients and their access, refresh and authorization
+  tokens from isolated test restores. Normal production restores are unchanged.
+
+## 0.5.0-rc.23
+
+- Repair persistent runtime-directory ownership from inside isolated
+  application containers after they start. This fixes restored GLPI `/var/glpi/logs`
+  permissions on Synology bind mounts and applies the same profile-driven
+  safeguard to n8n and Team Password Manager.
+- Create GLPI's `/var/glpi/logs` directory during container startup and include
+  it in the writable runtime-directory contract.
+
 ## 0.5.0-rc.22
 
 - Explicitly start the isolated ingress proxy during GLPI restores. Compose

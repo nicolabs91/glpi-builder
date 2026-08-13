@@ -32,6 +32,8 @@ class AppProfile:
     database_image_prefixes: tuple[str, ...]
     default_database_image: str
     volumes: tuple[str, ...]
+    runtime_paths: tuple[str, ...]
+    runtime_uid: str
     backup_note: str
     quarantine_restore: bool = False
     quarantine_note: str = "No verified isolated restore adapter is available for this application."
@@ -49,6 +51,8 @@ PROFILES = {
         database_image_prefixes=("postgres:",),
         default_database_image="postgres:16-alpine",
         volumes=("data", "database"),
+        runtime_paths=("/home/node/.n8n",),
+        runtime_uid="1000:1000",
         backup_note="Back up PostgreSQL and the n8n data directory together; the encryption key is retained in the private environment file.",
         quarantine_restore=True,
         quarantine_note="Restores one manifest-verified PostgreSQL and n8n data backup set into a new private environment. Triggers and external routes remain blocked by the internal Docker network.",
@@ -64,6 +68,8 @@ PROFILES = {
         database_image_prefixes=("mysql:",),
         default_database_image="mysql:5.7",
         volumes=("application", "database"),
+        runtime_paths=("/var/www/html",),
+        runtime_uid="33:33",
         backup_note="Back up the MariaDB database and application data directory as one consistent set.",
         quarantine_restore=True,
         quarantine_note="Restores a TPM SQL backup into a new private MySQL database. External settings remain in the copied data but cannot connect because the application network has no external route.",

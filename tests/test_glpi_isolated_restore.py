@@ -93,6 +93,7 @@ class GlpiIsolatedRestoreTest(unittest.TestCase):
              patch.object(module, "reset_db_user", return_value=(True, "user")), \
              patch.object(module, "ensure_glpi_writable_dirs"), \
              patch.object(module, "fix_permissions", return_value="fixed"), \
+             patch.object(module, "repair_glpi_container_runtime_permissions", return_value="runtime"), \
              patch.object(module, "verify_glpi_port_binding", return_value="port"):
             module.create_or_restore(
                 "glpi-isolated", env, clean_db=False, force_recreate=True,
@@ -102,6 +103,17 @@ class GlpiIsolatedRestoreTest(unittest.TestCase):
             run.call_args_list[-1].args[1],
             ["glpi-isolated", "glpi-isolated-ingress"],
         )
+
+    def test_glpi_runtime_repair_runs_inside_container_as_uid_33(self):
+        result = type("ExecResult", (), {"exit_code": 0, "output": b""})()
+        container = MagicMock()
+        container.exec_run.return_value = result
+        with patch.object(module, "get_container", return_value=container):
+            message = module.repair_glpi_container_runtime_permissions("glpi-isolated")
+        command = container.exec_run.call_args.args[0]
+        self.assertIn("mkdir -p /var/glpi/logs", command[2])
+        self.assertIn("chown -R 33:33 /var/glpi", command[2])
+        self.assertIn("runtime directories", message)
 
     def test_isolated_port_binding_must_match_requested_port(self):
         container = MagicMock()
@@ -152,6 +164,7 @@ class GlpiIsolatedRestoreTest(unittest.TestCase):
         self.assertNotIn("ports:", app_section)
         self.assertIn('SAMESITE="$${GLPI_SESSION_COOKIE_SAMESITE:-Lax}"', compose)
         self.assertIn('for dir in /etc/php/*/apache2/conf.d', compose)
+        self.assertIn("/var/glpi/logs", compose)
         self.assertNotIn('for dir in /etc/php/*/apache2/conf.d; do\n  if [ -d "" ]', compose)
 
     def test_normal_compose_does_not_change_proven_cron_program(self):
@@ -206,6 +219,28 @@ class GlpiIsolatedRestoreTest(unittest.TestCase):
             self.assertEqual((config / "config_db.php").read_text(encoding="utf-8"), "keep")
             for relative in ("files/_log", "files/_cron", "logs"):
                 self.assertEqual(list((project_root / "glpi" / relative).iterdir()), [])
+
+    def test_isolated_restore_scrubs_glpi_oauth_clients_and_tokens(self):
+        result = type("ExecResult", (), {"exit_code": 0, "output": (b"", b"")})()
+        database = MagicMock()
+        database.exec_run.return_value = result
+        with patch.object(module, "get_container", return_value=database):
+            message = module.scrub_glpi_isolated_oauth("glpi-isolated")
+
+        sql = database.exec_run.call_args.args[0][-1]
+        self.assertIn("glpi_oauthclients", sql)
+        self.assertIn("glpi_oauth_access_tokens", sql)
+        self.assertIn("glpi_oauth_refresh_tokens", sql)
+        self.assertIn("glpi_oauth_auth_codes", sql)
+        self.assertIn("Removed copied GLPI OAuth clients", message)
+
+    def test_oauth_scrub_failure_aborts(self):
+        result = type("ExecResult", (), {"exit_code": 1, "output": (b"", b"database error")})()
+        database = MagicMock()
+        database.exec_run.return_value = result
+        with patch.object(module, "get_container", return_value=database), \
+             self.assertRaisesRegex(RuntimeError, "Could not remove copied GLPI OAuth"):
+            module.scrub_glpi_isolated_oauth("glpi-isolated")
 
     def make_set(self, root):
         folder = Path(root) / "glpi-production" / "2026-08-06_100000"

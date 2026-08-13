@@ -60,7 +60,7 @@ from app_profiles import (
     validate_project_name as validate_application_project,
 )
 
-APP_VERSION = "0.5.0-rc.22"
+APP_VERSION = "0.5.1"
 UPDATE_MAX_ZIP_BYTES = 64 * 1024 * 1024
 UPDATE_MAX_EXPANDED_BYTES = 256 * 1024 * 1024
 UPDATE_MAX_FILES = 2000
@@ -254,6 +254,7 @@ GLPI_WRITABLE_SUBDIRS = [
     "files/_sessions",
     "files/_tmp",
     "files/_uploads",
+    "logs",
 ]
 
 ENV_ORDER = [
@@ -283,7 +284,7 @@ for dir in /etc/php/*/apache2/conf.d /etc/php/*/fpm/conf.d /etc/php/*/cli/conf.d
     cp /tmp/glpi-builder-php/99-glpi-builder-session.ini "$dir/99-glpi-builder-session.ini";
   fi;
 done &&
-mkdir -p /var/glpi/files/_cache /var/glpi/files/_cron /var/glpi/files/_dumps /var/glpi/files/_graphs /var/glpi/files/_lock /var/glpi/files/_log /var/glpi/files/_pictures /var/glpi/files/_plugins /var/glpi/files/_rss /var/glpi/files/_sessions /var/glpi/files/_tmp /var/glpi/files/_uploads /var/www/glpi/plugins &&
+mkdir -p /var/glpi/files/_cache /var/glpi/files/_cron /var/glpi/files/_dumps /var/glpi/files/_graphs /var/glpi/files/_lock /var/glpi/files/_log /var/glpi/files/_pictures /var/glpi/files/_plugins /var/glpi/files/_rss /var/glpi/files/_sessions /var/glpi/files/_tmp /var/glpi/files/_uploads /var/glpi/logs /var/www/glpi/plugins &&
 chown -R 33:33 /var/glpi /var/www/glpi/plugins /var/log/apache2 /var/run/apache2 /run/apache2 &&
 chmod -R 775 /var/glpi /var/www/glpi/plugins &&
 chmod -R 777 /var/log/apache2 /var/run/apache2 /run/apache2 &&
@@ -3158,6 +3159,66 @@ echo "Database restore completed."
         return False, str(exc)
 
 
+def scrub_glpi_isolated_oauth(project):
+    """Remove copied GLPI OAuth clients and tokens from an isolated restore."""
+    database = get_container(f"{project}-db")
+    sql = """
+SET @oauth_table = 'glpi_oauthclients';
+SET @oauth_delete = IF(
+    EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = @oauth_table),
+    CONCAT('DELETE FROM `', @oauth_table, '`'),
+    'SELECT 1'
+);
+PREPARE oauth_statement FROM @oauth_delete;
+EXECUTE oauth_statement;
+DEALLOCATE PREPARE oauth_statement;
+
+SET @oauth_table = 'glpi_oauth_access_tokens';
+SET @oauth_delete = IF(
+    EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = @oauth_table),
+    CONCAT('DELETE FROM `', @oauth_table, '`'),
+    'SELECT 1'
+);
+PREPARE oauth_statement FROM @oauth_delete;
+EXECUTE oauth_statement;
+DEALLOCATE PREPARE oauth_statement;
+
+SET @oauth_table = 'glpi_oauth_refresh_tokens';
+SET @oauth_delete = IF(
+    EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = @oauth_table),
+    CONCAT('DELETE FROM `', @oauth_table, '`'),
+    'SELECT 1'
+);
+PREPARE oauth_statement FROM @oauth_delete;
+EXECUTE oauth_statement;
+DEALLOCATE PREPARE oauth_statement;
+
+SET @oauth_table = 'glpi_oauth_auth_codes';
+SET @oauth_delete = IF(
+    EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = @oauth_table),
+    CONCAT('DELETE FROM `', @oauth_table, '`'),
+    'SELECT 1'
+);
+PREPARE oauth_statement FROM @oauth_delete;
+EXECUTE oauth_statement;
+DEALLOCATE PREPARE oauth_statement;
+"""
+    result = database.exec_run(
+        [
+            "sh", "-c",
+            'exec mariadb -uroot -p"$MARIADB_ROOT_PASSWORD" "$GLPI_DB_NAME" -e "$1"',
+            "mariadb", sql,
+        ],
+        demux=True,
+    )
+    stdout, stderr = result.output if isinstance(result.output, tuple) else (result.output, b"")
+    output = ((stdout or b"") + (stderr or b"")).decode("utf-8", errors="replace")
+    if result.exit_code != 0:
+        detail = "\n" + tail_text(output, 2000) if output else ""
+        raise RuntimeError("Could not remove copied GLPI OAuth credentials from the isolated restore." + detail)
+    return "Removed copied GLPI OAuth clients and OAuth tokens from the isolated restore."
+
+
 def empty_dir(path):
     path.mkdir(parents=True, exist_ok=True)
     for child in path.iterdir():
@@ -3461,6 +3522,50 @@ def fix_permissions(project):
     if warnings:
         msg += "\nLatest warnings:\n" + "\n".join(warnings[-20:])
     return msg
+
+
+def repair_glpi_container_runtime_permissions(project):
+    """Repair bind-mounted GLPI runtime ownership from inside the container.
+
+    Synology bind mounts can retain host-side ownership that does not map to
+    the image's web user.  Host-side chmod/chown is therefore only a best
+    effort; the running container is the authority for the UID that GLPI
+    actually uses.  Keep this repair narrow so restored configuration and
+    plugin files are not rewritten unnecessarily.
+    """
+    container = get_container(project)
+    if not container:
+        raise RuntimeError(f"GLPI runtime permission repair failed: missing container {project}.")
+    container.reload()
+    result = container.exec_run([
+        "sh", "-c",
+        "mkdir -p /var/glpi/logs /var/glpi/files/_log /var/glpi/files/_cache "
+        "/var/glpi/files/_cron /var/glpi/files/_dumps /var/glpi/files/_graphs "
+        "/var/glpi/files/_lock /var/glpi/files/_pictures /var/glpi/files/_plugins "
+        "/var/glpi/files/_rss /var/glpi/files/_sessions /var/glpi/files/_tmp "
+        "/var/glpi/files/_uploads /var/www/glpi/plugins && "
+        "chown -R 33:33 /var/glpi /var/www/glpi/plugins && "
+        "chmod 775 /var/glpi/logs /var/glpi/files/_log /var/www/glpi/plugins",
+    ], user="0:0")
+    if result.exit_code != 0:
+        output = result.output.decode("utf-8", "replace") if isinstance(result.output, bytes) else str(result.output)
+        raise RuntimeError("GLPI runtime permission repair failed: " + tail_text(output, 2000))
+    return "Repaired GLPI runtime directories inside the container for www-data (UID 33)."
+
+
+def repair_application_runtime_permissions(project, profile):
+    """Repair persistent application data using the image's runtime UID/GID."""
+    container = get_container(project)
+    if not container:
+        raise RuntimeError(f"Application runtime permission repair failed: missing container {project}.")
+    container.reload()
+    paths = " ".join(profile.runtime_paths)
+    command = f"mkdir -p {paths} && chown -R {profile.runtime_uid} {paths}"
+    result = container.exec_run(["sh", "-c", command], user="0:0")
+    if result.exit_code != 0:
+        output = result.output.decode("utf-8", "replace") if isinstance(result.output, bytes) else str(result.output)
+        raise RuntimeError(f"{profile.name} runtime permission repair failed: " + tail_text(output, 2000))
+    return f"Repaired {profile.name} runtime directories inside the container for {profile.runtime_uid}."
 
 
 def prepare_db_directory(project):
@@ -3786,6 +3891,8 @@ def create_or_restore(
             raise RuntimeError("Database restore failed:\n" + tail_text(out, 5000))
         messages.append("Database backup restored successfully.")
         messages.append(out)
+        if isolated_restore:
+            messages.append(scrub_glpi_isolated_oauth(project))
     else:
         report(57, "Preparing empty database", "Preparing database credentials for the fresh GLPI installation.")
         if fresh_install:
@@ -3821,6 +3928,7 @@ def create_or_restore(
             project, [project, f"{project}-ingress"],
             force_recreate=force_recreate,
         ))
+        messages.append(repair_glpi_container_runtime_permissions(project))
         messages.append(verify_glpi_port_binding(project, env["GLPI_HTTP_PORT"]))
     else:
         messages.append(create_glpi_container(
@@ -6256,6 +6364,9 @@ def run_application_deployment(job_token, data):
                 "Application deployment failed: " + tail_text(deployment.stderr, 1800)
                 + " Database log: " + details
             )
+        if data.get("quarantine"):
+            update_progress_job(job_token, 84, "Repairing runtime permissions", "Applying container-side ownership to restored application data.")
+            messages.append(repair_application_runtime_permissions(project, profile))
         port_proof = verify_application_port(project, data["host_port"], profile.internal_port)
         report = None
         if data.get("quarantine"):

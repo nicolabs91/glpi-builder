@@ -4,7 +4,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from app_profiles import (
     MANIFEST_NAME,
@@ -32,6 +32,19 @@ class ApplicationProfileTests(unittest.TestCase):
         with patch.object(app_module, "get_container", return_value=container), \
              self.assertRaisesRegex(RuntimeError, "no matching active published port"):
             app_module.verify_application_port("n8n-test", 18775, 5678)
+
+    def test_quarantine_runtime_repair_uses_profile_declared_runtime_identity(self):
+        result = type("ExecResult", (), {"exit_code": 0, "output": b""})()
+        container = MagicMock()
+        container.exec_run.return_value = result
+        with patch.object(app_module, "get_container", return_value=container):
+            message = app_module.repair_application_runtime_permissions(
+                "n8n-test", get_profile("n8n")
+            )
+        command = container.exec_run.call_args.args[0]
+        self.assertIn("/home/node/.n8n", command[2])
+        self.assertIn("chown -R 1000:1000", command[2])
+        self.assertIn("n8n runtime directories", message)
 
     def test_catalog_contains_initial_supported_apps(self):
         self.assertEqual({item.key for item in profile_catalog()}, {"n8n", "teampasswordmanager"})

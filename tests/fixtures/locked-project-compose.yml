@@ -82,7 +82,7 @@ services:
             cp /tmp/glpi-builder-php/99-glpi-builder-session.ini "$$dir/99-glpi-builder-session.ini";
           fi;
         done &&
-        mkdir -p /var/glpi/files/_cache /var/glpi/files/_cron /var/glpi/files/_dumps /var/glpi/files/_graphs /var/glpi/files/_lock /var/glpi/files/_log /var/glpi/files/_pictures /var/glpi/files/_plugins /var/glpi/files/_rss /var/glpi/files/_sessions /var/glpi/files/_tmp /var/glpi/files/_uploads /var/www/glpi/plugins &&
+        mkdir -p /var/glpi/files/_cache /var/glpi/files/_cron /var/glpi/files/_dumps /var/glpi/files/_graphs /var/glpi/files/_lock /var/glpi/files/_log /var/glpi/files/_pictures /var/glpi/files/_plugins /var/glpi/files/_rss /var/glpi/files/_sessions /var/glpi/files/_tmp /var/glpi/files/_uploads /var/glpi/logs /var/www/glpi/plugins &&
         chown -R 33:33 /var/glpi /var/www/glpi/plugins /var/log/apache2 /var/run/apache2 /run/apache2 &&
         chmod -R 775 /var/glpi /var/www/glpi/plugins &&
         chmod -R 777 /var/log/apache2 /var/run/apache2 /run/apache2 &&
