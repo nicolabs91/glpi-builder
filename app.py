@@ -60,7 +60,7 @@ from app_profiles import (
     validate_project_name as validate_application_project,
 )
 
-APP_VERSION = "0.5.1"
+APP_VERSION = "0.5.3"
 UPDATE_MAX_ZIP_BYTES = 64 * 1024 * 1024
 UPDATE_MAX_EXPANDED_BYTES = 256 * 1024 * 1024
 UPDATE_MAX_FILES = 2000
@@ -2447,16 +2447,44 @@ def inspect_glpi_backup_set(database_value, files_value):
     folder = database.parent
     manifest_path = folder / "manifest.json"
     checksums_path = folder / "SHA256SUMS"
-    try:
-        manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError("GLPI isolated restore requires a valid Builder backup manifest.") from exc
-    if manifest_data.get("application") not in {None, "", "glpi"}:
-        raise ValueError("The selected backup manifest does not belong to GLPI.")
-    manifest_database = _safe_backup_member(folder, manifest_data.get("database"))
-    manifest_files = _safe_backup_member(folder, manifest_data.get("files"))
-    if manifest_database != database or manifest_files != files:
-        raise ValueError("Selected GLPI backup files do not match the backup manifest.")
+    legacy_info_path = folder / "BACKUP_INFO"
+    if manifest_path.is_file() and not manifest_path.is_symlink():
+        try:
+            manifest_data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError("GLPI isolated restore requires a valid Builder backup manifest.") from exc
+        if manifest_data.get("application") not in {None, "", "glpi"}:
+            raise ValueError("The selected backup manifest does not belong to GLPI.")
+        manifest_database = _safe_backup_member(folder, manifest_data.get("database"))
+        manifest_files = _safe_backup_member(folder, manifest_data.get("files"))
+        if manifest_database != database or manifest_files != files:
+            raise ValueError("Selected GLPI backup files do not match the backup manifest.")
+    elif legacy_info_path.is_file() and not legacy_info_path.is_symlink():
+        if database.name != "glpi-database.sql" or files.name != "glpi-files.tar.gz":
+            raise ValueError("Selected GLPI backup files do not match the legacy Builder backup set.")
+        try:
+            metadata = {}
+            for line in legacy_info_path.read_text(encoding="utf-8").splitlines():
+                key, value = line.split("=", 1)
+                if key not in {"PROJECT_NAME", "CREATED_AT"} or not value.strip():
+                    raise ValueError
+                metadata[key] = value.strip()
+            if set(metadata) != {"PROJECT_NAME", "CREATED_AT"}:
+                raise ValueError
+        except (OSError, ValueError) as exc:
+            raise ValueError("GLPI isolated restore requires valid legacy Builder BACKUP_INFO metadata.") from exc
+        manifest_data = {
+            "schema": 0,
+            "application": "glpi",
+            "project": metadata["PROJECT_NAME"],
+            "created_at": metadata["CREATED_AT"],
+            "database": database.name,
+            "files": files.name,
+            "checksums": checksums_path.name,
+            "legacy": True,
+        }
+    else:
+        raise ValueError("GLPI isolated restore requires a valid Builder manifest or legacy BACKUP_INFO.")
     expected = {}
     try:
         for line in checksums_path.read_text(encoding="utf-8").splitlines():
@@ -2464,7 +2492,10 @@ def inspect_glpi_backup_set(database_value, files_value):
             expected[Path(name.lstrip("* ")).name] = digest.lower()
     except (OSError, ValueError) as exc:
         raise ValueError("GLPI isolated restore requires a valid SHA256SUMS file.") from exc
-    for member in (database, files):
+    checksum_members = [database, files]
+    if manifest_data.get("legacy"):
+        checksum_members.append(legacy_info_path)
+    for member in checksum_members:
         if not hmac.compare_digest(expected.get(member.name, ""), sha256_file(member)):
             raise ValueError(f"GLPI backup checksum mismatch for {member.name}.")
     return {
@@ -4461,7 +4492,6 @@ dl{display:grid;grid-template-columns:minmax(170px,240px) 1fr;gap:0;border-top:1
 
 PROGRESS_HTML = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-{% if job.status in ['queued', 'running'] %}<meta http-equiv="refresh" content="2">{% endif %}
 <title>{{ job.title }} progress · {{ job.project }} · Docker App Manager</title>
 <style>
 :root{--bg:#f4f7fb;--card:#fff;--line:#dce4ee;--ink:#172033;--muted:#64748b;--brand:#2364d2;--danger:#b42318;--wait:#a15c00}
@@ -4474,11 +4504,63 @@ progress{display:block;width:100%;height:24px;margin:16px 0;accent-color:var(--b
 </style></head><body>
 <header><div><h1>{{ job.title }} progress</h1><div>{{ app_version }}</div></div></header>
 <main>
-<section class="card"><span class="status {{ job.status }}">{{ job.status|capitalize }}</span><h2 style="margin-top:14px">{{ job.stage }}</h2><div class="percent">{{ job.percent }}%</div><progress max="100" value="{{ job.percent }}">{{ job.percent }}%</progress><p class="meta">Elapsed time: {{ elapsed }} seconds{% if job.status in ['queued','running'] %} · this page refreshes automatically{% endif %}</p></section>
-{% if job.error %}<section class="card"><h2>Error</h2><div class="error">{{ job.error }}</div></section>{% endif %}
-<section class="card"><h2>Activity</h2><ol class="timeline">{% for message in job.messages %}<li>{{ message }}</li>{% endfor %}</ol></section>
-<section class="card"><div class="actions"><a class="button secondary" href="{{ url_for('index') }}#projects">Dashboard</a>{% if job.status == 'completed' and job.target_port %}<a class="button" href="{{ application_url(job.target_port) }}" target="_blank" rel="noopener">Open application ↗</a>{% endif %}{% if job.log_name %}<a class="button" href="{{ url_for('view_log', project=job.project, filename=job.log_name) }}">Open full log</a>{% endif %}</div></section>
+<section class="card" data-progress-root data-progress-url="{{ url_for('progress_status_api', job_token=job.token) }}"><span class="status {{ job.status }}" data-progress-status>{{ job.status|capitalize }}</span><h2 style="margin-top:14px" data-progress-stage>{{ job.stage }}</h2><div class="percent" data-progress-percent>{{ job.percent }}%</div><progress max="100" value="{{ job.percent }}" data-progress-bar>{{ job.percent }}%</progress><p class="meta">Elapsed time: <span data-progress-elapsed>{{ elapsed }}</span> seconds <span data-progress-refresh-note>{% if job.status in ['queued','running'] %}· checking progress in the background{% endif %}</span></p></section>
+<section class="card" data-progress-error{% if not job.error %} hidden{% endif %}><h2>Error</h2><div class="error" data-progress-error-message>{{ job.error }}</div></section>
+<section class="card"><h2>Activity</h2><ol class="timeline" data-progress-messages>{% for message in job.messages %}<li>{{ message }}</li>{% endfor %}</ol></section>
+<section class="card"><div class="actions"><a class="button secondary" href="{{ url_for('index') }}#projects">Dashboard</a><span data-progress-application>{% if job.status == 'completed' and job.target_port %}<a class="button" href="{{ application_url(job.target_port) }}" target="_blank" rel="noopener">Open application ↗</a>{% endif %}</span><span data-progress-log>{% if job.log_name %}<a class="button" href="{{ url_for('view_log', project=job.project, filename=job.log_name) }}">Open full log</a>{% endif %}</span></div></section>
 </main></body></html>"""
+
+PROGRESS_HTML += r"""
+<script>
+(() => {
+  const root = document.querySelector('[data-progress-root]');
+  if (!root) return;
+  const status = root.querySelector('[data-progress-status]');
+  const stage = root.querySelector('[data-progress-stage]');
+  const percent = root.querySelector('[data-progress-percent]');
+  const bar = root.querySelector('[data-progress-bar]');
+  const elapsed = root.querySelector('[data-progress-elapsed]');
+  const note = root.querySelector('[data-progress-refresh-note]');
+  const errorCard = document.querySelector('[data-progress-error]');
+  const errorMessage = document.querySelector('[data-progress-error-message]');
+  const messages = document.querySelector('[data-progress-messages]');
+  const application = document.querySelector('[data-progress-application]');
+  const log = document.querySelector('[data-progress-log]');
+  const escapeHtml = (value) => String(value).replace(/[&<>\"']/g, (char) => ({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;',"'":'&#39;'}[char]));
+  const render = (data) => {
+    status.textContent = data.status.charAt(0).toUpperCase() + data.status.slice(1);
+    status.className = `status ${data.status}`;
+    stage.textContent = data.stage;
+    percent.textContent = `${data.percent}%`;
+    bar.value = data.percent;
+    bar.textContent = `${data.percent}%`;
+    elapsed.textContent = data.elapsed;
+    note.textContent = ['queued', 'running'].includes(data.status) ? '· checking progress in the background' : '';
+    errorCard.hidden = !data.error;
+    errorMessage.textContent = data.error || '';
+    messages.innerHTML = (data.messages || []).map((message) => `<li>${escapeHtml(message)}</li>`).join('');
+    if (data.status === 'completed' && data.target_port && !application.querySelector('a')) {
+      application.innerHTML = `<a class="button" href="${escapeHtml(data.application_url)}" target="_blank" rel="noopener">Open application ↗</a>`;
+    }
+    if (data.log_url && !log.querySelector('a')) {
+      log.innerHTML = `<a class="button" href="${escapeHtml(data.log_url)}">Open full log</a>`;
+    }
+  };
+  const poll = async () => {
+    try {
+      const response = await fetch(root.dataset.progressUrl, {headers: {'Accept': 'application/json'}, cache: 'no-store'});
+      if (!response.ok) throw new Error('progress unavailable');
+      const data = await response.json();
+      render(data);
+      if (!['completed', 'failed'].includes(data.status)) window.setTimeout(poll, 2000);
+    } catch (_) {
+      window.setTimeout(poll, 2500);
+    }
+  };
+  if (['queued', 'running'].includes(status.className.split(' ').pop())) poll();
+})();
+</script>
+"""
 
 
 
@@ -4592,6 +4674,27 @@ def restore_progress(job_token):
         return redirect(url_for("index"))
     elapsed = max(0, (job["finished_at"] or int(time.time())) - job["created_at"])
     return render_template_string(PROGRESS_HTML, job=job, elapsed=elapsed)
+
+
+@app.route("/api/progress/<job_token>", methods=["GET"])
+def progress_status_api(job_token):
+    job = progress_job_snapshot(job_token)
+    if not job:
+        return jsonify({"error": "Progress job not found or expired."}), 404
+    elapsed = max(0, (job["finished_at"] or int(time.time())) - job["created_at"])
+    payload = {
+        "status": job["status"],
+        "percent": job["percent"],
+        "stage": job["stage"],
+        "messages": job["messages"],
+        "error": job["error"],
+        "elapsed": elapsed,
+        "target_port": job["target_port"],
+        "application_url": application_url(job["target_port"]) if job["target_port"] else "",
+        "log_url": url_for("view_log", project=job["project"], filename=job["log_name"])
+        if job["log_name"] else "",
+    }
+    return jsonify(payload)
 
 
 @app.route("/change-port", methods=["POST"])
@@ -5151,7 +5254,13 @@ def healthz():
 
 @app.route("/favicon.ico")
 def favicon():
-    return ("", 204)
+    response = make_response("""<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+<defs><linearGradient id="b" x1="0" y1="0" x2="1" y2="1"><stop stop-color="#3d7ce3"/><stop offset="1" stop-color="#1b55b4"/></linearGradient></defs>
+<rect width="64" height="64" rx="17" fill="url(#b)"/>
+<text x="32" y="43" text-anchor="middle" fill="white" font-family="Arial,Helvetica,sans-serif" font-size="34" font-weight="800">D</text>
+</svg>""")
+    response.headers["Content-Type"] = "image/svg+xml; charset=utf-8"
+    return response
 
 
 @app.route("/assets/app.js")

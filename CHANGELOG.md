@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.5.2
+
+- Accept checksum-verified legacy GLPI Builder backup sets containing
+  `glpi-database.sql`, `glpi-files.tar.gz`, `BACKUP_INFO`, and `SHA256SUMS`
+  for isolated restores.
+
 ## 0.5.1
 
 - Release the isolated-restore safety cleanup from rc.24 as the stable
@@ -268,3 +274,6 @@ is completed and verified.
 
 - Harden restore and backup directory permissions.
 - Improve Synology backup dispatcher detection.
+## 0.5.3
+
+- Replace full-page progress refreshes with background polling, so navigation and page state are not interrupted during application builds and restores.

@@ -15,7 +15,7 @@ from tests.auth_test_support import authenticate
 
 
 REQUIRED_FILES = {
-    "app.py": 'APP_VERSION = "0.5.2"\n',
+    "app.py": 'APP_VERSION = "0.5.3"\n',
     "app_ui.py": "VALUE = 1\n",
     "app_profiles.py": "VALUE = 1\n",
     "auth_security.py": "VALUE = 1\n",
@@ -54,7 +54,7 @@ class SelfUpdateValidationTest(unittest.TestCase):
         archive = self.root / "release.zip"
         make_update_zip(archive)
         manifest = self.inspect(archive)
-        self.assertEqual(manifest["target_version"], "0.5.2")
+        self.assertEqual(manifest["target_version"], "0.5.3")
         self.assertEqual(len(manifest["sha256"]), 64)
         self.assertTrue(Path(manifest["package_root"], "Dockerfile").is_file())
         stored = json.loads((self.update_root / "transactions" / manifest["transaction_id"] / "status.json").read_text())

@@ -288,6 +288,49 @@ class GlpiIsolatedRestoreTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "checksum mismatch"):
                     module.inspect_glpi_backup_set(database, files)
 
+    def test_verified_legacy_builder_set_is_accepted(self):
+        with tempfile.TemporaryDirectory() as root:
+            folder = Path(root) / "GLPI_Backup_20260813-000001"
+            folder.mkdir()
+            database = folder / "glpi-database.sql"
+            database.write_text("CREATE TABLE glpi_users (id int);", encoding="utf-8")
+            files = folder / "glpi-files.tar.gz"
+            files.write_bytes(gzip.compress(b"legacy files"))
+            info = folder / "BACKUP_INFO"
+            info.write_text(
+                "PROJECT_NAME=glpi-prod-1108\nCREATED_AT=2026-08-13T00:00:01+0200\n",
+                encoding="utf-8",
+            )
+            checksums = "".join(
+                f"{hashlib.sha256(path.read_bytes()).hexdigest()} {path.name}\n"
+                for path in (database, files, info)
+            )
+            (folder / "SHA256SUMS").write_text(checksums, encoding="utf-8")
+            with patch.object(module, "BACKUP_ROOT", Path(root)):
+                result = module.inspect_glpi_backup_set(database, files)
+            self.assertTrue(result["manifest"]["legacy"])
+            self.assertEqual(result["manifest"]["project"], "glpi-prod-1108")
+
+    def test_legacy_builder_set_rejects_tampered_backup_info(self):
+        with tempfile.TemporaryDirectory() as root:
+            folder = Path(root) / "GLPI_Backup_20260813-000001"
+            folder.mkdir()
+            database = folder / "glpi-database.sql"
+            database.write_text("SELECT 1;", encoding="utf-8")
+            files = folder / "glpi-files.tar.gz"
+            files.write_bytes(gzip.compress(b"files"))
+            info = folder / "BACKUP_INFO"
+            info.write_text("PROJECT_NAME=prod\nCREATED_AT=now\n", encoding="utf-8")
+            checksums = "".join(
+                f"{hashlib.sha256(path.read_bytes()).hexdigest()} {path.name}\n"
+                for path in (database, files, info)
+            )
+            (folder / "SHA256SUMS").write_text(checksums, encoding="utf-8")
+            info.write_text("PROJECT_NAME=changed\nCREATED_AT=now\n", encoding="utf-8")
+            with patch.object(module, "BACKUP_ROOT", Path(root)):
+                with self.assertRaisesRegex(ValueError, "checksum mismatch for BACKUP_INFO"):
+                    module.inspect_glpi_backup_set(database, files)
+
     def test_database_and_files_must_be_from_same_set(self):
         with tempfile.TemporaryDirectory() as root:
             database, files = self.make_set(root)

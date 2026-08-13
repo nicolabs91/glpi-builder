@@ -44,10 +44,12 @@ class RouteRobustnessTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 302)
 
-    def test_favicon_is_an_empty_success_response(self):
+    def test_favicon_uses_the_blue_d_brand_mark(self):
         response = self.client.get("/favicon.ico")
-        self.assertEqual(response.status_code, 204)
-        self.assertNotIn(b"Internal Server Error", response.data)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.mimetype, "image/svg+xml")
+        self.assertIn(b"#3d7ce3", response.data)
+        self.assertIn(b">D</text>", response.data)
 
     def test_post_routes_reject_missing_csrf_without_server_error(self):
         routes = (
