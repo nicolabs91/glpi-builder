@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.5.4
+
+- Allow the published port of an isolated GLPI test environment to be changed
+  after creation while preserving its internal Docker network.
+- Recreate and verify the isolated ingress container for the new port, with an
+  automatic rollback to the previous port if the change fails.
+
 ## 0.5.2
 
 - Accept checksum-verified legacy GLPI Builder backup sets containing

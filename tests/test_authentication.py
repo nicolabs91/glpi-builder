@@ -226,7 +226,7 @@ class AuthenticationTest(unittest.TestCase):
         public = {"login", "healthz", "favicon", "setup", "ui_javascript"}
         management = {rule.endpoint for rule in module.app.url_map.iter_rules()} - {"static"} - public
         expected = {
-            "index", "create", "execute_create", "restore_progress", "change_port_route",
+            "index", "create", "execute_create", "restore_progress", "progress_status_api", "change_port_route",
             "change_cookie_route", "set_backup_source_route", "run_backup_now_route", "rebuild_glpi_route",
             "diagnose", "testdb_route", "resetdb_route", "view_log", "logout",
             "projects_page", "new_project_page", "project_detail_page", "backups_page",

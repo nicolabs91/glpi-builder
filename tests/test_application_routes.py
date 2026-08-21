@@ -13,6 +13,15 @@ import app as module
 from tests.auth_test_support import authenticate
 
 
+class ImmediateThread:
+    def __init__(self, target, args=(), **_kwargs):
+        self.target = target
+        self.args = args
+
+    def start(self):
+        self.target(*self.args)
+
+
 class ApplicationRouteTests(unittest.TestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
@@ -134,13 +143,12 @@ class ApplicationRouteTests(unittest.TestCase):
             self.assertEqual(preview.status_code, 200)
             with self.client.session_transaction() as state:
                 token = state["pending_application_preview"]["token"]
-            response = self.client.post(
-                "/applications/create/execute",
-                data={"csrf_token": self.csrf(), "preview_token": token},
-            )
-            deadline = module.time.monotonic() + 5
-            while not (self.base / "n8n-production" / ".builder-app.json").is_file() and module.time.monotonic() < deadline:
-                module.time.sleep(0.01)
+            with patch.object(module.threading, "Thread", ImmediateThread), \
+                 patch.object(module, "verify_application_port", return_value="Verified test port."):
+                response = self.client.post(
+                    "/applications/create/execute",
+                    data={"csrf_token": self.csrf(), "preview_token": token},
+                )
         self.assertEqual(response.status_code, 302)
         self.assertIn("/progress/", response.headers["Location"])
         folder = self.base / "n8n-production"
