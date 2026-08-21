@@ -60,7 +60,7 @@ from app_profiles import (
     validate_project_name as validate_application_project,
 )
 
-APP_VERSION = "0.5.3"
+APP_VERSION = "0.5.4"
 UPDATE_MAX_ZIP_BYTES = 64 * 1024 * 1024
 UPDATE_MAX_EXPANDED_BYTES = 256 * 1024 * 1024
 UPDATE_MAX_FILES = 2000
@@ -4121,8 +4121,12 @@ def change_project_port(project, host_port):
         raise ValueError(f"No .env file was found for {project}. Create or restore the project first.")
 
     env = normalize_env_defaults(env)
+    isolated = env.get("BUILDER_QUARANTINE") == "1"
     host_port = validate_port(host_port, "New host port")
-    assert_docker_port_free(host_port, exclude_containers={project})
+    assert_docker_port_free(
+        host_port,
+        exclude_containers={project, f"{project}-ingress"} if isolated else {project},
+    )
 
     old_env = dict(env)
     old_port = old_env.get("GLPI_HTTP_PORT", "unknown")
@@ -4131,30 +4135,43 @@ def change_project_port(project, host_port):
     env["GLPI_CONTAINER_PORT"] = "8080"
 
     ensure_dirs(project)
-    ensure_network(project)
+    ensure_network(project, internal=isolated)
 
     try:
         docker_client().containers.get(f"{project}-db")
     except NotFound:
         raise ValueError(f"Database container {project}-db does not exist. The GLPI container cannot be recreated safely.")
 
-    ensure_container_network(project, f"{project}-db")
+    ensure_container_network(project, f"{project}-db", internal=isolated)
 
     try:
         write_env(project, env)
         write_compose(project, env)
-        message = create_glpi_container(project, env, force_recreate=True, pull_image=False)
+        if isolated:
+            message = run_isolated_compose(
+                project, [project, f"{project}-ingress"], force_recreate=True,
+            )
+            proof = verify_glpi_port_binding(project, host_port)
+        else:
+            message = create_glpi_container(project, env, force_recreate=True, pull_image=False)
+            proof = f"New mapping: {host_port}:8080"
         return [
             f"Changed port from {old_port} to {host_port}.",
             message,
-            f"New mapping: {host_port}:8080",
+            proof,
         ]
     except Exception as exc:
         rollback_error = None
         try:
             write_env(project, old_env)
             write_compose(project, old_env)
-            create_glpi_container(project, old_env, force_recreate=True, pull_image=False)
+            if isolated:
+                run_isolated_compose(
+                    project, [project, f"{project}-ingress"], force_recreate=True,
+                )
+                verify_glpi_port_binding(project, old_port)
+            else:
+                create_glpi_container(project, old_env, force_recreate=True, pull_image=False)
         except Exception as rollback_exc:
             rollback_error = rollback_exc
 

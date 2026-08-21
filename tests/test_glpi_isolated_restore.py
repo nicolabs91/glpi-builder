@@ -11,6 +11,42 @@ import app as module
 
 
 class GlpiIsolatedRestoreTest(unittest.TestCase):
+    def test_change_port_preserves_isolated_network_and_recreates_ingress(self):
+        env = module.build_env(
+            "glpi-isolated", "glpi/glpi:11.0.8", "mariadb:11.4",
+            18778, 8080, "Europe/Brussels", True, isolated_restore=True,
+        )
+        db = MagicMock()
+        with patch.object(module, "read_env", return_value=env), \
+             patch.object(module, "assert_docker_port_free") as port_free, \
+             patch.object(module, "ensure_dirs"), \
+             patch.object(module, "ensure_network") as ensure_network, \
+             patch.object(module, "ensure_container_network") as ensure_container_network, \
+             patch.object(module, "docker_client") as docker_client, \
+             patch.object(module, "write_env") as write_env, \
+             patch.object(module, "write_compose") as write_compose, \
+             patch.object(module, "run_isolated_compose", return_value="recreated") as compose, \
+             patch.object(module, "verify_glpi_port_binding", return_value="verified") as verify:
+            docker_client.return_value.containers.get.return_value = db
+            messages = module.change_project_port("glpi-isolated", 18779)
+
+        port_free.assert_called_once_with(
+            18779, exclude_containers={"glpi-isolated", "glpi-isolated-ingress"},
+        )
+        ensure_network.assert_called_once_with("glpi-isolated", internal=True)
+        ensure_container_network.assert_called_once_with(
+            "glpi-isolated", "glpi-isolated-db", internal=True,
+        )
+        self.assertEqual(write_env.call_args.args[1]["GLPI_HTTP_PORT"], "18779")
+        self.assertEqual(write_compose.call_args.args[1]["GLPI_HTTP_PORT"], "18779")
+        compose.assert_called_once_with(
+            "glpi-isolated", ["glpi-isolated", "glpi-isolated-ingress"],
+            force_recreate=True,
+        )
+        verify.assert_called_once_with("glpi-isolated", 18779)
+        self.assertIn("Changed port from 18778 to 18779.", messages)
+        self.assertIn("verified", messages)
+
     def test_empty_legacy_network_is_removed_before_compose_start(self):
         network = MagicMock()
         network.attrs = {

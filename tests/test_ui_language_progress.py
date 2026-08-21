@@ -27,7 +27,7 @@ class UiLanguageAndProgressTest(unittest.TestCase):
         authenticate(self.client, module)
 
     def test_dashboard_is_english(self):
-        self.assertEqual(module.APP_VERSION, "0.5.3")
+        self.assertEqual(module.APP_VERSION, "0.5.4")
         with patch.object(module, "discover_projects", return_value=[]), \
              patch.object(module, "scan_backup_choices", return_value={"database": [], "files": []}), \
              patch.object(module, "suggest_free_host_port", return_value=18888), \
@@ -45,7 +45,7 @@ class UiLanguageAndProgressTest(unittest.TestCase):
         self.assertIn(b'aria-label="Primary"', response.data)
         self.assertIn(b'aria-label="Mobile navigation"', response.data)
         self.assertIn(b"font:inherit", response.data)
-        self.assertIn(b'class="version">0.5.3</span>', response.data)
+        self.assertIn(b'class="version">0.5.4</span>', response.data)
         self.assertIn(b'<html lang="en">', response.data)
 
     def test_project_management_is_moved_to_project_detail(self):
@@ -125,7 +125,7 @@ class UiLanguageAndProgressTest(unittest.TestCase):
         self.assertIn(b"checking progress in the background", response.data)
         self.assertIn(b"Restoring database", response.data)
         self.assertIn(b"57%", response.data)
-        self.assertIn(b"<div>0.5.3</div>", response.data)
+        self.assertIn(b"<div>0.5.4</div>", response.data)
         self.assertNotIn(b"0.2 \xc2\xb7 project", response.data)
 
     def test_progress_status_api_returns_json_without_rendering_page(self):
